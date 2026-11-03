@@ -10,6 +10,7 @@
  * With priority inheritance the server is boosted to 30 when hi sends and
  * finishes lo's request ahead of the hog; with a fixed-priority channel
  * (ts_psrv -f) the hog runs first and hi misses its deadline.
+ * At exit it prints how many of hi's requests missed the deadline.
  * -o LO,HOG,HI moves the three start offsets (us); for example -o 0,4200,4000
  * with a short lo request makes the hog preempt the server while it already
  * handles hi's request (inversion after the receive).
@@ -24,6 +25,8 @@ static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000;
 static struct timespec t_base;
 static int srv_pid, srv_chid;
 static pthread_barrier_t bar;
+static unsigned hi_n, hi_missed;    /* written by the hi thread only, read after join */
+static uint64_t hi_max_cyc;
 
 static void at(int k, unsigned off_us)
 {
@@ -68,6 +71,11 @@ static void *worker(void *arg)
         /* c = latency in cycles, d = 1 if the deadline was missed (hi only) */
         ts_log_at(t1, "SEND_DONE", id, coid, st, (int64_t)(t1 - t0),
                   (s->role == 2 && (t1 - t0) > dl_cyc) ? 1 : 0);
+        if (s->role == 2) {
+            hi_n++;
+            if (t1 - t0 > dl_cyc) hi_missed++;
+            if (t1 - t0 > hi_max_cyc) hi_max_cyc = t1 - t0;
+        }
     }
     return NULL;
 }
@@ -114,5 +122,7 @@ int main(int argc, char **argv)
     ts_msg_t q = { TS_MSG_QUIT, 0, 0, 0, 0 };
     MsgSend(coid, &q, sizeof q, NULL, 0);
     ts_dump();
+    printf("hi: %u of %u requests missed the %u us deadline, slowest %.0f us\n", hi_missed, hi_n, dl_us,
+           (double)hi_max_cyc * 1e6 / (double)SYSPAGE_ENTRY(qtime)->cycles_per_sec);
     return 0;
 }
