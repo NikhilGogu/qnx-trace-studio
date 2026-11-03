@@ -1,0 +1,6 @@
+workload/build/
+workload/stage/
+__pycache__/
+*.pyc
+*.perfetto-trace
+/out/
