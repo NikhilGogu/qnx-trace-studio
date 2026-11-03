@@ -85,6 +85,8 @@ Measured on the priority scenario (section 7):
 | default channel (inheritance) | 20 | 0 | 2740.4 us | 0 | 30 |
 | `_NTO_CHF_FIXED_PRIORITY` | 20 | 20 | 11429.5 us | 20 | 10 |
 
+Run 2 reproduced it: inheritance 0 of 20 missed (max 2863.3 us, 0 inversions), fixed priority 20 of 20 missed (max 11035.3 us, 20 inversions, fixed-priority channel `2019351/1` detected).
+
 In the fixed case each report reads: `ts_pload/hi` (prio 30) SEND-blocked, `ts_psrv/psrv-rx` READY at priority 10 for a median 8177.6 us, preempted by `ts_pload/hog` (prio 20) on CPU 0 for a median 8155.5 us, server busy with `ts_pload/lo`'s request; channel `1421335/1` has flags 0x1. With inheritance the same SQL shows the server at priority 10 for lo and 30 once hi has sent, matching the System Architecture guide ("the change in the server's priority happens when T1 sends the message").
 
 The same chain printer, unprompted, found a real system chain in `prio_inherit`: `tracelogger` REPLY-blocked 30041.4 us on `devb-eide/fsys_resmgr`, which spent 29917.6 us of it in MUTEX.
@@ -99,7 +101,7 @@ Planned:
 
 ## 6. Validation (measured)
 
-1. Event by event against the host `traceprinter` (`tools/compare_traceprinter.py`), five traces (`probe`, `ipc_wide`, `ipc_fast`, `prio_inherit`, `prio_fixed`): 139,421 events, identical (64-bit timestamp, CPU, class, event) for all of them, per-CPU order differences 0, 375,640 argument values compared over 47 event types, 0 mismatches. Labels are normalised (kernel calls by number, SYSTEM by class) because names differ (`SYNC_CONDVAR_SIG` vs `SYNC_CONDVAR_SIGNAL`, `PATHMGR_OPEN` vs `PATHMGR`); signed and unsigned prints of the same 32- or 64-bit value count as equal. The comparison found one real bug (process event 64 decoded as a virtual-thread state), since fixed.
+1. Event by event against the host `traceprinter` (`tools/compare_traceprinter.py`), five traces (`probe`, `ipc_wide`, `ipc_fast`, `prio_inherit`, `prio_fixed`): 139,421 events, identical (64-bit timestamp, CPU, class, event) for all of them, per-CPU order differences 0, 375,640 argument values compared over 47 event types, 0 mismatches. Labels are normalised (kernel calls by number, SYSTEM by class) because names differ (`SYNC_CONDVAR_SIG` vs `SYNC_CONDVAR_SIGNAL`, `PATHMGR_OPEN` vs `PATHMGR`); signed and unsigned prints of the same 32- or 64-bit value count as equal. The comparison found one real bug (process event 64 decoded as a virtual-thread state), since fixed. A second capture of the same four scenarios (run 2, same target, not committed) gave the same result: 135,749 events identical, 366,243 argument values, 0 mismatches, with 750 per-CPU timestamp regressions (interlaced combine events) in its fast-mode trace handled by the merge.
 2. Against workload ground truth (`tracestudio validate`): every logged request must contain exactly one decoded transaction from the same client thread, naming the same server pid and thread, the same rcvid, with MsgReceivev exit before the server's post-receive log and MsgReplyv entry after its pre-reply log; in wide mode msg[1] must equal the request id; forwarded requests must be children of the client request.
 
 | trace | requests | fully matched | parent links | payload id | missing | wrong |
@@ -109,7 +111,7 @@ Planned:
 | prio_inherit | 40 | 40 | n/a | 40/40 | 0 | 0 |
 | prio_fixed | 40 | 40 | n/a | 40/40 | 0 | 0 |
 
-Match rate 480/480 (100%). Client pulses: 4 logged, 4 matched with their value in wide mode, 0 with value in fast mode (fast MsgSendPulse entry has no value). Back-end timer pulses: 413 logged, 413 received in the trace. Log-minus-trace latency (time the client spends outside the kernel call): median 1.85 us (ipc_wide), 2.36 us (ipc_fast), 15.9-16.1 us in the pinned single-CPU priority runs (not yet explained).
+Match rate 480/480 (100%); run 2 also 480/480, with rcvid keys reused up to 173 times (ipc) and 120 times (prio). Client pulses: 4 logged, 4 matched with their value in wide mode, 0 with value in fast mode (fast MsgSendPulse entry has no value). Back-end timer pulses: 413 logged, 413 received in the trace. Log-minus-trace latency (time the client spends outside the kernel call): median 1.85 us (ipc_wide), 2.36 us (ipc_fast), 15.9-16.1 us in the pinned single-CPU priority runs. For request 30005 in `prio_fixed` the split is 15.37 us from the client's ClockCycles() to the MsgSendv entry event and 0.24 us from the exit event to the second ClockCycles(); the disassembly (`ntox86_64-objdump -d ts_pload`) shows only register moves and the `MsgSend@plt` call between rdtsc and the call, so the time is spent in libc or kernel entry before the event is written. Cause still open (candidates: lazy FPU/XSAVE handling under nested virtualisation, kernel-entry locking).
 
 Ambiguities found and how they are handled:
 - Concurrent receivers: ts_front has two receive threads on one channel; server thread matched 200/200 through REC_MESSAGE's actor.
@@ -159,7 +161,7 @@ Planned: `tracestudio capture <ssh target> [--seconds N] [--classes ...]` (runs 
 - Thread names are a snapshot (last name wins); Perfetto thread ids are synthetic.
 - Timestamps assume ClockCycles() synchronised across CPUs, as tracelogger itself requires.
 - Pulse send/receive matching is FIFO per (server pid, scoid) and is inferred, not proven.
-- The 15-16 us log-vs-trace offset in the pinned scenario is unexplained.
+- The 15 us between a pinned client's ClockCycles() and its MsgSendv entry event (section 6) is not yet explained; it does not affect linking.
 
 ## 10. Judge demo storyline (under 3 minutes)
 
