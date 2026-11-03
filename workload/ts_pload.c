@@ -10,13 +10,17 @@
  * With priority inheritance the server is boosted to 30 when hi sends and
  * finishes lo's request ahead of the hog; with a fixed-priority channel
  * (ts_psrv -f) the hog runs first and hi misses its deadline.
+ * -o LO,HOG,HI moves the three start offsets (us); for example -o 0,4200,4000
+ * with a short lo request makes the hog preempt the server while it already
+ * handles hi's request (inversion after the receive).
  *
- * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us]
+ * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi]
  */
 #include "common.h"
 
 static int nper = 20;
 static unsigned period_us = 25000, lo_us = 4000, hog_us = 10000, hi_us = 500, dl_us = 5000;
+static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000;
 static struct timespec t_base;
 static int srv_pid, srv_chid;
 static pthread_barrier_t bar;
@@ -71,13 +75,19 @@ static void *worker(void *arg)
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "n:P:l:m:d:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:")) != -1) {
         switch (opt) {
         case 'n': nper = atoi(optarg); break;
         case 'P': period_us = (unsigned)atoi(optarg); break;
         case 'l': lo_us = (unsigned)atoi(optarg); break;
         case 'm': hog_us = (unsigned)atoi(optarg); break;
         case 'd': dl_us = (unsigned)atoi(optarg); break;
+        case 'o':
+            if (sscanf(optarg, "%u,%u,%u", &off_lo, &off_hog, &off_hi) != 3) {
+                fprintf(stderr, "-o wants LO,HOG,HI offsets in us\n");
+                return 2;
+            }
+            break;
         }
     }
     ts_role = "pload";
@@ -87,9 +97,9 @@ int main(int argc, char **argv)
     if (ts_read_addr("/tmp/ts_psrv.addr", &srv_pid, &srv_chid)) { fprintf(stderr, "no ts_psrv\n"); return 1; }
 
     spec_t sp[3] = {
-        { "lo", 10, 0, lo_us, 0 },
-        { "hog", 20, 2000, hog_us, 1 },
-        { "hi", 30, 4000, hi_us, 2 },
+        { "lo", 10, off_lo, lo_us, 0 },
+        { "hog", 20, off_hog, hog_us, 1 },
+        { "hi", 30, off_hi, hi_us, 2 },
     };
     pthread_barrier_init(&bar, NULL, 4);
     pthread_t th[3];

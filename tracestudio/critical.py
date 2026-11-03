@@ -148,6 +148,10 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                         "" if k.parent == tx.idx else ", not part of this request"), srv, sprio)
                 else:
                     add(c, d, "server blocked", "%s %s-blocked" % (sl, state_name(scode)), srv, sprio)
+            elif scode == ST_RECEIVE and tx.t_rx_exit is not None and c >= tx.t_rx_exit:
+                # received, not yet replied, waiting for other messages: the work went elsewhere
+                add(c, d, "server blocked", "%s RECEIVE-blocked, this request still open (handed off, not followed)"
+                    % sl, srv, sprio)
             elif scode == ST_RECEIVE:
                 add(c, d, "server waiting", "%s RECEIVE-blocked" % sl, srv, sprio)
             elif scode in (None, ST_UNKNOWN):

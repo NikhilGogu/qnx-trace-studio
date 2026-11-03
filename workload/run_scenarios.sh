@@ -2,7 +2,10 @@
 # Run on the QNX 8.0 target as root. Captures one kernel event trace per
 # scenario with tracelogger and keeps each process's ground-truth CSV log.
 #   run_scenarios.sh <bindir> <outdir> [scenario...]
-# scenarios: ipc_wide ipc_fast prio_inherit prio_fixed (default: all four)
+# scenarios: ipc_wide ipc_fast prio_inherit prio_fixed (default: all four),
+#            prio_inherit_rx prio_fixed_rx (hog preempts the server after it received hi's request),
+#            cancel (timeouts, signals and late replies), rm_traffic (ls, find, cat, wc on qnx6 file systems),
+#            rm_small (a short capture of a few known file reads, used as a test fixture)
 B=${1:-/tmp/ts/bin}
 O=${2:-/tmp/ts/out}
 shift 2
@@ -21,7 +24,7 @@ start_trace() {   # <name> <mode-flag> <seconds>
 finish() {        # <name>
     wait $TL
     mkdir -p "$O/$1.logs"
-    cp /tmp/ts_logs/*.csv "$O/$1.logs/"
+    cp /tmp/ts_logs/*.csv "$O/$1.logs/" 2>/dev/null
     echo "$1: $(ls -l "$O/$1.kev" | awk '{print $5}') bytes, logs: $(ls "$O/$1.logs" | tr '\n' ' ')"
 }
 
@@ -36,13 +39,41 @@ run_ipc() {       # <name> <mode-flag>
     finish $1
 }
 
-run_prio() {      # <name> <psrv-flag>
+run_prio() {      # <name> <psrv-flag> [ts_pload options]
     rm -f /tmp/ts_psrv.addr
     start_trace $1 -w 4
     "$B/ts_psrv" $2 &
     sleep 1
-    "$B/ts_pload" -n 20
+    "$B/ts_pload" -n 20 $3
     finish $1
+}
+
+run_cancel() {
+    start_trace cancel -w 3
+    "$B/ts_cancel" -n 5
+    finish cancel
+}
+
+run_rm() {
+    start_trace rm_traffic -w 3
+    ls -l /system/bin /data > /dev/null
+    find /system/lib -name '*.so*' > /dev/null
+    cat /system/lib/*.so* > /dev/null 2>&1
+    dd if=/dev/zero of=/data/ts_rm.bin bs=65536 count=8 2>/dev/null
+    cat /data/ts_rm.bin > /dev/null
+    rm -f /data/ts_rm.bin
+    wc -c /system/etc/* > /dev/null 2>&1
+    finish rm_traffic
+}
+
+run_rm_small() {   # known sizes: libxo.so.0 as on the target, ts_rm.bin 65536 bytes
+    start_trace rm_small -w 2
+    cat /system/lib/libxo.so.0 > /dev/null
+    dd if=/dev/zero of=/data/ts_rm.bin bs=4096 count=16 2>/dev/null
+    cat /data/ts_rm.bin > /dev/null
+    ls -l /data > /dev/null
+    rm -f /data/ts_rm.bin
+    finish rm_small
 }
 
 for s in $SCEN; do
@@ -51,5 +82,10 @@ for s in $SCEN; do
     ipc_fast)     run_ipc ipc_fast "" ;;
     prio_inherit) run_prio prio_inherit "" ;;
     prio_fixed)   run_prio prio_fixed -f ;;
+    prio_inherit_rx) run_prio prio_inherit_rx "" "-l 500 -o 0,4200,4000" ;;
+    prio_fixed_rx)   run_prio prio_fixed_rx -f "-l 500 -o 0,4200,4000" ;;
+    cancel)       run_cancel ;;
+    rm_traffic)   run_rm ;;
+    rm_small)     run_rm_small ;;
     esac
 done

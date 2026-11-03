@@ -19,10 +19,11 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 from drop_buffer import drop_buffers  # noqa: E402
 from tracestudio.kev import KevFile  # noqa: E402
 from tracestudio.model import Model  # noqa: E402
-from tracestudio.validate import validate  # noqa: E402
+from tracestudio.validate import load_logs, validate  # noqa: E402
 from tracestudio.analyses import deadline_misses, suspected_inversions  # noqa: E402
 
 DATA = os.path.join(HERE, "data", "run1")
+DATA3 = os.path.join(HERE, "data", "run3")
 TMP = tempfile.mkdtemp(prefix="ts-test-")
 SCEN = ["ipc_wide", "ipc_fast", "prio_inherit", "prio_fixed"]
 
@@ -33,10 +34,10 @@ def skip(why):
     print("skip:", why)
 
 
-def kev(name):
+def kev(name, data=DATA):
     out = os.path.join(TMP, name + ".kev")
     if not os.path.exists(out):
-        with gzip.open(os.path.join(DATA, name + ".kev.gz")) as f, open(out, "wb") as g:
+        with gzip.open(os.path.join(data, name + ".kev.gz")) as f, open(out, "wb") as g:
             shutil.copyfileobj(f, g)
     return out
 
@@ -127,6 +128,64 @@ def test_perfetto_loads():
                 "WHERE tr.name = 'hi critical path' AND s.depth = 0 AND s.name LIKE 'txn % -> ts_psrv: %'"))[0].n
             assert cp == 20, cp
         tp.close()
+
+
+def test_inversion_after_receive_on_a_real_capture():
+    # run 3: lo sends 0.5 ms of work at t+0, hi at t+4 ms, the hog wakes at t+4.2 ms, while
+    # the server already handles hi's request
+    for name, n_inv, missed in (("prio_fixed_rx", 20, 20), ("prio_inherit_rx", 0, 0)):
+        m = Model(KevFile(kev(name, DATA3)))
+        res, _, _ = validate(m, os.path.join(DATA3, name + ".logs"))
+        assert res["ok"] and res["matched"] == res["requests"] == 40, (name, res["checks"])
+        d = deadline_misses(m, "hi", 5000)["ts_psrv"]
+        assert (d["requests"], d["missed"]) == (20, missed), (name, d)
+        sus = suspected_inversions(m)["suspected"]
+        assert len(sus) == n_inv, (name, len(sus))
+        assert all(set(x["while"]) == {"REPLY"} and x["preempted_by"][0]["thread"] == "ts_pload/hog" for x in sus)
+
+
+def test_cancellation_matches_the_workload_log():
+    m = Model(KevFile(kev("cancel", DATA3)))
+    rows = load_logs(os.path.join(DATA3, "cancel.logs"))
+    sends = {(r["tid"], r["id"]): r for r in rows if r["ev"] == "SEND"}
+    seen = 0
+    for r in rows:
+        if r["ev"] != "SEND_DONE":
+            continue
+        s = sends[(r["tid"], r["id"])]
+        (tx,) = [t for t in m.txns if t.client == (r["pid"], r["tid"]) and t.t_call is not None
+                 and s["cycles"] <= t.t_call <= r["cycles"]]
+        if r["b"] == -1:      # ETIMEDOUT (tmo) or EINTR (sig): MsgSendv exits with -1, no INT_CALL is traced
+            assert r["c"] in (4, 260) and tx.outcome == "cancelled" and tx.status == -1 and not tx.trustworthy
+        else:
+            assert tx.outcome == "replied" and tx.trustworthy, tx
+        seen += 1
+    assert seen == 15
+    late = sum(1 for r in rows if r["ev"] == "REPLY" and r["b"] == -1)
+    assert late == 10 and m.counters["reply_without_txn"] == late     # late replies never touch other exchanges
+
+
+def test_resource_manager_names_and_paths():
+    m = Model(KevFile(kev("rm_small", DATA3)))
+    read = {}
+    for t in m.txns:
+        if t.msg_type == "_IO_READ" and t.path and m.label(t.client).startswith("cat/") and t.status and t.status > 0:
+            read[t.path] = read.get(t.path, 0) + t.status
+    assert read == {"/system/lib/libxo.so.0": 132400, "/data/ts_rm.bin": 65536}   # sizes from wc -c on the target
+    to_disk = {t.msg_type for t in m.txns if m.server_name(t) == "devb-eide"}
+    assert {"_IO_CONNECT_OPEN", "_IO_READ", "_IO_WRITE", "_IO_CLOSE", "_IO_CONNECT_UNLINK", "_IO_LSEEK"} <= to_disk
+    try:
+        from perfetto.trace_processor import TraceProcessor
+        from tracestudio.perfetto_out import write
+    except ImportError:
+        return skip("perfetto package not installed")
+    out = os.path.join(TMP, "rm_small.perfetto-trace")
+    write(m, out)
+    tp = TraceProcessor(trace=out)
+    r = list(tp.query("SELECT COUNT(*) n, SUM(extract_arg(arg_set_id, 'debug.path') = '/system/lib/libxo.so.0') p "
+                      "FROM slice WHERE name = 'MsgSend _IO_READ -> devb-eide'"))[0]
+    assert r.n >= 30 and r.p >= 30, (r.n, r.p)
+    tp.close()
 
 
 def test_fault_injection_never_links_wrong():

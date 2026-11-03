@@ -551,7 +551,7 @@ class Model:
         elif tx.server != actor:
             tx.warnings.append("MsgReceivev exit on %s, REC_MESSAGE on %s" % (actor, tx.server))
         tx.t_rx_exit = ts
-        if "pid" in a:
+        if a.get("pid"):   # a server that passes no _msg_info buffer gets zeros: nothing to compare
             info = {k: a[k] for k in ("pid", "tid", "chid", "scoid", "coid", "msglen", "priority") if k in a}
             if (a["pid"], a.get("tid")) != tx.client:
                 tx.info_conflict = info

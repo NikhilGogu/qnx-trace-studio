@@ -2,7 +2,7 @@
 ARCH ?= x86_64
 CC = qcc -Vgcc_nto$(ARCH)
 CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -std=gnu11
-BINS = ts_back ts_front ts_clients ts_psrv ts_pload
+BINS = ts_back ts_front ts_clients ts_psrv ts_pload ts_cancel
 OUT = build/$(ARCH)
 
 all: $(addprefix $(OUT)/,$(BINS))
