@@ -80,6 +80,13 @@ KER_ARGS = {
     ("THREAD_CTLEXT", 0, 1): ("pid:d tid:d", "pid:d tid:d cmd:d data:q"),
     ("THREAD_CTLEXT", 1, 0): ("ret_val:d", "ret_val:d"),
     ("CONNECT_DETACH", 0, 0): ("coid:x", "coid:x"),
+    # SyncMutexLock/Unlock: the mutex address and its count and owner words as the kernel read them
+    ("SYNC_MUTEX_LOCK", 0, 0): ("sync_p:x owner:d", "sync_p:x count:d owner:d"),
+    ("SYNC_MUTEX_LOCK", 0, 1): ("sync_p:q", "sync_p:q count:d owner:d"),
+    ("SYNC_MUTEX_LOCK", 1, 0): ("ret_val:d empty:x", "ret_val:d empty:x"),
+    ("SYNC_MUTEX_UNLOCK", 0, 0): ("sync_p:x owner:d", "sync_p:x count:d owner:d"),
+    ("SYNC_MUTEX_UNLOCK", 0, 1): ("sync_p:q owner:d", "sync_p:q count:d owner:d"),
+    ("SYNC_MUTEX_UNLOCK", 1, 0): ("ret_val:d empty:x", "ret_val:d empty:x"),
 }
 for _n in ("MSG_SENDVNC",):
     for _k in [k for k in KER_ARGS if k[0] == "MSG_SENDV"]:

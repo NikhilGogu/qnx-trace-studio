@@ -1327,6 +1327,8 @@ def layout_trace():
     m1 = 0xFFFFFFFF                                                              # a pulse's _msg_info: all ones
     g.kcall(0, T + 140, K_RECEIVEV, [0, 0x7101, 0, 0, 0, 0, 100, 1, 1, m1, m1, m1, m1, m1, m1, m1, m1, 10, m1, 0],
             EXIT | i64)
+    g.kcall(0, T + 150, 80, [0x49FB3A20, 0x10, 0x80000000, 0x4018000A], i64)       # SyncMutexLock, 64-bit
+    g.kcall(0, T + 160, 81, [0x1000, 0x80000000, 0xC018000A])                     # SyncMutexUnlock, 32-bit
     return g
 
 
@@ -1348,7 +1350,9 @@ def test_kernel_call_layouts_follow_the_sat_guide():
         ("KER_EXIT", {"ret_val": -1, "errno": 22}),
         ("KER_EXIT", {"ret_val": -1, "errno": 3}),
         ("KER_EXIT", {"rcvid": 0, "rmsg0": 0x7101, "rmsg1": 0, "rmsg2": 0, "pid": 100, "tid": 1, "chid": 1, "scoid": -1,
-                      "coid": -1, "msglen": -1, "srcmsglen": -1, "dstmsglen": -1, "priority": 10, "flags": -1})]
+                      "coid": -1, "msglen": -1, "srcmsglen": -1, "dstmsglen": -1, "priority": 10, "flags": -1}),
+        ("KER_CALL", {"sync_p": 0x1049FB3A20, "count": -2147483648, "owner": 0x4018000A}),
+        ("KER_CALL", {"sync_p": 0x1000, "count": -2147483648, "owner": -1072168950})]
     # the same events printed by the SDP's traceprinter (black-box oracle), when it is installed
     import shutil
     import subprocess
@@ -1651,3 +1655,88 @@ def test_check_inversions_need_coverage_and_count_inconclusive():
     assert f.get("message") == "bell ? here" and "esc ?[0m" in f.text
 
 
+
+
+# ---- mutex owner chains (phase 2b) ----------------------------------------------------------------------
+K_MUTEX_LOCK, K_MUTEX_UNLOCK, ST_MUTEX_CODE = 80, 81, 13
+
+
+def mutex_scene(unlock_value=0x1002, unlocker=S2, loss=False):
+    """s1 blocks on mutex 0x1000 whose owner word says 0x1002; then `unlocker` unlocks it with `unlock_value`."""
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RUNNING, S2, 10)                      # s2 locked it in user space: nothing traced
+    g.state(0, T + 10, RUNNING, S, 10)
+    g.kcall(0, T + 20, K_MUTEX_LOCK, [0x1000, 0x80000000, 0x1002])
+    g.state(0, T + 30, ST_MUTEX_CODE, S, 30)
+    g.state(0, T + 40, RUNNING, unlocker, 10)
+    if loss:
+        g.event(0, T + 100, C_CONTROL, 8, [1, 0])
+    g.kcall(0, T + 500, K_MUTEX_UNLOCK, [0x1000, 0x80000000, 0x80000000 | unlock_value])
+    g.state(0, T + 510, READY, S, 30)
+    g.state(0, T + 600, RUNNING, S, 30)
+    g.kcall(0, T + 610, K_MUTEX_LOCK, [0, 0], EXIT)
+    return model(g)
+
+
+def test_mutex_owner_needs_the_owners_own_unlock():
+    _, m = mutex_scene()
+    (w,) = m.mutex_waits
+    assert (w.waiter, w.sync, w.owner_value, w.owner, w.t_block, w.t_release, w.ret) == (
+        S, 0x1000, 0x1002, S2, T + 30, T + 500, 0) and w.owner_known
+    _, m = mutex_scene(unlock_value=0x1003)                     # someone else's owner value: not the owner
+    assert not m.mutex_waits[0].owner_known and "owner value 0x1003" in m.mutex_waits[0].unknown
+    _, m = mutex_scene(loss=True)                                # lost events: the unlock may be missing
+    assert m.mutex_waits[0].unknown == "events lost during the wait"
+    _, m = mutex_scene(unlocker=M)                               # same address in another process
+    assert m.mutex_waits[0].unknown == "no SyncMutexUnlock of this mutex seen during the wait"
+
+
+def test_critical_path_follows_a_mutex_owner_into_its_request():
+    from tracestudio.analyses import blocking_chain, chain_text, mutex_wait_text, mutex_waits
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 1, RECEIVE, M, 10)
+    g.state(0, T + 2, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, S2, 10)                         # s2 owns mutex 0x1000 and asks mid for work
+    g.send(0, T + 20, S2, M[0], 0x30003, prio=10)
+    g.receive(0, T + 60, M, S2, 0x30003, prio=10)
+    g.state(0, T + 100, RUNNING, C, 10)
+    g.send(0, T + 110, C, S[0], 0x10001, prio=10)               # c asks s1
+    g.receive(0, T + 150, S, C, 0x10001, prio=10)
+    g.kcall(0, T + 200, K_MUTEX_LOCK, [0x1000, 0x80000000, 0x1002])
+    g.state(0, T + 210, ST_MUTEX_CODE, S, 10)                   # s1 needs the mutex
+    g.state(0, T + 220, RUNNING, M, 10)
+    g.reply(0, T + 1000, M, S2, 0x30003, 10)
+    g.wait_receive(0, T + 1040, M, 10)
+    g.send_exit(0, T + 1060, S2, 10)
+    g.kcall(0, T + 1100, K_MUTEX_UNLOCK, [0x1000, 0x80000000, 0x80001002])
+    g.state(0, T + 1110, READY, S, 10)
+    g.state(0, T + 1200, RUNNING, S, 10)
+    g.kcall(0, T + 1210, K_MUTEX_LOCK, [0, 0], EXIT)
+    g.reply(0, T + 1300, S, C, 0x10001, 10)
+    g.wait_receive(0, T + 1340, S, 10)
+    g.send_exit(0, T + 1360, C, 10)
+    _, m = model(g)
+    owner_req, tx = m.txns
+    assert owner_req.trustworthy and tx.trustworthy and m.mutex_waits[0].owner == S2
+    tl = Timeline(m)
+    segs = critical_path(m, tx, tl)
+    assert sum(s.t1 - s.t0 for s in segs) == tx.t_exit - tx.t_call
+    (n,) = [s for s in segs if s.kind == "nested request"]
+    assert "MUTEX-blocked on mutex 0x1000 owned by server/s2, which waits for mid (txn 0)" in n.label
+    assert any(k.label == "mid/m running this request" for k in n.children)
+    assert chain_text(tl, blocking_chain(tl, S, T + 500)) == (
+        "server/s1 MUTEX-blocked on mutex 0x1000 (owner server/s2) -> server/s2 REPLY-blocked on mid (txn 0) "
+        "-> mid/m RUNNING")
+    (r,) = mutex_waits(m, tl)
+    assert r["owner"] == "server/s2" and r["blocked_us"] == 0.9
+    assert mutex_wait_text(r).startswith("server/s1 (prio 10) MUTEX-blocked 0.9 us on mutex 0x1000 owned by "
+                                         "server/s2, which was REPLY-blocked on mid (txn 0)")
+    tp = tp_of(m, "mutex")
+    if tp:
+        no_import_errors(tp)
+        assert [x.name for x in rows(tp, "SELECT name FROM slice WHERE name LIKE 'MUTEX %'")] == ["MUTEX 0x1000 (owner s2)"]
+        tp.close()

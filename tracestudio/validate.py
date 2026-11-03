@@ -71,7 +71,7 @@ def ground_truth(rows, unpaired=None):
         elif r["ev"] == "REPLY":
             reply[(r["role"], r["id"])].append(r)
     for g in gt:
-        srole = {"clients": "front", "front": "back"}.get(g["role"])
+        srole = {"clients": "front", "front": "back", "mutex": "mutex"}.get(g["role"])
         if g["role"] == "pload":
             srole = next((k[0] for k in rx if k[0].startswith("psrv") and k[1] == g["id"]), None)
         g["server_role"] = srole
@@ -213,6 +213,7 @@ def validate(model, logdir, wide=None):
         res["checks"]["client_pulses" + (":ok" if matched == len(sent) else ":WRONG")] += 1
     if ticks_log:
         res["checks"]["back_pulses" + (":ok" if ticks_dec == ticks_log else ":WRONG")] += 1
+    _validate_mutex(model, rows, res)
     res["unpaired_log_records"] = [(why, r["role"], r["ev"], r["id"], r["pid"], r["tid"]) for why, r in unpaired]
     res["checks"]["log_records_paired" + (":WRONG" if unpaired else ":ok")] += 1
     res["problems"] = dict(res["problems"])
@@ -225,3 +226,40 @@ def validate(model, logdir, wide=None):
         res["log_minus_trace_latency_us"] = {"min": round(le[0], 2), "median": round(le[len(le) // 2], 2),
                                              "max": round(le[-1], 2)}
     return res, gt, tx_for_gt
+
+
+def _validate_mutex(model, rows, res):
+    """ts_mutex: each logged WAIT..ACQUIRED of the receiving thread must contain exactly one decoded mutex wait of
+    that thread, on the logged mutex address, whose owner is the thread that logged LOCKED for that period, with the
+    owner value (TLS __owner) it logged, released between the owner's UNLOCK log and the waiter's ACQUIRED log;
+    and the owner's request to ts_mslow (MSEND..MSEND_DONE) must be a decoded exchange."""
+    mrows = [r for r in rows if r["role"] == "mutex"]
+    if not mrows:
+        return
+    by = defaultdict(dict)
+    for r in mrows:
+        by[r["ev"]][r["id"]] = r
+    slow = next((r["pid"] for r in rows if r["role"] == "mslow"), None)
+    for i, wr in sorted(by["WAIT"].items()):
+        ar, lr, ur, s0, s1 = (by[e].get(i) for e in ("ACQUIRED", "LOCKED", "UNLOCK", "MSEND", "MSEND_DONE"))
+        if not all((ar, lr, ur, s0, s1)):
+            res["checks"]["mutex_log_records:WRONG"] += 1
+            continue
+        cands = [w for w in model.mutex_waits if w.waiter == (wr["pid"], wr["tid"]) and wr["cycles"] <= w.t_call
+                 and (w.t_exit is None or w.t_exit <= ar["cycles"])]
+        if len(cands) != 1:
+            res["checks"]["mutex_wait" + (":missing" if not cands else ":WRONG")] += 1
+            continue
+        w = cands[0]
+        req = [t for t in model.txns if t.client == (lr["pid"], lr["tid"]) and t.server_pid == slow
+               and t.t_call is not None and s0["cycles"] <= t.t_call <= s1["cycles"]]
+        checks = {
+            "mutex_address": w.sync == wr["a"] & 0xFFFFFFFFFFFFFFFF,
+            "mutex_owner": None if not w.owner_known else w.owner == (lr["pid"], lr["tid"]),
+            "mutex_owner_value": None if w.owner_value is None else w.owner_value == lr["b"] & 0x7FFFFFFF,
+            "mutex_release": None if w.t_release is None else ur["cycles"] <= w.t_release <= ar["cycles"],
+            "mutex_owner_request": None if not req else len(req) == 1 and req[0].trustworthy,
+        }
+        for k, v in checks.items():
+            res["checks"][k + {True: ":ok", None: ":missing", False: ":WRONG"}[v]] += 1
+    res["mutex_waits_logged"] = len(by["WAIT"])

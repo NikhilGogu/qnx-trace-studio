@@ -124,7 +124,8 @@ def cmd_convert(a):
 
 def _analysis(model, a, tl):
     """Everything analyze and diff report, for text and JSON alike; --client filters every per-client part."""
-    from .analyses import deadline_misses, ipc_latency, server_priority_while_handling, suspected_inversions, us
+    from .analyses import (deadline_misses, ipc_latency, mutex_waits, server_priority_while_handling,
+                           suspected_inversions, us)
     only = (lambda key: a.client in model.label(key)) if a.client else None
     out = {"trace": a.trace, "client_filter": a.client, "transactions": len(model.txns),
            "trustworthy": model.counters["txns_trustworthy"],
@@ -143,6 +144,7 @@ def _analysis(model, a, tl):
         {"server": s, "client": c, "prio_us": {str(p): round(v, 1) for p, v in sorted(d.items())},
          "prio_share": {str(p): v / sum(d.values()) for p, v in sorted(d.items())} if sum(d.values()) > 0 else {}}
         for (s, c), d in sorted(sp.items()) if a.client is None or a.client in c]
+    out["mutex_waits"] = mutex_waits(model, tl, a.min_us, only)
     return out
 
 
@@ -217,6 +219,15 @@ def cmd_analyze(a):
     if out["fixed_priority_channels"]:
         p("\nchannels created with _NTO_CHF_FIXED_PRIORITY: " + ", ".join(
             "%s chid %d" % (c["process"], c["chid"]) for c in out["fixed_priority_channels"]))
+    mw = out["mutex_waits"]
+    if mw:
+        from .analyses import mutex_wait_text
+        p("\nmutex waits of at least %g us: %d (owner known for %d)" % (a.min_us, len(mw),
+                                                                     sum(1 for r in mw if r["owner"])))
+        for r in sorted(mw, key=lambda r: -r["blocked_us"])[:a.top]:
+            p("  wait %d: %s" % (r["wait"], mutex_wait_text(r)))
+        if len(mw) > a.top:
+            p("  ... %d more (use --json)" % (len(mw) - a.top))
     for tx, segs in cps:
         p("")
         if segs is None:

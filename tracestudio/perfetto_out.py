@@ -263,6 +263,7 @@ class Writer:
         self._sched()
         self._states()
         self._ipc()
+        self._mutexes()
         if self.critical_paths:
             self._critical_paths()
         self._pulses()
@@ -405,6 +406,19 @@ class Writer:
                 self.add((tx.client, None), t_back, tx.t_exit, "reply received" + mark, common,
                          term=(reply_flow,) if linked else ())
             self.stats["ipc_txns"] += 1
+
+    def _mutexes(self):
+        """A slice on the waiter's track for each blocking SyncMutexLock, naming the owner only when it is known."""
+        m = self.m
+        for w in m.mutex_waits:
+            end = w.t_exit if w.t_exit is not None else m.end_ts
+            known = w.owner_known
+            self.add((w.waiter, None), w.t_block, end, "MUTEX 0x%x (owner %s)" % (
+                w.sync, self.comm(w.owner) if known else "unknown"),
+                {"mutex": "0x%x" % w.sync, "owner": m.label(w.owner) if known else None,
+                 "owner_value": None if w.owner_value is None else "0x%x" % w.owner_value,
+                 "owner_unknown": None if known else w.unknown, "result": w.ret, "errno": w.errno})
+        self.stats["mutex_waits"] = len(m.mutex_waits)
 
     def _critical_paths(self):
         from .analyses import Timeline, us

@@ -35,7 +35,7 @@ import bisect
 from collections import Counter, defaultdict
 
 from .events import state_name
-from .model import SCHED_SPORADIC, ST_DEAD, ST_DESTROY, ST_READY, ST_RUNNING, ST_SEND, ST_REPLY, ST_UNKNOWN, UNKNOWN
+from .model import SCHED_SPORADIC, ST_DEAD, ST_DESTROY, ST_MUTEX, ST_READY, ST_RUNNING, ST_SEND, ST_REPLY, ST_UNKNOWN, UNKNOWN
 
 
 def us(model, cyc):
@@ -230,6 +230,19 @@ class Timeline:
         lst, calls = v
         i = bisect.bisect_right(calls, ts) - 1
         if i >= 0 and (lst[i].t_exit is None or ts < lst[i].t_exit):
+            return lst[i]
+        return None
+
+    def mutex_wait_at(self, key, ts):
+        """The MutexWait of thread `key` whose SyncMutexLock call covers ts, or None."""
+        cache = self.__dict__.setdefault("_mutex_cache", {})
+        v = cache.get(key)
+        if v is None:
+            lst = sorted((w for w in self.m.mutex_waits if w.waiter == key), key=lambda w: w.t_call)
+            v = cache[key] = (lst, [w.t_call for w in lst])
+        lst, starts = v
+        i = bisect.bisect_right(starts, ts) - 1
+        if i >= 0 and ts < (lst[i].t_exit if lst[i].t_exit is not None else self.end + 1):
             return lst[i]
         return None
 
@@ -539,3 +552,109 @@ def suspected_inversions(model, tl=None, min_us=100.0, only=None):
     return {"suspected": found, "insufficient_evidence": unclear, "checked": checked,
             "excluded_untrustworthy": excluded, "excluded_ambiguous_parent": ambiguous,
             "suspected_using_assumptions": sum(1 for r in found if r["assumptions"]), "min_us": min_us}
+
+
+# ---- mutex owner chains ----------------------------------------------------------------------------------
+def mutex_owner_at(tl, w, ts):
+    """(owner key or None, reason) for MutexWait w at ts: the owner is known from the wait's call to the owner's
+    SyncMutexUnlock, not after it (the mutex may have passed to another waiter)."""
+    if not w.owner_known:
+        return None, w.unknown or "owner not known"
+    if w.t_release is not None and ts >= w.t_release:
+        return None, "released at %.1f us; the next owner is not known" % us(tl.m, w.t_release - tl.m.start_ts)
+    return w.owner, None
+
+
+def blocking_chain(tl, key, ts, depth=4):
+    """What `key` waits for at ts, hop by hop: [(thread, state name, object text, next thread or None)]. A hop
+    follows a MUTEX wait to its owner (only when the owner is known) and a SEND or REPLY wait to the server
+    thread of the exchange (only when the exchange is trustworthy and was received)."""
+    m = tl.m
+    out, seen = [], set()
+    while key is not None and key not in seen and len(out) < depth:
+        seen.add(key)
+        code, _ = tl.state_at(key, ts)
+        nxt, what = None, ""
+        if code == ST_MUTEX:
+            w = tl.mutex_wait_at(key, ts)
+            if w is None:
+                what = "a mutex (no SyncMutexLock traced)"
+            else:
+                nxt, why = mutex_owner_at(tl, w, ts)
+                what = "mutex 0x%x" % w.sync + ("" if nxt else " (owner unknown: %s)" % why)
+        elif code in (ST_SEND, ST_REPLY):
+            tx = tl.client_txn_at(key, ts)
+            if tx is not None:
+                what = "%s (txn %d)" % (m.server_name(tx), tx.idx)
+                if tx.trustworthy and tx.server is not None and (tx.t_rx_exit is None or ts >= tx.t_rx_exit):
+                    nxt = tx.server if code == ST_REPLY else None
+        out.append((key, state_name(code) if code is not None else "?", what, nxt))
+        key = nxt
+    return out
+
+
+def chain_text(tl, chain):
+    """'A MUTEX-blocked on mutex 0x10 (owner B) -> B REPLY-blocked on C (txn 7) -> C/rx RUNNING'"""
+    m = tl.m
+    parts = []
+    for key, state, what, nxt in chain:
+        if state == "MUTEX":
+            parts.append("%s MUTEX-blocked on %s%s" % (m.label(key), what, " (owner %s)" % m.label(nxt) if nxt else ""))
+        elif state in ("SEND", "REPLY") and what:
+            parts.append("%s %s-blocked on %s" % (m.label(key), state, what))
+        else:
+            parts.append("%s %s" % (m.label(key), state))
+    return " -> ".join(parts)
+
+
+def mutex_waits(model, tl=None, min_us=0.0, only=None):
+    """Mutex waits of at least min_us: who waited, on what, for how long, the owner (when known) and what the
+    owner did meanwhile (its states, with the server it waited for), plus its priority before and during."""
+    tl = tl or Timeline(model)
+    m = model
+    out = []
+    for w in m.mutex_waits:
+        if only is not None and not only(w.waiter):
+            continue
+        end = w.t_exit if w.t_exit is not None else m.end_ts
+        blocked = sum(b - a for a, b, code, _ in tl.segments(w.waiter, w.t_block, end) if code == ST_MUTEX)
+        if us(m, blocked) < min_us:
+            continue
+        row = {"wait": w.idx, "waiter": m.label(w.waiter), "waiter_prio": tl.prio_at(w.waiter, w.t_block),
+               "mutex": "0x%x" % w.sync, "blocked_us": round(us(m, blocked), 1), "owner": None,
+               "owner_value": None if w.owner_value is None else "0x%x" % w.owner_value,
+               "result": "acquired" if w.ret == 0 else ("still waiting" if w.t_exit is None else
+                                                        "failed (errno %s)" % w.errno)}
+        if not w.owner_known:
+            row["owner_unknown"] = w.unknown
+        else:
+            o, rel = w.owner, w.t_release
+            row["owner"] = m.label(o)
+            prios = [p for _, _, _, p in tl.segments(o, w.t_block, rel) if p is not None]
+            row["owner_prio_before"], row["owner_prio_max"] = tl.prio_at(o, w.t_call), max(prios) if prios else None
+            states = Counter()
+            for a, b, code, _ in tl.segments(o, w.t_block, rel):
+                if code in (ST_SEND, ST_REPLY):
+                    tx = tl.client_txn_at(o, a)
+                    states["%s-blocked on %s (txn %d)" % (state_name(code), m.server_name(tx), tx.idx)
+                           if tx is not None else state_name(code) + "-blocked"] += b - a
+                else:
+                    states[state_name(code) if code is not None else "unknown"] += b - a
+            row["owner_states_us"] = {k: round(us(m, v), 1) for k, v in states.most_common()}
+            row["chain"] = chain_text(tl, blocking_chain(tl, w.waiter, w.t_block + (rel - w.t_block) // 2))
+        out.append(row)
+    return out
+
+
+def mutex_wait_text(r):
+    """One line for a mutex wait: "A MUTEX-blocked 3.2 ms on mutex 0x... owned by B, which ..." """
+    head = "%s (prio %s) MUTEX-blocked %.1f us on mutex %s" % (r["waiter"], r["waiter_prio"], r["blocked_us"],
+                                                                  r["mutex"])
+    if r["owner"] is None:
+        return head + ", owner unknown (%s)" % r["owner_unknown"]
+    pi = ""
+    if r["owner_prio_max"] is not None and r["owner_prio_before"] is not None and \
+            r["owner_prio_max"] > r["owner_prio_before"]:
+        pi = " (prio %s, raised to %s while it held the mutex)" % (r["owner_prio_before"], r["owner_prio_max"])
+    return head + " owned by %s%s, which was %s" % (r["owner"], pi, ", ".join(
+        "%s %.1f us" % kv for kv in r["owner_states_us"].items()))

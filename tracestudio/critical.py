@@ -17,8 +17,13 @@ latency exactly:
                      runs this request, or replies to it
   nested request     the server thread waits in its own request to another server;
                      that request's critical path is nested inside, recursively, when it is trustworthy
-  server blocked     the server thread is blocked in another state (MUTEX, ...) or in a
-                     request that is not part of this one
+  server blocked     the server thread is blocked in another state, in a request that is not part of
+                     this one, or on a mutex whose owner is not known
+  mutex owner running / mutex owner preempted / mutex owner blocked
+                     the server thread is MUTEX-blocked on a mutex whose owner is known (see
+                     model.MutexWait) and the owner runs, is READY behind threads at or above its
+                     priority, or is blocked; an owner waiting in a trustworthy request of its own
+                     is a nested request
   unknown            no events (lost data), nothing known yet, or the request was handed off (another
                      thread replied, or the receiver went back to MsgReceive with the request open)
 """
@@ -27,9 +32,9 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass, field
 
-from .analyses import Timeline, mask_cpus, us
+from .analyses import Timeline, mask_cpus, mutex_owner_at, us
 from .events import state_name
-from .model import ST_READY, ST_RECEIVE, ST_REPLY, ST_RUNNING, ST_SEND, ST_UNKNOWN, UNKNOWN
+from .model import ST_MUTEX, ST_READY, ST_RECEIVE, ST_REPLY, ST_RUNNING, ST_SEND, ST_UNKNOWN, UNKNOWN
 
 
 @dataclass
@@ -166,6 +171,43 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
 
     rx0 = tx.t_rx_call if tx.t_rx_call is not None else tx.t_rmsg    # the receive call, as far as it is known
 
+    def mutex_part(c, d, waiter, wprio):
+        """A MUTEX wait of `waiter` in [c, d], partitioned by what the mutex's owner did, when it is known."""
+        wl, ws = m.label(waiter), _tn(m, waiter)
+        w = tl.mutex_wait_at(waiter, c)
+        owner, why = mutex_owner_at(tl, w, c) if w is not None else (None, "no SyncMutexLock traced")
+        if owner is None:
+            add(c, d, "server blocked", "%s MUTEX-blocked on %s, owner unknown (%s)" % (
+                wl, "mutex 0x%x" % w.sync if w else "a mutex", why), waiter, wprio, short="%s MUTEX, owner unknown" % ws)
+            return
+        known_end = min(d, w.t_release) if w.t_release is not None else d
+        pre = "%s MUTEX-blocked on mutex 0x%x owned by %s" % (wl, w.sync, m.label(owner))
+        on = _tn(m, owner)
+        for e, f, ocode, oprio in tl.segments(owner, c, known_end):
+            if ocode == ST_RUNNING:
+                add(e, f, "mutex owner running", pre + ", which runs", owner, oprio, short="%s: owner %s runs" % (ws, on))
+            elif ocode == ST_READY:
+                for g, h, text, explained in _held(tl, owner, e, f, oprio):
+                    add_wait(g, h, "mutex owner preempted" if explained else "unexplained ready", owner, oprio, text)
+            elif ocode in (ST_SEND, ST_REPLY):
+                k = tl.client_txn_at(owner, e)
+                if k is not None and k.causal and _depth < max_depth:
+                    kids = _clip(m, critical_path(m, k, tl, max_depth, _depth + 1), e, f)
+                    add(e, f, "nested request", "%s, which waits for %s (txn %d)" % (pre, m.server_name(k), k.idx),
+                        owner, oprio, kids, short="%s: owner %s waits for %s" % (ws, on, m.server_name(k)))
+                else:
+                    add(e, f, "mutex owner blocked", "%s, which is %s-blocked%s" % (
+                        pre, state_name(ocode), " on %s (txn %d, not followed)" % (m.server_name(k), k.idx) if k else ""),
+                        owner, oprio, short="%s: owner %s %s-blocked" % (ws, on, state_name(ocode)))
+            elif ocode in (None, ST_UNKNOWN):
+                add(e, f, "unknown", pre + ", no events for the owner", owner, short="owner %s: no events" % on)
+            else:
+                add(e, f, "mutex owner blocked", "%s, which is blocked in %s" % (pre, state_name(ocode)), owner, oprio,
+                    short="%s: owner %s %s" % (ws, on, state_name(ocode)))
+        if d > known_end:
+            add(known_end, d, "server blocked", "%s MUTEX-blocked on mutex 0x%x after its owner's SyncMutexUnlock began "
+                "(handover; the next owner is not traced)" % (wl, w.sync), waiter, wprio, short="%s MUTEX handover" % ws)
+
     def server_part(a, b):
         if srv is None:
             add(a, b, "unknown", "receiving server thread not identified", short="server unknown")
@@ -249,6 +291,8 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                 add(c, d, "server waiting", "%s RECEIVE-blocked" % sl, srv, sprio, short="%s RECEIVE-blocked" % ss)
             elif scode in (None, ST_UNKNOWN):
                 add(c, d, "unknown", "no events for %s" % sl, srv, short="unknown (no events)")
+            elif scode == ST_MUTEX:
+                mutex_part(c, d, srv, sprio)
             else:
                 add(c, d, "server blocked", "%s blocked in %s" % (sl, state_name(scode)), srv, sprio,
                     short="%s %s" % (ss, state_name(scode)))
