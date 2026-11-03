@@ -114,8 +114,8 @@ class Writer:
         self.tid = TidMap(model)
         self.critical_paths = critical_paths
         self.tl = tl
-        self.trace = pb.Trace()
-        self.out = []          # (ts_ns, seq, TracePacket)
+        self.head = []         # serialized packets that go first, in order
+        self.out = []          # (ts_ns, seq, serialized TracePacket)
         self._seq = 0
         self._uuid = 1000
         self.thread_track = {}
@@ -143,8 +143,9 @@ class Writer:
 
     # ---- packets ----------------------------------------------------------
     def _push(self, ts_ns, pkt):
+        # keep serialized bytes, not message objects: large traces have millions of packets
         self._seq += 1
-        self.out.append((ts_ns, self._seq, pkt))
+        self.out.append((ts_ns, self._seq, pkt.SerializeToString()))
 
     def _te(self, ts_cyc, track, typ, name=None, args=None, flows=(), term=()):
         p = pb.TracePacket()
@@ -178,7 +179,7 @@ class Writer:
         p = pb.TracePacket()
         p.trusted_packet_sequence_id = SEQ
         p.track_descriptor.CopyFrom(desc)
-        self.trace.packet.append(p)
+        self.head.append(p.SerializeToString())
 
     def track_for(self, key):
         u = self.thread_track.get(key)
@@ -250,11 +251,12 @@ class Writer:
 
     # ---- content ----------------------------------------------------------
     def build(self):
+        """The trace as bytes (a serialized perfetto.protos.Trace)."""
         first = pb.TracePacket()
         first.trusted_packet_sequence_id = SEQ
         first.sequence_flags = pb.TracePacket.SEQ_INCREMENTAL_STATE_CLEARED
         first.trace_config.SetInParent()
-        self.trace.packet.append(first)
+        self.head.append(first.SerializeToString())
         self._process_tree()
         self._sched()
         self._states()
@@ -266,10 +268,9 @@ class Writer:
         self._losses()
         self._emit_items()
         self.out.sort(key=lambda x: (x[0], x[1]))
-        for _, _, p in self.out:
-            self.trace.packet.append(p)
-        self.stats["packets"] = len(self.trace.packet)
-        return self.trace
+        packets = self.head + [p for _, _, p in self.out]
+        self.stats["packets"] = len(packets)
+        return b"".join(_frame(p) for p in packets)
 
     def _process_tree(self):
         m = self.m
@@ -293,7 +294,7 @@ class Writer:
             x.pid = UNKNOWN_TID
             x = pt.threads.add()
             x.tid, x.tgid, x.name = UNKNOWN_TID, UNKNOWN_TID, "UNKNOWN"
-        self.trace.packet.append(p)
+        self.head.append(p.SerializeToString())
         names = [(pid, pr.name) for pid, pr in sorted(m.processes.items())]
         if any(sw[5] == UNKNOWN for sw in m.switches):
             names.append((UNKNOWN_TID, "trace-studio: CPU occupant unknown"))
@@ -456,9 +457,19 @@ class Writer:
                 g.cpu, g.kind, " (%d)" % g.count if g.count is not None else ""), {"detail": g.detail, "cpu": g.cpu})
 
 
+def _frame(packet):
+    """One `repeated TracePacket packet = 1` entry of perfetto.protos.Trace."""
+    n, head = len(packet), bytearray(b"\x0a")
+    while n > 0x7F:
+        head.append((n & 0x7F) | 0x80)
+        n >>= 7
+    head.append(n)
+    return bytes(head) + packet
+
+
 def write(model, path, critical_paths=True, tl=None):
     w = Writer(model, critical_paths, tl)
-    tr = w.build()
+    data = w.build()
     with open(path, "wb") as f:
-        f.write(tr.SerializeToString())
+        f.write(data)
     return dict(w.stats)

@@ -144,20 +144,64 @@ class Timeline:
         t = self.m.threads.get(key)
         return [w for w, _ in (t.runmask if t else []) if t0 < w < t1]
 
-    def handling_at(self, server, ts):
-        """The trustworthy request the server thread was handling at ts (received, not yet replied)."""
-        for tx in self._handled(server):
-            if tx.t_rx_exit <= ts < tx.t_reply_call:
-                return tx
-        return None
-
-    def _handled(self, server):
+    def _handled_index(self, server):
+        """Requests the server thread received and replied to, sorted by receive time, with the
+        running maximum of their reply times (to stop scanning early)."""
         cache = self.__dict__.setdefault("_handled_cache", {})
         v = cache.get(server)
         if v is None:
-            v = cache[server] = [t for t in self.m.txns if t.server == server and t.t_rx_exit is not None
-                                 and t.t_reply_call is not None]
+            lst = sorted((t for t in self.m.txns if t.server == server and t.t_rx_exit is not None
+                          and t.t_reply_call is not None), key=lambda t: t.t_rx_exit)
+            reach, mx = [], -1
+            for t in lst:
+                mx = max(mx, t.t_reply_call)
+                reach.append(mx)
+            v = cache[server] = (lst, [t.t_rx_exit for t in lst], reach)
         return v
+
+    def _handled(self, server):
+        return self._handled_index(server)[0]
+
+    def handling_at(self, server, ts):
+        """The request the server thread was handling at ts (received, not yet replied); the latest
+        received one when several are open."""
+        lst, rx, reach = self._handled_index(server)
+        i = bisect.bisect_right(rx, ts) - 1
+        while i >= 0 and reach[i] > ts:
+            if ts < lst[i].t_reply_call:
+                return lst[i]
+            i -= 1
+        return None
+
+    def open_at(self, server, ts):
+        """All requests the server thread had received and not yet replied to at ts."""
+        lst, rx, reach = self._handled_index(server)
+        out = []
+        i = bisect.bisect_right(rx, ts) - 1
+        while i >= 0 and reach[i] > ts:
+            if ts < lst[i].t_reply_call:
+                out.append(lst[i])
+            i -= 1
+        return out
+
+    def next_received_after(self, server, ts):
+        """The first request the server thread received after ts, or None."""
+        lst, rx, _ = self._handled_index(server)
+        i = bisect.bisect_right(rx, ts)
+        return lst[i] if i < len(lst) else None
+
+    def client_txn_at(self, key, ts):
+        """The exchange in which thread `key` was the client at ts (MsgSendv entered, not yet returned)."""
+        cache = self.__dict__.setdefault("_client_cache", {})
+        v = cache.get(key)
+        if v is None:
+            lst = sorted((t for t in self.m.txns if t.client == key and t.t_call is not None), key=lambda t: t.t_call)
+            v = cache[key] = (lst, [t.t_call for t in lst])
+        lst, calls = v
+        i = bisect.bisect_right(calls, ts) - 1
+        if i >= 0 and (lst[i].t_exit is None or ts < lst[i].t_exit):
+            return lst[i]
+        return None
 
 
 def _channel(tx):

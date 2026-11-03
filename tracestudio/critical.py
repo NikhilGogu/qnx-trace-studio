@@ -7,7 +7,8 @@ consecutive segments that never overlap, so the durations add up to the
 latency exactly:
   client running     the client thread executes (kernel call entry and exit)
   client ready       the client is runnable while other threads hold the CPUs it may use
-  server busy        the receiving thread runs, but not this request (SEND-blocked client)
+  server busy        the receiving thread runs, but not this request (SEND-blocked client),
+                     or it holds several received requests and the trace does not say which one it serves
   server waiting     the receiving thread is still RECEIVE-blocked (message not yet delivered)
   server preempted   the server thread is READY while other threads hold its CPUs
   server running     the server thread receives, runs or replies to this request
@@ -19,6 +20,7 @@ latency exactly:
 """
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 
 from .analyses import Timeline, us
@@ -117,25 +119,37 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
             return
         sl = m.label(srv)
         ss = _tn(m, srv)
-        handled = tl._handled(srv)
         for c, d, scode, sprio in tl.segments(srv, a, b):
             if scode == ST_RUNNING:
                 cuts = {c, d}
-                for h in handled:
-                    for t in (h.t_rx_exit, h.t_reply_call):
-                        if c < t < d:
-                            cuts.add(t)
+                lst, rx, reach = tl._handled_index(srv)
+                i0 = j = bisect.bisect_right(rx, c)
+                while j < len(lst) and rx[j] < d:          # requests received inside (c, d)
+                    cuts.add(rx[j])
+                    if lst[j].t_reply_call < d:
+                        cuts.add(lst[j].t_reply_call)
+                    j += 1
+                i = i0 - 1
+                while i >= 0 and reach[i] > c:             # requests received before c, replied inside
+                    if c < lst[i].t_reply_call < d:
+                        cuts.add(lst[i].t_reply_call)
+                    i -= 1
                 cuts = sorted(cuts)
                 for e, f in zip(cuts, cuts[1:]):
-                    h = tl.handling_at(srv, e)
-                    if h is tx:
+                    opened = tl.open_at(srv, e)
+                    h = opened[0] if len(opened) == 1 else None
+                    if len(opened) > 1:     # which of them the thread works on is not in the trace
+                        add(e, f, "server busy", "%s running with %d requests open (%s)" % (
+                            sl, len(opened), ", ".join("txn %d" % x.idx for x in sorted(opened, key=lambda x: x.idx))),
+                            srv, sprio, short="%s: %d requests open" % (ss, len(opened)))
+                    elif h is tx:
                         add(e, f, "server running", "%s running this request" % sl, srv, sprio,
                             short="%s runs this request" % ss)
                     elif h is not None:
                         add(e, f, "server busy", "%s running %s's request (txn %d)" % (sl, m.label(h.client), h.idx),
                             srv, sprio, short="%s busy: %s's request" % (ss, _tn(m, h.client)))
                     elif tx.t_rx_exit is not None and e < tx.t_rx_exit and (
-                            not handled or not any(x.t_rx_exit > e and x.t_rx_exit < tx.t_rx_exit for x in handled)):
+                            (tl.next_received_after(srv, e) or tx).t_rx_exit >= tx.t_rx_exit):
                         add(e, f, "server running", "%s receiving this request" % sl, srv, sprio,
                             short="%s receiving" % ss)
                     elif tx.t_reply_call is not None and e >= tx.t_reply_call:
@@ -147,8 +161,7 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                 for e, f, text, who, p in _held(tl, srv, c, d):
                     add_wait(e, f, "server preempted", srv, sprio, text)
             elif scode in (ST_SEND, ST_REPLY):
-                k = next((t for t in m.txns if t.client == srv and t.t_call is not None and t.t_call <= c
-                          and (t.t_exit is None or c < t.t_exit)), None)
+                k = tl.client_txn_at(srv, c)
                 if k is not None and k.parent == tx.idx and k.t_exit is not None and _depth < max_depth:
                     kids = _clip(critical_path(m, k, tl, max_depth, _depth + 1), c, d)
                     add(c, d, "nested request", "%s waits for %s (txn %d)" % (sl, m.server_name(k), k.idx),
