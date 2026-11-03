@@ -220,11 +220,12 @@ def test_check_fails_prio_fixed_and_passes_prio_inherit():
     import io
     import xml.etree.ElementTree as ET
     from tracestudio.cli import main
+    opts = ["--deadline", "hi=5000", "--no-inversions", "--max-insufficient", "2"]
     for name, code in (("prio_fixed", 1), ("prio_inherit", 0)):
         xml = os.path.join(TMP, name + ".junit.xml")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            assert main(["check", kev(name), "--deadline", "hi=5000", "--no-inversions", "--junit", xml]) == code
+            assert main(["check", kev(name)] + opts + ["--junit", xml]) == code
         text = out.getvalue()
         root = ET.parse(xml).getroot()
         (suite,) = root.findall("testsuite")
@@ -233,34 +234,55 @@ def test_check_fails_prio_fixed_and_passes_prio_inherit():
         assert [c.get("name") for c in cases] == ["trace integrity", "deadline hi=5000 us",
                                                   "no suspected priority inversions"]
         failures = [c.find("failure") for c in cases]
+        assert "matched ts_pload/hi@30 -> procnto-smp-instr (1), ts_pload/hi@30 -> ts_psrv (20)" in text
+        assert "2 with insufficient evidence (at most 2 allowed)" in text
         if code:
             assert "FAIL deadline hi=5000 us: 20 of 21 trustworthy requests over 5000 us, max 11429.5 us" in text
-            assert "FAIL no suspected priority inversions: 20 suspected" in text and "txn 520: ts_pload/hi (prio 30)" in text
+            assert "FAIL no suspected priority inversions: 20 suspected; checked 672 exchanges" in text
+            assert "txn 520: ts_pload/hi (prio 30)" in text
             assert suite.get("failures") == "2" and failures[0] is None
             assert failures[1].get("type") == "DeadlineMissed" and "txn 524: ts_pload/hi -> ts_psrv" in failures[1].text
             assert failures[2].get("type") == "PriorityInversion" and "ts_pload/hog (prio 20)" in failures[2].text
         else:
             assert "check: 3 assertions, 0 failed" in text and "FAIL" not in text
             assert suite.get("failures") == "0" and failures == [None, None, None]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):                       # inconclusive requests count against --no-inversions
+        assert main(["check", kev("prio_inherit"), "--no-inversions"]) == 1
+    assert "2 with insufficient evidence (at most 0 allowed)" in out.getvalue()
 
 
 def test_open_converts_once_and_pins_the_slowest_clients():
     import contextlib
     import io
     import shutil
+    from tracestudio import __version__
     from tracestudio.cli import main
-    from tracestudio.serve import default_pins
+    from tracestudio.serve import cache_path, default_pins
     pins, labels = default_pins(Model(KevFile(kev("prio_fixed"))))
     assert pins == ["^lo (critical path|QNX state)", "^hi (critical path|QNX state)"]
     assert labels == ["ts_pload/lo", "ts_pload/hi"]
-    path = os.path.join(TMP, "open_me.kev")
-    shutil.copy(kev("prio_fixed"), path)
-    for want in ("converted ", "using "):                # converts once, then reuses the cached file
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            assert main(["open", path, "--no-browser", "--port", "0", "--timeout", "1", "--pin", "^hi "]) == 1
-        assert want in out.getvalue() and "pinning tracks matching ^hi " in out.getvalue()
-    assert os.path.exists(os.path.join(TMP, "open_me.perfetto-trace"))
+    assert default_pins(Model(KevFile(kev("prio_fixed"))), [("hi@ts_psrv", 5000.0)])[1] == ["ts_pload/hi"]
+    old = os.environ.get("XDG_CACHE_HOME")
+    os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp(prefix="ts-cache-")
+    try:
+        path = os.path.join(TMP, "open_me.kev")
+        shutil.copy(kev("prio_fixed"), path)
+        cached = cache_path(path, __version__)
+        for step in ("converted ", "using ", "incomplete; converting again"):
+            if step.startswith("incomplete"):
+                with open(cached, "r+b") as f:                # an interrupted write must not be reused
+                    f.truncate(1000)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                assert main(["open", path, "--no-browser", "--port", "0", "--timeout", "1", "--pin", "^hi "]) == 1
+            assert step in out.getvalue() and "pinning tracks matching ^hi " in out.getvalue()
+        assert os.path.getsize(cached) > 1000 and not os.path.exists(os.path.join(TMP, "open_me.perfetto-trace"))
+    finally:
+        if old is None:
+            os.environ.pop("XDG_CACHE_HOME", None)
+        else:
+            os.environ["XDG_CACHE_HOME"] = old
 
 
 if __name__ == "__main__":

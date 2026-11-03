@@ -1498,30 +1498,79 @@ def test_cli_rejects_bad_numbers_and_reports_io_errors():
 
 
 # ---- open and check (phase 2a) ------------------------------------------------------------------------
-def test_open_serves_the_page_and_the_trace_without_coop():
+def test_open_serves_only_its_page_to_its_origin_with_a_token():
+    import http.client
     import threading
     import urllib.parse
-    import urllib.request
     from tracestudio.serve import make_server, regex_literal, serve_until_delivered
     pin = "^" + regex_literal("a.b (x)") + " critical path"
-    srv = make_server(b"\x0a\x02trace", "t.kev", "t.perfetto-trace", [pin], 0)
-    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    srv = make_server(b"\x0a\x02tr", "t.kev", "t.kev.perfetto-trace", [pin], 0)
+    port = srv.server_address[1]
     done = []
     th = threading.Thread(target=lambda: done.append(serve_until_delivered(srv, 30)))
     th.start()
-    with urllib.request.urlopen(base + "/") as r:
-        page = r.read().decode()
-        assert r.headers.get("Cross-Origin-Opener-Policy") is None
+
+    def req(method, path, host="127.0.0.1:%d" % port, origin=None, body=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        h = {"Host": host}
+        if origin:
+            h["Origin"] = origin
+        c.request(method, path, body=body, headers=h)
+        r = c.getresponse()
+        out = (r.status, r.read(), r.getheader("Cross-Origin-Opener-Policy"))
+        c.close()
+        return out
+    assert srv.url == "http://127.0.0.1:%d%s" % (port, srv.base) and len(srv.token) >= 32
+    status, page, coop = req("GET", srv.base)
+    assert status == 200 and coop is None
+    page = page.decode()
+    assert req("GET", srv.base, host="attacker.example:%d" % port)[0] == 421      # DNS rebinding
+    assert req("GET", srv.base, host="localhost:%d" % port)[0] == 200
+    assert req("GET", "/")[0] == 404 and req("GET", "/trace")[0] == 404           # the token is required
+    assert req("GET", srv.base + "trace")[1] == b"\x0a\x02tr"
+    assert req("POST", srv.base + "delivered", body=b"4")[0] == 403              # no Origin
+    assert req("POST", srv.base + "delivered", origin="https://evil.example", body=b"4")[0] == 403
+    assert not srv.delivered.is_set()
     ui = json.loads(page.split("const UI = ", 1)[1].split(", ORIGIN", 1)[0])
-    assert ui.startswith("https://ui.perfetto.dev/#!/?startupCommands=")
     cmds = json.loads(urllib.parse.unquote(ui.split("startupCommands=", 1)[1]))
     assert cmds == [{"id": "dev.perfetto.PinTracksByRegex", "args": [r"^a\.b \(x\) critical path"]}]
-    assert '"PING"' in page and "perfetto: {buffer: trace, title: TITLE, fileName: FILE}" in page
-    with urllib.request.urlopen(base + "/trace") as r:
-        assert r.read() == b"\x0a\x02trace"
-    urllib.request.urlopen(urllib.request.Request(base + "/delivered", data=b"", method="POST")).close()
+    for js in ("e.origin !== ORIGIN", "ORIGIN, [trace]", "HANDSHAKE_MS", "win.closed", "if (!r.ok) throw",
+               ".catch(", "retryBtn", "Handed "):
+        assert js in page, js
+    assert req("POST", srv.base + "delivered", origin="http://127.0.0.1:%d" % port, body=b"4")[0] == 204
     th.join(10)
-    assert done == [True]
+    assert done == [True] and srv.handed_bytes == 4
+
+
+def test_open_cache_is_private_atomic_and_checked_for_completeness():
+    from tracestudio.serve import cache_dir, cache_path, trace_complete, write_atomic
+    old = os.environ.get("XDG_CACHE_HOME")
+    base = tempfile.mkdtemp(prefix="ts-cache-")
+    os.environ["XDG_CACHE_HOME"] = base
+    try:
+        d = cache_dir()
+        assert d == os.path.join(base, "tracestudio") and os.stat(d).st_mode & 0o777 == 0o700
+        src = os.path.join(TMP, "cache_src.kev")
+        with open(src, "wb") as f:
+            f.write(b"x")
+        p = cache_path(src, "1.0")
+        assert os.path.dirname(p) == d and p != cache_path(src, "2.0")        # a new version converts again
+        frame = b"\x0a\x03abc" * 3
+        write_atomic(p, frame)
+        assert os.listdir(d) == [os.path.basename(p)] and trace_complete(frame)
+        assert not trace_complete(frame[:-1]) and not trace_complete(b"") and not trace_complete(b"\x12\x00")
+        os.chmod(d, 0o755)                                                     # open to others: refused
+        try:
+            cache_dir()
+        except OSError as e:
+            assert "not private" in str(e)
+        else:
+            raise AssertionError("accepted a shared cache directory")
+    finally:
+        if old is None:
+            os.environ.pop("XDG_CACHE_HOME", None)
+        else:
+            os.environ["XDG_CACHE_HOME"] = old
 
 
 def test_check_fails_on_lost_events_and_on_nothing_checked():
@@ -1541,10 +1590,16 @@ def test_check_fails_on_lost_events_and_on_nothing_checked():
         assert main(["check", path, "--deadline", "c=10000"]) == 1
         assert main(["check", path, "--deadline", "c=10000", "--allow-loss"]) == 0
         assert main(["check", path, "--deadline", "nobody=10000", "--allow-loss"]) == 1
+        assert main(["check", path, "--deadline", "c@server=10000", "--allow-loss"]) == 0
+        assert main(["check", path, "--deadline", "c@mid=10000", "--allow-loss"]) == 1       # scoped to another server
+        assert main(["check", path, "--deadline", "c=10000", "--allow-loss", "--min-requests", "2"]) == 1
     text = out.getvalue()
     assert "FAIL trace integrity: 1 loss records" in text and "CPU 1: dropped" in text
     assert "PASS trace integrity: 1 loss records, allowed by --allow-loss" in text
-    assert "FAIL deadline nobody=10000 us: no trustworthy request to check" in text
+    assert "FAIL deadline nobody=10000 us: 0 trustworthy requests, at least 1 required" in text
+    assert "PASS deadline c@server=10000 us: 0 of 1 trustworthy requests over 10000 us" in text
+    assert "matched client/c@10 -> server (1)" in text
+    assert "FAIL deadline c=10000 us: 1 trustworthy requests, at least 2 required" in text
     with contextlib.redirect_stderr(io.StringIO()):
         assert main(["check", path]) == 2                         # no assertion given
         try:
@@ -1553,3 +1608,46 @@ def test_check_fails_on_lost_events_and_on_nothing_checked():
             assert e.code == 2
         else:
             raise AssertionError("accepted inf")
+
+
+def test_check_inversions_need_coverage_and_count_inconclusive():
+    from tracestudio.check import Result, junit_xml
+    from tracestudio.cli import main
+    import xml.etree.ElementTree as ET
+    g = Gen(ncpu=1)                                                # the only exchange is untrustworthy
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 1000, RUNNING, C, 10)
+    g.send(0, T + 1010, C, S[0], 0x10001)
+    g.receive(0, T + 1050, S, C, 0x10001, info_client=B)
+    g.reply(0, T + 2000, S, C, 0x10001)
+    g.wait_receive(0, T + 2040, S)
+    g.send_exit(0, T + 2100, C)
+    none = os.path.join(TMP, "check_none.kev")
+    with open(none, "wb") as f:
+        f.write(g.bytes())
+    unclear = os.path.join(TMP, "check_unclear.kev")             # run mask not traced: insufficient evidence
+    with open(unclear, "wb") as f:
+        f.write(prio_scene(None, M, 20, gen=True).bytes())
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        assert main(["check", none, "--no-inversions", "--allow-loss"]) == 1
+        assert main(["check", unclear, "--no-inversions"]) == 1
+        assert main(["check", unclear, "--no-inversions", "--max-insufficient", "1"]) == 0
+        assert main(["check", unclear, "--no-inversions", "--max-insufficient", "1", "--min-checked", "5"]) == 1
+        bad = os.path.join(TMP, "check_report.xml")
+        assert main(["check", os.path.join(TMP, "missing.kev"), "--no-inversions", "--junit", bad]) == 1
+    text = out.getvalue()
+    assert "FAIL no suspected priority inversions: 0 suspected; checked 0 exchanges (at least 1 required)" in text
+    assert "FAIL no suspected priority inversions: 0 suspected; checked 1 exchanges (at least 1 required), " \
+           "1 with insufficient evidence (at most 0 allowed)" in text
+    assert "run mask of server/s1 not traced" in text
+    root = ET.parse(bad).getroot()                                 # a report even when the trace cannot be read
+    (case,) = root.iter("testcase")
+    assert root.get("errors") == "1" and case.find("error").get("type") == "TraceError"
+    doc = junit_xml([Result("odd \x01 name", False, "bell \x07 here", ["esc \x1b[0m"])], "t.kev", 0.0, "x")
+    f = ET.fromstring(doc.split("?>", 1)[1]).find(".//failure")    # parses: forbidden characters replaced
+    assert f.get("message") == "bell ? here" and "esc ?[0m" in f.text
+
+

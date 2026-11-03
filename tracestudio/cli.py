@@ -349,90 +349,91 @@ def _regex(text):
     return text
 
 
-def _cached_conversion(path):
-    """Where `open` keeps the converted trace: next to the input, else in the temp dir; and whether it is newer
-    than the input (then it is reused)."""
-    import hashlib
-    import os
-    import tempfile
-    stem = path[:-3] if path.endswith(".gz") else path
-    stem = stem[:-4] if stem.endswith(".kev") else stem
-    out = stem + ".perfetto-trace"
-    if not os.access(os.path.dirname(os.path.abspath(out)), os.W_OK):
-        out = os.path.join(tempfile.gettempdir(), "tracestudio-%s.perfetto-trace"
-                           % hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:12])
-    fresh = os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path)
-    return out, fresh
-
-
 def cmd_open(a):
     import getpass
     import os
     import socket
     import webbrowser
-    from .serve import default_pins, make_server, serve_until_delivered
+    from . import __version__
+    from .serve import cache_path, default_pins, make_server, serve_until_delivered, trace_complete, write_atomic
     pins, labels = list(a.pin or []), []
     if a.trace.endswith((".perfetto-trace", ".pftrace")):
         out = a.trace
+        with open(out, "rb") as f:
+            data = f.read()
         if not pins:
             print("note: no tracks pinned (give --pin REGEX; defaults need the .kev)")
     else:
-        out, fresh = _cached_conversion(a.trace)
-        if not fresh or not pins:
+        out = cache_path(a.trace, __version__)      # private cache: ~/.cache/tracestudio, mode 0700
+        data = None
+        if os.path.exists(out):
+            with open(out, "rb") as f:
+                data = f.read()
+            if not trace_complete(data):
+                print("note: cached %s is incomplete; converting again" % out)
+                data = None
+        if data is None or not pins:
             kev, model, _ = _load(a.trace)
             if not kev.events():
                 print("error: %s has no events" % a.trace, file=sys.stderr)
                 return 1
-            if not fresh:
-                from .perfetto_out import write
-                write(model, out)
+            if data is None:
+                from .perfetto_out import Writer
+                data = Writer(model, True, None).build()
+                write_atomic(out, data)
                 print("converted %s -> %s" % (a.trace, out))
+            else:
+                print("using %s (converted earlier from this trace)" % out)
             if not pins:
                 pins, labels = default_pins(model, a.deadline or [])
-        if fresh:
-            print("using %s (newer than the trace)" % out)
-    with open(out, "rb") as f:
-        data = f.read()
+        else:
+            print("using %s (converted earlier from this trace)" % out)
     try:
-        srv = make_server(data, os.path.basename(a.trace), os.path.basename(out), pins, a.port)
+        srv = make_server(data, os.path.basename(a.trace), os.path.basename(a.trace) + ".perfetto-trace", pins, a.port)
     except OSError as e:
         print("error: cannot listen on 127.0.0.1:%d (%s); choose another --port" % (a.port, e), file=sys.stderr)
         return 1
-    url = "http://127.0.0.1:%d/" % srv.server_address[1]
+    url, port = srv.url, srv.server_address[1]
     print("serving %s (%d bytes) at %s (this machine only)" % (out, len(data), url))
     if pins:
         print("pinning tracks matching %s%s" % (", ".join(pins), " (clients %s)" % ", ".join(labels) if labels else ""))
     if a.no_browser or not webbrowser.open(url):
-        port = srv.server_address[1]
         print("open %s in a browser on this machine; from another machine, forward the port first:" % url)
-        print("  ssh -N -L %d:127.0.0.1:%d %s@%s     then open %s there" % (
-            port, port, getpass.getuser(), socket.gethostname(), url))
-    print("waiting for the browser (Ctrl-C to stop) ...")
+        print("  ssh -N -L %d:127.0.0.1:%d %s@%s     then open the same URL there" % (
+            port, port, getpass.getuser(), socket.gethostname()))
+    print("waiting for the browser (Ctrl-C to stop) ...", flush=True)
     if serve_until_delivered(srv, a.timeout):
-        print("trace delivered to the Perfetto UI")
+        print("trace handed to Perfetto (%s bytes); the UI loads it in its tab" % (
+            srv.handed_bytes if srv.handed_bytes is not None else len(data)))
         return 0
-    print("stopped before the trace was delivered", file=sys.stderr)
+    print("stopped before the trace was handed to Perfetto", file=sys.stderr)
     return 1
 
 
 def cmd_check(a):
     from . import __version__
-    from .check import junit_xml, render, run_checks
+    from .check import junit_error, junit_xml, render, run_checks, write_report
     if not (a.deadline or a.max_latency or a.no_inversions or a.max_insufficient is not None):
         print("error: nothing to check: give --deadline, --max-latency, --no-inversions or --max-insufficient",
               file=sys.stderr)
         return 2
     t0 = time.time()
-    kev, model, _ = _load(a.trace)
-    if not kev.events():
-        print("error: %s has no events" % a.trace, file=sys.stderr)
+    try:
+        kev, model, _ = _load(a.trace)
+        if not kev.events():
+            raise KevError("the trace has no events")
+    except (KevError, OSError, EOFError) as e:       # still leave a report, so CI never reads a stale one
+        msg = "cannot check %s: %s" % (a.trace, e)
+        print("error: " + msg, file=sys.stderr)
+        if a.junit:
+            write_report(a.junit, junit_error(a.trace, msg, time.time() - t0, __version__))
+            print("wrote %s" % a.junit)
         return 1
     results = run_checks(model, _timeline(model, a), a)
     for line in render(results):
         print(line)
     if a.junit:
-        with open(a.junit, "w") as f:
-            f.write(junit_xml(results, a.trace, time.time() - t0, __version__))
+        write_report(a.junit, junit_xml(results, a.trace, time.time() - t0, __version__))
         print("wrote %s" % a.junit)
     return 0 if all(r.ok for r in results) else 1
 
@@ -460,8 +461,9 @@ def main(argv=None):
         else:
             s.add_argument("before")
             s.add_argument("after")
-        s.add_argument("--deadline", action="append", metavar="THREAD=US", type=_deadline_spec,
-                       help="count requests of client threads with this name slower than US microseconds")
+        s.add_argument("--deadline", action="append", metavar="THREAD[@SERVER]=US", type=_deadline_spec,
+                       help="count requests of client threads with this name (to this server process only, with "
+                            "@SERVER) slower than US microseconds")
         s.add_argument("--client", help="only client threads whose label contains this text")
         s.add_argument("--min-us", type=_us, default=100.0, help="inversion evidence threshold (default 100)")
         s.add_argument("--runmask", action="append", metavar="PROCESS[/THREAD]=MASK", type=_runmask_spec,
@@ -491,13 +493,19 @@ def main(argv=None):
     s.set_defaults(fn=cmd_open)
     s = sub.add_parser("check", help="real-time assertions: exit status 1 on any failure, JUnit XML for CI")
     s.add_argument("trace")
-    s.add_argument("--deadline", action="append", metavar="THREAD=US", type=_deadline_spec,
-                   help="every trustworthy MsgSend of client threads with this name ends within US microseconds")
-    s.add_argument("--max-latency", action="append", metavar="CLIENT=US", type=_deadline_spec,
+    s.add_argument("--deadline", action="append", metavar="THREAD[@SERVER]=US", type=_deadline_spec,
+                   help="every trustworthy MsgSend of client threads with this name (to this server process only, "
+                        "with @SERVER) ends within US microseconds")
+    s.add_argument("--max-latency", action="append", metavar="CLIENT[@SERVER]=US", type=_deadline_spec,
                    help="the same for client threads whose label (process/thread) contains CLIENT")
+    s.add_argument("--min-requests", type=_count, default=1, metavar="N",
+                   help="each --deadline and --max-latency needs at least N trustworthy requests (default 1)")
+    s.add_argument("--min-checked", type=_count, default=1, metavar="N",
+                   help="inversion assertions need at least N exchanges checked by the analysis (default 1)")
     s.add_argument("--no-inversions", action="store_true", help="no suspected priority inversion")
     s.add_argument("--max-insufficient", type=_count, metavar="N",
-                   help="at most N requests with insufficient evidence for the inversion analysis")
+                   help="at most N requests with insufficient evidence for the inversion analysis (default 0 "
+                        "with --no-inversions)")
     s.add_argument("--allow-loss", action="store_true",
                    help="do not fail because of lost events or untrustworthy requests (they are still reported)")
     s.add_argument("--min-us", type=_us, default=100.0, help="inversion evidence threshold (default 100)")
