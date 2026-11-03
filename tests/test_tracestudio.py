@@ -24,6 +24,7 @@ from tracestudio.analyses import deadline_misses, suspected_inversions  # noqa: 
 
 DATA = os.path.join(HERE, "data", "run1")
 DATA3 = os.path.join(HERE, "data", "run3")
+DATA4 = os.path.join(HERE, "data", "run4")
 TMP = tempfile.mkdtemp(prefix="ts-test-")
 SCEN = ["ipc_wide", "ipc_fast", "prio_inherit", "prio_fixed"]
 
@@ -287,6 +288,51 @@ def test_open_converts_once_and_pins_the_slowest_clients():
             os.environ.pop("XDG_CACHE_HOME", None)
         else:
             os.environ["XDG_CACHE_HOME"] = old
+
+
+
+def test_mutex_chain_captures():
+    import csv
+    from tracestudio.analyses import Timeline, mutex_waits
+    from tracestudio.critical import critical_path
+    tp = shutil.which("traceprinter")
+    for name, inherit in (("mutex_chain_hog", True), ("mutex_chain_nopi", False)):
+        path, logs = kev(name, DATA4), os.path.join(DATA4, name + ".logs")
+        m = Model(KevFile(path))
+        res, _, _ = validate(m, logs)
+        assert res["ok"] and res["requests"] == res["matched"] == 20 and res["mutex_waits_logged"] == 20, res
+        for c in ("mutex_address", "mutex_owner", "mutex_owner_value", "mutex_release", "mutex_owner_request"):
+            assert res["checks"][c + ":ok"] == 20, (name, c, res["checks"])
+        tl = Timeline(m)
+        rows = [r for r in mutex_waits(m, tl, 100.0) if r["waiter"] == "ts_mutex/mrx"]
+        assert len(rows) == 20 and all(r["owner"] == "ts_mutex/holder" for r in rows)
+        assert all((r["owner_prio_max"] == 30) == inherit for r in rows)      # mutex priority inheritance, or not
+        hi = [t for t in m.txns if m.label(t.client) == "ts_mutex/hi" and m.server_name(t) == "ts_mutex" and t.causal]
+        worst = max(hi, key=lambda t: t.t_exit - t.t_call)
+        segs = critical_path(m, worst, tl)
+        assert sum(sg.t1 - sg.t0 for sg in segs) == worst.t_exit - worst.t_call
+        (n,) = [sg for sg in segs if sg.kind == "nested request"]
+        assert "MUTEX-blocked on mutex" in n.label and "owned by ts_mutex/holder, which waits for ts_mslow" in n.label
+        kids = " | ".join(k.label for k in n.children)
+        assert ("hog (prio 20)" in kids) == (not inherit), kids               # without inheritance the hog cuts in
+        if tp:
+            txt = os.path.join(TMP, name + ".txt")
+            subprocess.run([tp, "-f", path, "-o", txt], check=True)
+            r = subprocess.run([sys.executable, os.path.join(HERE, "..", "tools", "compare_traceprinter.py"), path, txt],
+                               capture_output=True, text=True)
+            assert r.returncode == 0 and "mismatches: 0 (sign only: 0)" in r.stdout, r.stdout
+        elif os.environ.get("TS_REQUIRE_ALL"):
+            raise AssertionError("traceprinter not found")
+    bad = tempfile.mkdtemp(prefix="ts-mutex-logs-")                 # a log that names another owner value
+    for f in os.listdir(os.path.join(DATA4, "mutex_chain_hog.logs")):
+        with open(os.path.join(DATA4, "mutex_chain_hog.logs", f)) as src, open(os.path.join(bad, f), "w") as dst:
+            for line in src:
+                parts = line.rstrip("\n").split(",")
+                if len(parts) == 10 and parts[4] == "LOCKED" and parts[5] == "1":
+                    parts[7] = str(int(parts[7]) + 1)
+                dst.write(",".join(parts) + "\n")
+    res, _, _ = validate(Model(KevFile(kev("mutex_chain_hog", DATA4))), bad)
+    assert not res["ok"] and "mutex_owner_value:WRONG" in res["failed_checks"]
 
 
 if __name__ == "__main__":
