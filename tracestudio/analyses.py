@@ -310,13 +310,25 @@ def ipc_latency(model):
     return out
 
 
+def split_selector(name):
+    """THREAD or THREAD@SERVER (a deadline selector) -> (thread, server process name or None)."""
+    thread, at, server = name.rpartition("@")
+    return (thread, server) if at and thread and server else (name, None)
+
+
+def selector_matches(model, selector, thread_name, tx):
+    """Whether a request `tx` from a thread called `thread_name` is selected by THREAD or THREAD@SERVER."""
+    thread, server = split_selector(selector)
+    return thread_name == thread and (server is None or model.server_name(tx) == server)
+
+
 def deadline_misses(model, thread_name, deadline_us, only=None):
-    """{server process: {requests, missed, max_us, excluded, unfinished}} for client threads with this name
-    (and, with `only`, for which only(client key) holds)."""
+    """{server process: {requests, missed, max_us, excluded, unfinished}} for client threads with this name, or
+    THREAD@SERVER for one server (and, with `only`, for which only(client key) holds)."""
     out = {}
     for t in model.txns:
         th = model.threads.get(t.client)
-        if not th or th.name != thread_name or only is not None and not only(t.client):
+        if not th or not selector_matches(model, thread_name, th.name, t) or only is not None and not only(t.client):
             continue
         r = out.setdefault(model.server_name(t), {"requests": 0, "missed": 0, "max_us": 0.0, "excluded": 0,
                                                  "unfinished": 0})
