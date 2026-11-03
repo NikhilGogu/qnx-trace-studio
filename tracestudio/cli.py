@@ -185,7 +185,7 @@ def cmd_analyze(a):
     if len(inv["suspected"]) > a.top:
         p("  ... %d more (use --json)" % (len(inv["suspected"]) - a.top))
     if inv["insufficient_evidence"]:
-        p("insufficient evidence (low-priority server READY, cause not shown by the trace): %d" %
+        p("insufficient evidence (the trace cannot show whether the server was held up): %d" %
           len(inv["insufficient_evidence"]))
         for r in inv["insufficient_evidence"][:a.top]:
             p("  txn %d: %s -> %s, %.1f us unexplained: %s" % (r["txn"], r["client"], r["server"], r["unexplained_us"],

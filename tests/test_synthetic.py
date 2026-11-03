@@ -995,7 +995,7 @@ def opened(g, cpu, ts, client, server, path, coid, rcvid, first=(0x00020100, 0, 
     return ts + 300
 
 
-def test_paths_need_a_confirmed_open_and_names_a_resource_manager():
+def test_paths_need_an_answered_open_and_stay_candidates():
     g = Gen(ncpu=1)
     g.buffer(0, T)
     g.names(0, T, NAMES)

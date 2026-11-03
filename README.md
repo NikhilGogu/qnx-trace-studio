@@ -5,10 +5,10 @@ trace-studio reads QNX OS 8.0 kernel event traces (`.kev` files written by `trac
 What it does:
 
 - Reads `.kev` files directly with its own parser, so no QNX libraries are needed on the host. Its events and arguments matched the SDP's `traceprinter` exactly on the 14 captures listed below.
-- Converts to a Perfetto trace: per-CPU scheduling tracks, QNX thread states as the kernel reports them (SEND, RECEIVE, REPLY, MUTEX, ...), QNX priorities, each message exchange it can link with the server's handling and reply joined by arrows, resource-manager message names (`MsgSend _IO_READ -> devb-eide`) with the path the file was opened with, pulses, interrupts, and a critical-path track per client thread.
+- Converts to a Perfetto trace: per-CPU scheduling tracks, QNX thread states as the kernel reports them (SEND, RECEIVE, REPLY, MUTEX, ...), QNX priorities, every message exchange it can link with the server's handling and the reply (joined by arrows when the exchange is trustworthy), resource-manager message names, pulses, interrupts, and a critical-path track per client thread. Names and paths that rest on a heuristic are labelled as candidates (`MsgSend _IO_READ (candidate) -> devb-eide`, argument `path_candidate`).
 - `analyze`: latency per client and server, deadline misses, suspected priority inversions with the evidence, and the critical path of any request.
 - `diff`: before and after comparison of two traces.
-- Says when it does not know: exchanges that cross lost events, carry contradictory kernel information or have an ambiguous parent are kept but excluded from the analyses and counted; conclusions the trace cannot support are reported as "insufficient evidence" or "not explained by the trace".
+- Says when it does not know: exchanges that cross lost events or carry contradictory kernel information are kept, marked `[not trustworthy]` and left out of the analyses, with counts; a request with an ambiguous parent counts for latency but not for critical paths or inversions; conclusions the trace cannot support are reported as "insufficient evidence", "not explained by the trace" or "unknown".
 
 ## Install
 
@@ -32,7 +32,7 @@ tracelogger -w -k 32 -b 128 -s 4 -f /tmp/trace.kev      # 4 seconds, wide mode
 
 `-k 32` asks for 32 kernel buffers of 16 KB per CPU and `-b 128` for tracelogger-side buffers; with these, none of the captures below lost a buffer or dropped an event. Copy the file to the host (`scp target:/tmp/trace.kev .`).
 
-The inversion analysis needs to know which CPUs the server may use, so it uses run masks set during the trace with `ThreadCtl(_NTO_TCTL_RUNMASK)`; for a server whose mask was set before the trace started, the result is "insufficient evidence".
+The inversion analysis needs to know which CPUs the server may use. The trace records only run masks set while tracing (`ThreadCtl(_NTO_TCTL_RUNMASK)`); for a server whose mask was set before the trace started, the result is "insufficient evidence" unless you state the mask yourself with `analyze --runmask PROCESS[/THREAD]=MASK` or `--assume-unpinned PROCESS` (see Analyze).
 
 The example traces were captured on QNX 8.0.0 x86_64 under QEMU/KVM (image built with `mkqnximage --type=qemu --arch=x86_64`, 2 CPUs, 1 GB). The workload in `workload/` (build with `source qnxsdp-env.sh && make -C workload`, which runs `qcc -Vgcc_ntox86_64`) and `workload/run_scenarios.sh` reproduce them:
 
@@ -58,7 +58,7 @@ tracestudio convert trace.kev                  # writes trace.perfetto-trace
 
 Open the output in https://ui.perfetto.dev ("Open trace file"). The trace stays in the browser. You can also query it with Perfetto SQL (`trace_processor_shell` or the `perfetto` Python package).
 
-Each thread has its slice track (MsgSend, handle, MsgReply, pulses) and three child tracks: `QNX state` (the kernel's thread states, `qnx_prio` argument, UNKNOWN where data was lost), `QNX priority` (when it changes) and `critical path`. Slices carry `txn`, `rcvid`, `coid`, `message`, `path`, `latency_us`, `trustworthy` and any `warnings` as arguments; click a slice to see them and follow its arrows. A message type is named (`_IO_READ`) only on a connection known to be a resource-manager connection; otherwise `message` gives its number (`type 0x0101`).
+Each thread has its slice track (MsgSend, handle, MsgReply, pulses) and three child tracks: `QNX state` (the kernel's thread states, `qnx_prio` argument, UNKNOWN where data was lost), `QNX priority` (when it changes) and `critical path`. Every slice of an exchange (MsgSend, handle, MsgReply or MsgError, reply received) carries `txn`, `trustworthy` and any `warnings`; the MsgSend slice also has `rcvid`, `coid`, `message`, `path_candidate`, `client_qnx_prio`, `outcome` and `latency_us`. Click a slice to see them and follow its arrows. Arrows join only trustworthy exchanges; the slices of the others end in `[not trustworthy]`. Messages to procnto are named from its protocols (`_PROC_*`, `_IO_*`, ...). For other servers an `_IO_*` name needs a connection or channel that answered an `_IO_CONNECT` (type 0x100) in the trace; since an application message can use that number too, such names are labelled `(candidate)`, and other messages show their number (`type 0x0101`).
 
 Screenshots from ui.perfetto.dev (traces from `tests/data`):
 
@@ -70,7 +70,7 @@ hi's `MsgSend -> ts_psrv` selected: the arrow lands on psrv-rx's handling of hi'
 
 ![MsgSend flow](docs/img/hi_msgsend_flow.png)
 
-The same period with all tracks: QNX states (SEND, READY, ...) and the critical-path tracks (`txn 522 -> ts_psrv: 11194.1 us`, `psrv-rx READY (10), CPU: hog (20)`).
+The same period with all tracks: QNX states (SEND, READY, ...) and the critical-path tracks (`txn 522 -> ts_psrv: 11194.1 us`, `psrv-rx READY (10), CPU: hog (20) +4 more`).
 
 ![Critical path](docs/img/critical_path.png)
 
@@ -78,7 +78,7 @@ With priority inheritance (`prio_inherit`), psrv-rx's QNX priority rises from 10
 
 ![Priority inheritance](docs/img/psrv_priority_inherit.png)
 
-Resource-manager traffic (`rm_small`): `cat`'s `MsgSend _IO_READ -> devb-eide` with its arrow to devb-eide's `fsys_resmgr` thread, and its arguments.
+Resource-manager traffic (`rm_small`): `cat`'s `MsgSend _IO_READ (candidate) -> devb-eide` with its arrow to devb-eide's `fsys_resmgr` thread, and its arguments (`path_candidate` is the path the coid was probably opened with).
 
 ![_IO_READ slices](docs/img/io_read.png)
 ![_IO_READ arguments](docs/img/io_read_details.png)
@@ -92,17 +92,25 @@ tracestudio analyze prio_fixed.kev --deadline hi=5000
 prints latency per client and server, deadline misses, suspected inversions and fixed-priority channels (abridged, long lines wrapped):
 
 ```
-trace prio_fixed.kev: 690 message exchanges, 672 trustworthy (analyses use only those)
+trace prio_fixed.kev: 690 message exchanges, 682 trustworthy (analyses use only those)
+  10 of them have an ambiguous parent: kept in latency, left out of critical paths and inversions
 deadline hi=5000 us on ts_psrv: 20 of 20 requests missed, max 11429.5 us
-suspected priority inversions: 20 (checked 672 exchanges, 15 excluded as untrustworthy, threshold 100 us)
+suspected priority inversions: 20 (checked 672 exchanges, 5 excluded as untrustworthy, 10 with an ambiguous
+  parent, threshold 100 us)
   txn 520: ts_pload/hi (prio 30) waited 10937.8 us in MsgSend; for 8151.9 us of it (SEND-blocked 8151.9 us)
   ts_psrv/psrv-rx was READY at prio 10 while every CPU it may run on (CPU 0, run mask 0x1) ran a thread above
   prio 10, at least one of them below the client's 30; most of the time ts_pload/hog (prio 20) on CPU 0,
   8151.9 us; the server was busy with ts_pload/lo's request (txn 519).
+insufficient evidence (the trace cannot show whether the server was held up): 2
+  txn 94: ts_psrv/psrv-rx -> procnto-smp-instr/proc_pool_thread, 1146.3 us unexplained: request handed off:
+  received by procnto-smp-instr/proc_pool_thread (tid 14), replied by procnto-smp-instr/proc_pool_thread (tid 16)
+  ...
 channels created with _NTO_CHF_FIXED_PRIORITY: ts_psrv chid 1
 ```
 
-A suspected inversion needs evidence for every instant it counts: the client SEND- or REPLY-blocked on the server thread; the server READY at a lower priority than the client (priorities as known at that instant); the server's run mask traced and not invalidated since; every CPU in that mask busy with threads above the server, at least one of them below the client. While the client is SEND-blocked the server thread must also be provably the only thread of its process, since another one could receive the message. When the trace cannot show why a low-priority server was not running (untraced run mask, idle CPU, lost events, other possible receivers, sporadic scheduling, adaptive partitioning), the request is reported as "insufficient evidence" with the reasons. Use `--json` for everything, including all inversions.
+A suspected inversion needs evidence for every instant it counts: the client SEND- or REPLY-blocked on the server thread; the server READY at a lower priority than the client (priorities as known at that instant); the server's run mask traced and not invalidated since; every CPU in that mask busy with threads above the server, at least one of them below the client. While the client is SEND-blocked the server thread must also be provably the only thread of its process (a complete thread inventory with lifetimes, and no lost events), since another thread could receive the message; for multi-threaded servers the SEND phase is therefore always insufficient evidence. When another thread replies, the REPLY phase is insufficient evidence too: the trace does not say which threads worked on the request. When the trace cannot show why a low-priority server was not running (untraced run mask, idle CPU, lost events, other possible receivers, a handoff, sporadic scheduling, adaptive partitioning), the request is reported as "insufficient evidence" with the reasons. Use `--json` for everything, including all inversions.
+
+Run masks set before the trace started are not in it. If you know one from the program's code or configuration, say so: `--runmask ts_psrv/psrv-rx=0x1` (repeatable, hex, thread name optional) or `--assume-unpinned ts_psrv` (every CPU). A supplied mask applies to a thread only until the trace shows a mask event for it and only before the first lost events; every verdict that uses one says so in its evidence ("Relies on run mask 0x1 supplied by --runmask."), and `analyze` and `diff` count those verdicts separately. Without these options nothing is assumed.
 
 ## Critical path
 
@@ -120,9 +128,12 @@ txn 524: ts_pload/hi -> ts_psrv, MsgSend latency 11429.5 us
       0.5   8143.0   71.2  ts_psrv/psrv-rx READY at prio 10, CPUs held by ts_pload/hog (prio 20) on CPU 0 8142.8 us, ...
    8143.5    789.7    6.9  ts_psrv/psrv-rx running ts_pload/lo's request (txn 523)
    ...
+  10896.4      1.4    0.0  ts_psrv/psrv-rx running, not in a request
+  10897.8      0.4    0.0  ts_psrv/psrv-rx receiving this request (in MsgReceivev)
   10898.1    530.0    4.6  ts_psrv/psrv-rx running this request
+  11428.1      0.4    0.0  ts_psrv/psrv-rx replying
   11428.5      0.5    0.0  ts_pload/hi READY at prio 30, not explained by the trace: CPU 0 ran ts_psrv/psrv-rx (prio 10) 0.5 us
-   by kind: server preempted 8702.3 us, server busy 2193.5 us, server running 532.1 us, client running 1.1 us, unexplained ready 0.5 us
+   by kind: server preempted 8702.3 us, server busy 2194.9 us, server running 530.7 us, client running 1.1 us, unexplained ready 0.5 us
 ```
 
 A forwarded request (`ipc_wide`, txn 975) shows the nested server inline, and a wait the trace cannot explain as such:
@@ -133,7 +144,7 @@ A forwarded request (`ipc_wide`, txn 975) shows the nested server inline, and a 
     320.0     47.0    8.5  ts_front/front-rx0 READY at prio 10, not explained by the trace: CPU 0 idle (no run mask traced) 47.0 us
 ```
 
-Segment kinds: client running, client ready, server waiting, server busy (with another request, or holding several), server preempted, server running, nested request, server blocked, unexplained ready, unknown. A wait is "preempted" or "ready" only when every CPU the thread may use ran a known thread at or above its priority. `convert` writes the same segments to each client thread's `critical path` track.
+Segment kinds: client running, client ready, server waiting, server busy (with another request, holding several, or running outside any request), server preempted, server running (inside the MsgReceivev call that returned the request, handling it, replying), nested request, server blocked, unexplained ready, unknown (lost events, or a handoff: another thread replied, or the receiver went back to MsgReceive with the request open). A wait is "preempted" or "ready" only when every CPU the thread may use ran a known thread at or above its priority. `convert` writes the same segments to each client thread's `critical path` track.
 
 ## Diff
 
@@ -143,7 +154,7 @@ tracestudio diff prio_fixed.kev prio_inherit.kev --deadline hi=5000 --client ts_
 
 ```
 deadline hi=5000 us on ts_psrv: before 20/20 missed, max 11429.5 us | after 0/20 missed, max 2740.4 us
-suspected priority inversions: before 20 | after 0 (insufficient evidence: 0 | 0)
+suspected priority inversions: before 20 | after 0 (insufficient evidence: 2 | 2; relying on supplied run masks: 0 | 0)
 fixed-priority channels: before ts_psrv chid 1 | after none
 MsgSend latency (us), 2 pairs with the largest p99 change:
   client@priority                server                      n       p50       p90       p99       max  excluded/unfinished
@@ -172,7 +183,7 @@ Other commands: `tracestudio info trace.kev` (header, losses, decoder counters a
 | interrupted kernel calls (INT_CALL) | decoded as documented, never seen in a capture: timeouts and signals ended MsgSend with KER_EXIT and status -1 |
 | adaptive partitioning, sporadic scheduling, QVM guests | untested; inversion analysis reports insufficient evidence when they appear |
 | Python 3.10 and 3.12 | verified (`pip install .` in fresh venvs, test suite) |
-| Perfetto UI | checked in ui.perfetto.dev v59 |
+| Perfetto UI | checked in ui.perfetto.dev (screenshots taken 3 Nov 2026) |
 
 ## Validation evidence
 
@@ -180,24 +191,24 @@ All numbers come from commands run on the build box (Ubuntu 22.04, QNX SDP 8.0) 
 
 - Parser against `traceprinter` (`tools/compare_traceprinter.py`): 672,043 events identical in timestamp, CPU, class and event; 2,198,839 argument values compared, 0 mismatches. The largest capture (`rm_traffic`, 12.4 MB) has 306,436 events.
 - Message linking against the workload's own logs (`tracestudio validate`): 1,040 of 1,040 logged requests matched to the right client thread, server thread and rcvid (480 in run 1, 480 in run 2, 80 in run 3), including all 160 forwarded requests of runs 1 and 2 linked to their parent, with rcvids reused up to 186 times.
-- Inversions: 20 of 20 hi requests flagged with a fixed-priority channel and 0 with inheritance, both when the hog strikes before the receive (`prio_fixed`, median 8.2 ms of evidence each, SEND-blocked) and after it (`prio_fixed_rx`, median 10.0 ms, REPLY-blocked); 0 in the wide-mode IPC capture. Fast mode records no priorities, so for `ipc_fast` 12 requests are reported as insufficient evidence and none as inversions. Deadline misses at 5 ms: 20/20 versus 0/20 in both pairs.
+- Inversions: 20 of 20 hi requests flagged with a fixed-priority channel and 0 with inheritance, both when the hog strikes before the receive (`prio_fixed`, median 8.2 ms of evidence each, SEND-blocked) and after it (`prio_fixed_rx`, median 10.0 ms, REPLY-blocked); 0 in the wide-mode IPC capture. Requests that procnto received on one thread and replied to on another are reported as insufficient evidence: 2 in `prio_fixed`, 2 in `prio_inherit`, 1 in `prio_inherit_rx`, 2 in `ipc_wide`. Fast mode records no priorities, so `ipc_fast` has no inversions and 15 requests with insufficient evidence (12 for the missing priorities, 3 handoffs). Deadline misses at 5 ms: 20/20 versus 0/20 in both pairs.
 - Cancellation (`cancel`): all 15 logged sends decoded with the logged outcome (5 replied, 10 cancelled by ETIMEDOUT or EINTR), and the 10 late MsgReply calls that failed in the log are exactly the 10 replies the decoder could not attach to any exchange.
-- Resource managers: the bytes `cat` read through each coid path equal the file sizes for all 26 files in `rm_traffic` (librcheck.so is a symlink and counts under librcheck.so.1) and both files in `rm_small`; 81 messages in `rm_traffic` carry an `_IO_*` type number on connections not known to be resource-manager connections and are left unnamed.
+- Resource managers: summing the bytes of `cat`'s `_IO_READ` replies per candidate path gives 26 paths in `rm_traffic`: 25 equal the file size (`wc -c` on the target) and `librcheck.so.1` has twice its size, because `cat` also read it through the symlink `librcheck.so`; both files in `rm_small` match. In `rm_traffic` 7,293 `_IO_*` names are candidates (servers other than procnto), and 90 messages with an `_IO_*` number on connections with no `_IO_CONNECT` evidence are left unnamed. This checks the path heuristic on these captures only.
 - Fault injection (`tools/drop_buffer.py`): removing 4 of the 15 kernel buffers inside the workload window of `ipc_wide` leaves 108 of 200 requests matched, 62 without a candidate, none matched to a wrong exchange in that test, and validation fails as it should.
 - Perfetto import: TraceProcessor 0.59.1 loads all 14 converted captures with no error or data-loss stats; every flow joins slices of one transaction; no slice has a negative duration.
-- Tests: `python3 tests/test_tracestudio.py` (or pytest) runs 57 tests: 47 on synthetic slot streams, including a counterexample for each finding of the second review (deleted middle slots, unanchored timestamps, losses at trace start, READY inside a loss window, partial thread events, untraced run masks, inheriting channels, other possible receivers, sporadic scheduling, clipped attribution, untrustworthy children, unreplied requests, idle CPUs, empty masks, stale replies, ambiguous parents, wakeups without evidence, pulse queues out of sync, unrelated ConnectAttach, unqualified `_IO_*` numbers, same-named threads, overlapping handling), and 10 on the captures in `tests/data` (including CLI exit codes). With `TS_REQUIRE_ALL=1` a missing `traceprinter` or perfetto package fails the run; all 57 pass that way on the build box.
-- Speed on the build box: `ipc_wide` (1.7 MB, 44,807 events) converts in 0.86 s with 102 MB peak memory; `rm_traffic` in 7.4 s with 725 MB; `analyze` takes 0.4 s and 2.7 s.
+- Tests: `python3 tests/test_tracestudio.py` (or pytest) runs 66 tests: 56 on synthetic slot streams, including a counterexample for each finding of the second and third reviews (among them: deleted middle slots, a partial final slot, losses at trace start, unanchored timestamps, READY inside a loss window, untraced and supplied run masks, inheriting channels, stale channel identities after a loss, other possible receivers, reused thread ids, sporadic scheduling, clipped attribution, untrustworthy children, receive attribution, cross-thread replies, stale replies, ambiguous parents, wakeups across a re-block, pulse queues out of sync, candidate paths and names, untrustworthy exchanges without arrows), and 10 on the captures in `tests/data` (including CLI exit codes). With `TS_REQUIRE_ALL=1` a missing `traceprinter` or perfetto package fails the run; all 66 pass that way on the build box.
+- Speed on the build box: `ipc_wide` (1.7 MB, 44,807 events) converts in 0.87 s with 103 MB peak memory; `rm_traffic` in 7.5 s with 734 MB; `analyze` takes 0.37 s and 2.8 s.
 
 ## Limitations
 
 - The thread that runs a kernel call is inferred as the last thread switched in on that CPU. This held for every logged request, but it is an inference; it becomes "unknown" inside loss windows and after a migration until the next switch.
 - Fast-mode traces carry no priorities, `_msg_info` or message payload beyond msg[0]: no inversion analysis and no pulse values.
-- Wakeups appear in Perfetto ("woken by") only with object evidence: the woken thread later receives the message or pulse sent in the waker's kernel call, or the waker's reply names it. Timer, interrupt, synchronisation-object and cross-CPU wakeups have no waker; the QNX state track still shows READY.
+- Wakeups appear in Perfetto ("woken by") only with object evidence: the woken thread receives the message or pulse sent in the waker's kernel call before it blocks again, or the waker's reply names it. Timer, interrupt, synchronisation-object and cross-CPU wakeups have no waker; the QNX state track still shows READY.
 - Perfetto's own thread-state view maps QNX states to Linux ones (blocked states become "Sleeping"); the `QNX state` track has the kernel's states. The priority column of Perfetto's sched table holds the QNX priority (0 to 255, higher wins), not a Linux prio.
-- The inversion analysis needs the server's run mask traced (`ThreadCtl` during the trace) and, while SEND-blocked, a single-threaded server process; it is one level deep (it does not chain through a server that is itself blocked on another server or a mutex).
-- The critical path follows trustworthy nested requests, not mutexes, condvars or handoffs to other threads (it says "handed off, not followed"); a server holding several received requests is reported as such, since the trace does not say which one it works on.
-- A coid gets a path only from a confirmed open in the trace (PATHMGR event of the opening thread, ConnectAttach within 10 ms, first message an `_IO_CONNECT` answered without error); files opened before the trace started have no path.
-- Pulses are linked only when exactly one send can match a receive on a queue that is in sync (the receiver blocked on the channel since the last loss or ambiguity); otherwise the candidates are recorded and no arrow is drawn.
+- The inversion analysis needs the server's run mask traced (`ThreadCtl` during the trace) or supplied with `--runmask`; SEND-phase verdicts need a single-threaded server process, so for multi-threaded servers they are always "insufficient evidence"; requests replied to by another thread are "insufficient evidence" after the receive; it is one level deep (it does not chain through a server that is itself blocked on another server or a mutex).
+- The critical path follows trustworthy nested requests, not mutexes, condvars or handoffs to other threads (it says "handed off, not followed" and counts that time as unknown); a server holding several received requests is reported as such, since the trace does not say which one it works on.
+- Paths are candidates: a coid gets one when the opening thread's PATHMGR event is followed within 10 ms by its ConnectAttach and the first message on the coid is an `_IO_CONNECT` answered without error. Nothing in the trace ties the PATHMGR lookup to that connection, so an unrelated open in the window would inherit the path. Files opened before the trace started have no path.
+- Pulses are linked only when exactly one send can match a receive on a queue that is in sync (the receiver blocked on the channel that the scoid's pulses arrive on, with that channel learnt again after any loss, and no ambiguous receive since); otherwise the candidates are recorded and no arrow is drawn.
 - In the pinned priority runs the workload's own ClockCycles() is about 15 us before the traced MsgSendv entry; the cause is not known. It does not affect linking.
 
 ## How this was built
