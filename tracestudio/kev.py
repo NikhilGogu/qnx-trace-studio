@@ -64,7 +64,7 @@ class Event:
     words: tuple       # payload as 32-bit words (data[1], data[2] of every slot)
     seq: int           # file index of the first slot
     injected: bool = False
-    partial: bool = False   # combine event with missing slots
+    partial: bool = False   # combine event with missing slots, or timestamp guessed: not trusted
 
 
 @dataclass
@@ -260,6 +260,8 @@ class KevFile:
                 ts = place(cpu, d0)
             else:
                 ts = None
+            # before its CPU's first TIME a slot's epoch is borrowed from another CPU: a guess, not trusted
+            guessed = not is_time and cpu not in anchor
             prev_latest = latest.get(cpu)
             if ts is not None:
                 if prev_latest is not None and ts < prev_latest:
@@ -267,7 +269,7 @@ class KevFile:
                     st.max_regression_cycles = max(st.max_regression_cycles, prev_latest - ts)
 
             if struct_ == S_SIMPLE:
-                ev = Event(ts, cpu, cls, code, (d1, d2), i, injected)
+                ev = Event(ts, cpu, cls, code, (d1, d2), i, injected, guessed)
                 out.append(ev)
                 if cls == C_CONTROL and code == CTRL_BUFFER:
                     same = prev_time is not None and prev_time[0] == cpu and prev_time[1] == i - 1
@@ -308,7 +310,7 @@ class KevFile:
                 if struct_ == S_BEGIN:
                     if key in pending:   # previous one never ended
                         close_partial(key)
-                    pending[key] = [i, ts, [d1, d2], injected, in_bad]
+                    pending[key] = [i, ts, [d1, d2], injected, in_bad or guessed]
                 else:
                     p = pending.get(key)
                     if p is None:

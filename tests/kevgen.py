@@ -88,8 +88,8 @@ class Gen:
         return data if cut is None else data[:len(head) + cut]
 
     # ---- typed events ---------------------------------------------------------
-    def state(self, cpu, ts, code, key, prio=None, injected=False):
-        w = [key[0], key[1]] if prio is None else [key[0], key[1], prio, 2]
+    def state(self, cpu, ts, code, key, prio=None, injected=False, policy=2):
+        w = [key[0], key[1]] if prio is None else [key[0], key[1], prio, policy]
         self.event(cpu, ts, C_PRTH, code, w, injected)
 
     def kcall(self, cpu, ts, num, words, flags=0):

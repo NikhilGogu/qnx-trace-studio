@@ -188,6 +188,17 @@ def test_resource_manager_names_and_paths():
     tp.close()
 
 
+def test_cli_exit_codes():
+    from tracestudio.cli import main
+    empty = tempfile.mkdtemp(prefix="ts-empty-")
+    assert main(["validate", kev("prio_fixed"), "--logs", empty]) == 1             # no logged requests
+    assert main(["validate", kev("prio_fixed"), "--logs", os.path.join(DATA, "prio_fixed.logs")]) == 0
+    junk = os.path.join(TMP, "not-a-trace.kev")
+    with open(junk, "w") as f:
+        f.write("not a trace")
+    assert main(["info", junk]) == 1 and main(["analyze", junk]) == 1
+
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window

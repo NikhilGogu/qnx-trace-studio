@@ -463,7 +463,7 @@ def test_pulse_queue_loses_sync_at_a_loss():
 
 # ---- inversion inference ---------------------------------------------------------------
 def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, other_prio=None, after_receive=True,
-               chan_flags=0x1, sibling=False, gen=False):
+               chan_flags=0x1, sibling=False, gen=False, server_policy=2):
     """hi (30) asks server s1 (10, fixed priority) for 0.5 ms of work; preemptor takes CPU 0 for 2 ms."""
     g = Gen(ncpu=2)
     g.buffer(0, T)
@@ -482,7 +482,7 @@ def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, ot
     g.send(0, T + ms + 10, H, S[0], 0x10001, prio=30)           # hi REPLY-blocked
     if after_receive:
         g.receive(0, T + ms + 40, S, H, 0x10001, prio=10)       # s1 receives at its own priority
-    g.state(0, T + ms + 100_000, READY, S, 10)                   # preempted while handling hi's request
+    g.state(0, T + ms + 100_000, READY, S, 10, policy=server_policy)   # preempted while handling hi's request
     g.state(0, T + ms + 100_010, RUNNING, preemptor, preemptor_prio)
     g.state(0, T + 3 * ms, NANOSLEEP, preemptor, preemptor_prio)
     if after_receive:
@@ -762,6 +762,27 @@ def test_partial_thread_event_does_not_restore_actor():
     assert all(sw[5] != C for sw in m.switches)
     assert m.txns == [] and m.counters["partial_state_events"] == 1
 
+
+
+def test_slots_before_their_cpus_first_time_are_not_trusted():
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, C, 10)
+    b = g.buffer(1, T + 20)
+    del b[3][0]                                                 # CPU 1's first buffer has no TIME slot
+    g.state(1, T + 30, RUNNING, S, 10)
+    g.kcall(1, T + 40, K_SENDV, [0x40000001, 1, 1, 0x7101, 1, 0])
+    k, m = model(g)
+    assert k.stats.unanchored_slots > 0
+    assert all(e.partial for e in k.events() if e.cpu == 1 and e.cls != C_CONTROL)
+    assert not any(sw[1] == 1 and sw[5] == S for sw in m.switches) and m.txns == []
+
+
+def test_sporadic_server_is_insufficient_evidence():
+    _, m = prio_scene(0x1, M, 20, server_policy=4)              # SCHED_SPORADIC: its budget is not traced
+    r = suspected_inversions(m)
+    assert r["suspected"] == [] and "server uses sporadic scheduling" in r["insufficient_evidence"][0]["reasons"]
 
 # ---- critical path counterexamples ----------------------------------------------------------------
 def test_clip_recomputes_attribution():
