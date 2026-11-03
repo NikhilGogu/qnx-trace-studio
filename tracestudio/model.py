@@ -71,7 +71,24 @@ ST_UNKNOWN = -1
 ST_DEAD, ST_RUNNING, ST_READY, ST_STOPPED, ST_SEND, ST_RECEIVE, ST_REPLY = range(7)
 ST_DESTROY = 25
 ST_MUTEX = 13
-SYNC_OWNER_MASK = 0x7FFFFFFF      # _NTO_SYNC_OWNER_MASK; the top bit is _NTO_SYNC_WAITING
+# <sys/target_nto.h>: owner word (_NTO_SYNC_OWNER_MASK; the top bit is _NTO_SYNC_WAITING; 0 is a free mutex and
+# 0xffffff00 and above are markers: initializer, destroyed, other object types, dead owner) and count word flags
+SYNC_OWNER_MASK = 0x7FFFFFFF
+SYNC_SPECIAL_OWNER = 0xFFFFFF00
+SYNC_NONRECURSIVE, SYNC_PRIOCEILING, SYNC_COUNTMASK = 0x80000000, 0x20000000, 0x00FFFFFF
+EOWNERDEAD = 58
+
+
+def _owner_word_problem(raw):
+    """Why an owner word read from a mutex names no thread, or None."""
+    if raw is None:
+        return "owner word not traced"
+    raw &= 0xFFFFFFFF
+    if raw >= SYNC_SPECIAL_OWNER:
+        return "owner word 0x%x is a marker (uninitialised, destroyed, another object type or a dead owner)" % raw
+    if not raw & SYNC_OWNER_MASK:
+        return "owner word 0x%x names no owner" % raw
+    return None
 NOT_BLOCKED = (None, ST_UNKNOWN, ST_RUNNING, ST_READY)
 BLOCKED_IPC = {"SEND", "RECEIVE", "REPLY"}
 UNKNOWN = (-1, 0)          # pseudo thread: what ran on a CPU is not known
@@ -213,12 +230,23 @@ class MutexWait:
     owner_value: int | None         # owner word read by the waiter's call, without _NTO_SYNC_WAITING
     t_call: int
     t_block: int | None = None      # waiter entered MUTEX
-    t_release: int | None = None    # the owner's SyncMutexUnlock entry
+    t_wake: int | None = None       # waiter left MUTEX (READY until its SyncMutexLock returns)
+    t_release: int | None = None    # entry of the owner's SyncMutexUnlock, confirmed by its successful exit
     t_exit: int | None = None       # waiter's SyncMutexLock exit
     ret: int | None = None
     errno: int | None = None
     owner: tuple | None = None
     unknown: str | None = None      # why the owner is not known, once that is decided
+    count_word: int | None = None   # sync->__u.__count as the waiter's call read it (mutex type flags)
+
+    @property
+    def ceiling(self):
+        return self.count_word is not None and bool(self.count_word & SYNC_PRIOCEILING)
+
+    @property
+    def acquired(self):
+        """SyncMutexLock returned with the mutex: success, or EOWNERDEAD (the previous owner died holding it)."""
+        return self.ret == 0 or self.errno == EOWNERDEAD
 
     @property
     def owner_known(self):
@@ -283,6 +311,7 @@ class Model:
         self._wake_pulse = {}         # woken key -> (READY, Pulse) waiting for its REC_PULSE
         self._mutex_call = {}         # waiter key -> MutexWait of its SyncMutexLock in progress
         self._mutex_held = defaultdict(list)   # (pid, sync address) -> [MutexWait] not yet released
+        self._mutex_unlock = {}       # unlocking thread -> (key, owner word, entry ts, [MutexWait] held then)
         self._run(evs)
 
     # ---- helpers ----------------------------------------------------------
@@ -410,6 +439,12 @@ class Model:
                 self.mutex_waits.append(w)
                 if w.t_release is None:
                     w.unknown = w.unknown or "still waiting at the end of the trace"
+        for w in self.mutex_waits:
+            end = w.t_release or w.t_exit or self.end_ts
+            if any(w0 < end and w.t_call < w1 for lst in self.loss_windows.values() for w0, w1 in lst):
+                w.unknown = w.unknown or "events lost during the wait"
+            if w.t_release is None:
+                w.unknown = w.unknown or "no successful SyncMutexUnlock of this mutex seen during the wait"
         c["mutex_waits"] = len(self.mutex_waits)
         c["mutex_waits_owner_known"] = sum(1 for w in self.mutex_waits if w.owner_known)
         self._name_messages()
@@ -487,6 +522,7 @@ class Model:
             for w in lst:
                 w.unknown = w.unknown or "events lost during the wait"
         self._mutex_held.clear()
+        self._mutex_unlock.clear()
         self.counters["wakeups_without_evidence"] += len(self._wake_msg) + len(self._wake_pulse)
         self._wake_msg.clear()
         self._wake_pulse.clear()
@@ -579,10 +615,12 @@ class Model:
                 tx.client_block = state_name(code)
             if code == ST_READY and tx.t_reply_msg is not None and tx.t_unblock is None:
                 tx.t_unblock = ev.ts
-        if code == ST_MUTEX:
-            w = self._mutex_call.get(key)
-            if w is not None and w.t_block is None:
+        w = self._mutex_call.get(key)
+        if w is not None:
+            if code == ST_MUTEX and w.t_block is None:
                 w.t_block = ev.ts
+            elif code != ST_MUTEX and w.t_block is not None and w.t_wake is None:
+                w.t_wake = ev.ts
         if code == ST_RECEIVE and not uncertain:
             self._resync_pulses(key)
         if code == ST_DEAD:
@@ -633,7 +671,22 @@ class Model:
             self.counters["wakeups_without_evidence"] += len(call.ready)
         return call
 
+    def _alive_throughout(self, key, t0, t1):
+        """The thread existed at t0 and did not end before t1 (owner values are unique among live threads only)."""
+        t = self.threads.get(key)
+        alive = False
+        for st in (t.states if t else ()):
+            if st[0] > t1:
+                break
+            dead = st[1] in (ST_DEAD, ST_DESTROY)
+            if st[0] <= t0:
+                alive = not dead          # the latest event at or before t0 decides
+            elif dead:
+                return False
+        return alive
+
     def _thread_gone(self, key, ts, why):
+        self._mutex_unlock.pop(key, None)
         tx = self._by_client.get(key)
         if tx is not None:
             tx.warnings.append("client %s before MsgSendv returned" % why)
@@ -691,24 +744,20 @@ class Model:
             elif name == "CHANNEL_DESTROY":
                 self._forget_channels(actor[0])
             elif name == "SYNC_MUTEX_LOCK" and "sync_p" in a:
-                own = a.get("owner")
+                own, cnt = a.get("owner"), a.get("count")
                 w = MutexWait(len(self.mutex_waits), actor, actor[0], a["sync_p"],
-                              None if own is None else own & SYNC_OWNER_MASK, ev.ts)
+                              None if own is None else own & SYNC_OWNER_MASK, ev.ts, count_word=cnt)
+                w.unknown = _owner_word_problem(own)
+                if cnt is not None and (not cnt & SYNC_NONRECURSIVE or cnt & SYNC_COUNTMASK):
+                    w.unknown = w.unknown or "recursive mutex: which unlock reaches the kernel is not verified (unsupported)"
                 self._mutex_call[actor] = w
                 self._mutex_held[(actor[0], a["sync_p"])].append(w)
             elif name == "SYNC_MUTEX_UNLOCK" and "sync_p" in a:
-                own = a.get("owner")
-                for w in self._mutex_held.pop((actor[0], a["sync_p"]), []):
-                    if w.t_release is not None:
-                        continue
-                    w.t_release = ev.ts
-                    if own is None or w.owner_value is None:
-                        w.unknown = w.unknown or "owner value not traced"
-                    elif own & SYNC_OWNER_MASK != w.owner_value:
-                        w.unknown = w.unknown or "unlocked by %s with owner value 0x%x, the waiter saw 0x%x" % (
-                            self.label(actor), own & SYNC_OWNER_MASK, w.owner_value)
-                    else:
-                        w.owner = actor
+                k = (actor[0], a["sync_p"])     # confirmed only by this call's successful exit
+                self._mutex_unlock[actor] = (k, a.get("owner"), ev.ts, list(self._mutex_held.get(k, ())))
+            elif name in ("SYNC_DESTROY", "SYNC_CREATE") and "sync_p" in a:
+                for w in self._mutex_held.pop((actor[0], a["sync_p"]), []):     # a new object at this address
+                    w.unknown = w.unknown or "the mutex was destroyed or created again during the wait"
             elif name == "CONNECT_DETACH" and "coid" in a:
                 k = (actor[0], a["coid"])
                 self.coid_paths.pop(k, None)
@@ -730,6 +779,30 @@ class Model:
             tx = self._replying.pop(actor, None)
             if tx is not None:
                 tx.t_reply_exit = ev.ts
+        elif name == "SYNC_MUTEX_UNLOCK":
+            pend = self._mutex_unlock.pop(actor, None)
+            if pend is not None and not intr and a.get("ret_val", 0) == 0:
+                k, own, t_entry, waits = pend
+                held = self._mutex_held.get(k, [])
+                problem = _owner_word_problem(own)
+                for w in waits:
+                    if w in held:
+                        held.remove(w)
+                    if w.t_release is not None:
+                        continue
+                    w.t_release = t_entry
+                    if problem:
+                        w.unknown = w.unknown or problem
+                    elif own & SYNC_OWNER_MASK != w.owner_value:
+                        w.unknown = w.unknown or "unlocked by %s with owner value 0x%x, the waiter saw 0x%x" % (
+                            self.label(actor), own & SYNC_OWNER_MASK, w.owner_value)
+                    elif not self._alive_throughout(actor, w.t_call, t_entry):
+                        w.unknown = w.unknown or "the unlocking thread %s did not exist throughout the wait (a reused " \
+                                                 "thread id or owner value)" % self.label(actor)
+                    else:
+                        w.owner = actor
+            elif pend is not None:
+                self.counters["mutex_unlock_failed"] += 1
         elif name == "SYNC_MUTEX_LOCK":
             w = self._mutex_call.pop(actor, None)
             if w is not None:
@@ -737,9 +810,9 @@ class Model:
                 if w.t_block is not None:
                     self.mutex_waits.append(w)
                     w.idx = len(self.mutex_waits) - 1
-                    if w.t_release is None:
-                        w.unknown = w.unknown or "no SyncMutexUnlock of this mutex seen during the wait"
-                lst = self._mutex_held.get((w.pid, w.sync))
+                    if w.errno == EOWNERDEAD:
+                        w.unknown = w.unknown or "the owner died holding the mutex (EOWNERDEAD)"
+                lst = self._mutex_held.get((w.pid, w.sync))   # a pending unlock keeps its own list of waits
                 if lst and w in lst:
                     lst.remove(w)
         elif call is None or intr:

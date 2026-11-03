@@ -608,8 +608,10 @@ def chain_text(tl, chain):
 
 
 def mutex_waits(model, tl=None, min_us=0.0, only=None):
-    """Mutex waits of at least min_us: who waited, on what, for how long, the owner (when known) and what the
-    owner did meanwhile (its states, with the server it waited for), plus its priority before and during."""
+    """Mutex waits of at least min_us of MUTEX time: who waited, on what, how long, the owner (when known) and what
+    it did meanwhile. The owner is named only up to its SyncMutexUnlock; MUTEX time after that (a handover) and the
+    time before SyncMutexLock returned are reported separately. Owner priorities are observations: a higher
+    priority while it held the mutex may come from inheritance, a ceiling or anything else."""
     tl = tl or Timeline(model)
     m = model
     out = []
@@ -617,14 +619,23 @@ def mutex_waits(model, tl=None, min_us=0.0, only=None):
         if only is not None and not only(w.waiter):
             continue
         end = w.t_exit if w.t_exit is not None else m.end_ts
-        blocked = sum(b - a for a, b, code, _ in tl.segments(w.waiter, w.t_block, end) if code == ST_MUTEX)
-        if us(m, blocked) < min_us:
+        cut = w.t_release if w.owner_known else w.t_block
+        known = after = ready = 0
+        for a, b, code, _ in tl.segments(w.waiter, w.t_block, end):
+            if code == ST_MUTEX:
+                k0 = max(0, min(b, cut) - a)
+                known, after = known + k0, after + (b - a - k0)
+            else:
+                ready += b - a
+        if us(m, known + after) < min_us:
             continue
         row = {"wait": w.idx, "waiter": m.label(w.waiter), "waiter_prio": tl.prio_at(w.waiter, w.t_block),
-               "mutex": "0x%x" % w.sync, "blocked_us": round(us(m, blocked), 1), "owner": None,
+               "mutex": "0x%x" % w.sync, "blocked_us": round(us(m, known + after), 1), "owner": None,
                "owner_value": None if w.owner_value is None else "0x%x" % w.owner_value,
-               "result": "acquired" if w.ret == 0 else ("still waiting" if w.t_exit is None else
-                                                        "failed (errno %s)" % w.errno)}
+               "owner_known_us": round(us(m, known), 1), "owner_not_traced_us": round(us(m, after), 1),
+               "until_return_us": round(us(m, ready), 1), "ceiling": w.ceiling,
+               "result": ("acquired" if w.ret == 0 else "acquired, previous owner died (EOWNERDEAD)" if w.acquired
+                          else "still waiting" if w.t_exit is None else "failed (errno %s)" % w.errno)}
         if not w.owner_known:
             row["owner_unknown"] = w.unknown
         else:
@@ -647,14 +658,21 @@ def mutex_waits(model, tl=None, min_us=0.0, only=None):
 
 
 def mutex_wait_text(r):
-    """One line for a mutex wait: "A MUTEX-blocked 3.2 ms on mutex 0x... owned by B, which ..." """
-    head = "%s (prio %s) MUTEX-blocked %.1f us on mutex %s" % (r["waiter"], r["waiter_prio"], r["blocked_us"],
-                                                                  r["mutex"])
+    """One line for a mutex wait: "A MUTEX-blocked 3.2 ms on mutex 0x... owned by B for ... of it, which ..." """
+    head = "%s (prio %s) MUTEX-blocked %.1f us on mutex %s%s" % (
+        r["waiter"], r["waiter_prio"], r["blocked_us"], r["mutex"], " (priority ceiling)" if r["ceiling"] else "")
+    tail = ""
+    if r["owner_not_traced_us"]:
+        tail += "; then %.1f us MUTEX-blocked with the next owner not traced" % r["owner_not_traced_us"]
+    if r["until_return_us"]:
+        tail += "; then %.1f us before SyncMutexLock returned" % r["until_return_us"]
+    if r["result"] != "acquired":
+        tail += "; %s" % r["result"]
     if r["owner"] is None:
-        return head + ", owner unknown (%s)" % r["owner_unknown"]
-    pi = ""
+        return head + ", owner unknown (%s)%s" % (r["owner_unknown"], tail)
+    seen = ""
     if r["owner_prio_max"] is not None and r["owner_prio_before"] is not None and \
-            r["owner_prio_max"] > r["owner_prio_before"]:
-        pi = " (prio %s, raised to %s while it held the mutex)" % (r["owner_prio_before"], r["owner_prio_max"])
-    return head + " owned by %s%s, which was %s" % (r["owner"], pi, ", ".join(
-        "%s %.1f us" % kv for kv in r["owner_states_us"].items()))
+            r["owner_prio_max"] != r["owner_prio_before"]:
+        seen = " (prio %s before the wait, up to %s during it)" % (r["owner_prio_before"], r["owner_prio_max"])
+    return head + " owned by %s%s for %.1f us of it, which was %s%s" % (
+        r["owner"], seen, r["owner_known_us"], ", ".join("%s %.1f us" % kv for kv in r["owner_states_us"].items()), tail)

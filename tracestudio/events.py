@@ -87,6 +87,10 @@ KER_ARGS = {
     ("SYNC_MUTEX_UNLOCK", 0, 0): ("sync_p:x owner:d", "sync_p:x count:d owner:d"),
     ("SYNC_MUTEX_UNLOCK", 0, 1): ("sync_p:q owner:d", "sync_p:q count:d owner:d"),
     ("SYNC_MUTEX_UNLOCK", 1, 0): ("ret_val:d empty:x", "ret_val:d empty:x"),
+    ("SYNC_DESTROY", 0, 0): ("sync_p:x owner:d", "sync_p:x count:d owner:d"),
+    ("SYNC_DESTROY", 0, 1): ("sync_p:q", "sync_p:q count:d owner:d"),
+    ("SYNC_CREATE", 0, 0): ("type:d sync_p:x", "type:d sync_p:x count:d owner:d protocol:d flags:x prioceiling:d clockid:d"),
+    ("SYNC_CREATE", 0, 1): ("type:d sync_p:q", "type:d sync_p:q count:d owner:d protocol:d flags:x prioceiling:d clockid:d"),
 }
 for _n in ("MSG_SENDVNC",):
     for _k in [k for k in KER_ARGS if k[0] == "MSG_SENDV"]:

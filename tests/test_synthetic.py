@@ -1658,39 +1658,85 @@ def test_check_inversions_need_coverage_and_count_inconclusive():
 
 
 # ---- mutex owner chains (phase 2b) ----------------------------------------------------------------------
-K_MUTEX_LOCK, K_MUTEX_UNLOCK, ST_MUTEX_CODE = 80, 81, 13
+K_MUTEX_LOCK, K_MUTEX_UNLOCK, K_SYNC_DESTROY, ST_MUTEX_CODE = 80, 81, 79, 13
 
 
-def mutex_scene(unlock_value=0x1002, unlocker=S2, loss=False):
-    """s1 blocks on mutex 0x1000 whose owner word says 0x1002; then `unlocker` unlocks it with `unlock_value`."""
-    g = Gen(ncpu=1)
+def mutex_scene(unlock_value=0x1002, unlocker=S2, loss=False, owner_word=0x1002, count_word=0x80000000,
+                failed_unlock_by=None, destroy=False, death=False, ownerdead=False, early_loss=False):
+    """s1 blocks on mutex 0x1000 whose owner word says `owner_word`; `unlocker` then unlocks it successfully."""
+    g = Gen(ncpu=2)
     g.buffer(0, T)
     g.names(0, T, NAMES)
-    g.state(0, T + 5, RUNNING, S2, 10)                      # s2 locked it in user space: nothing traced
+    if early_loss:                                               # CPU 1 loses events from before the wait
+        g.state(1, T + 2, RUNNING, B, 10)
+        g.buffer(1, T + 300, seq=g.seq[1] + 2)
+    g.state(0, T + 5, RUNNING, S2, 10)                           # s2 locked it in user space: nothing traced
     g.state(0, T + 10, RUNNING, S, 10)
-    g.kcall(0, T + 20, K_MUTEX_LOCK, [0x1000, 0x80000000, 0x1002])
+    g.kcall(0, T + 20, K_MUTEX_LOCK, [0x1000, count_word, owner_word])
     g.state(0, T + 30, ST_MUTEX_CODE, S, 30)
+    if failed_unlock_by:                                         # a non-owner reads the genuine owner word, fails
+        g.state(0, T + 35, RUNNING, failed_unlock_by, 10)
+        g.kcall(0, T + 36, K_MUTEX_UNLOCK, [0x1000, count_word, 0x80000000 | owner_word])
+        g.kcall(0, T + 37, K_MUTEX_UNLOCK, [0xFFFFFFFF, 1], EXIT)    # EPERM
+    if destroy:
+        g.state(0, T + 38, RUNNING, (200, 3), 10)
+        g.kcall(0, T + 39, K_SYNC_DESTROY, [0x1000, count_word, 0])
+    if death:                                                    # the owner's tid dies and is used again
+        g.state(0, T + 38, DEAD, unlocker, 10)
     g.state(0, T + 40, RUNNING, unlocker, 10)
     if loss:
         g.event(0, T + 100, C_CONTROL, 8, [1, 0])
-    g.kcall(0, T + 500, K_MUTEX_UNLOCK, [0x1000, 0x80000000, 0x80000000 | unlock_value])
+    if not ownerdead:
+        g.kcall(0, T + 500, K_MUTEX_UNLOCK, [0x1000, count_word, 0x80000000 | unlock_value])
+        g.kcall(0, T + 505, K_MUTEX_UNLOCK, [0, 0], EXIT)
     g.state(0, T + 510, READY, S, 30)
     g.state(0, T + 600, RUNNING, S, 30)
-    g.kcall(0, T + 610, K_MUTEX_LOCK, [0, 0], EXIT)
+    g.kcall(0, T + 610, K_MUTEX_LOCK, [0xFFFFFFFF, 58] if ownerdead else [0, 0], EXIT)
     return model(g)
 
 
-def test_mutex_owner_needs_the_owners_own_unlock():
+def test_mutex_owner_needs_the_owners_successful_unlock():
     _, m = mutex_scene()
     (w,) = m.mutex_waits
-    assert (w.waiter, w.sync, w.owner_value, w.owner, w.t_block, w.t_release, w.ret) == (
-        S, 0x1000, 0x1002, S2, T + 30, T + 500, 0) and w.owner_known
-    _, m = mutex_scene(unlock_value=0x1003)                     # someone else's owner value: not the owner
+    assert (w.waiter, w.sync, w.owner_value, w.owner, w.t_block, w.t_wake, w.t_release, w.ret) == (
+        S, 0x1000, 0x1002, S2, T + 30, T + 510, T + 500, 0) and w.owner_known
+    _, m = mutex_scene(failed_unlock_by=B)                       # EPERM: B read the owner word but is not the owner
+    assert m.mutex_waits[0].owner == S2 and m.mutex_waits[0].owner_known and m.counters["mutex_unlock_failed"] == 1
+    _, m = mutex_scene(unlock_value=0x1003)                      # someone else's owner value: not the owner
     assert not m.mutex_waits[0].owner_known and "owner value 0x1003" in m.mutex_waits[0].unknown
-    _, m = mutex_scene(loss=True)                                # lost events: the unlock may be missing
-    assert m.mutex_waits[0].unknown == "events lost during the wait"
-    _, m = mutex_scene(unlocker=M)                               # same address in another process
-    assert m.mutex_waits[0].unknown == "no SyncMutexUnlock of this mutex seen during the wait"
+    for word, why in ((0, "names no owner"), (0x80000000, "names no owner"), (0xFFFFFFFE, "is a marker"),
+                      (0xFFFFFF00, "is a marker")):
+        _, m = mutex_scene(owner_word=word, unlock_value=word & 0x7FFFFFFF)
+        assert not m.mutex_waits[0].owner_known and why in m.mutex_waits[0].unknown, word
+    cases = {"loss": "events lost during the wait", "early_loss": "events lost during the wait",
+             "destroy": "destroyed or created again", "death": "did not exist throughout the wait",
+             "ownerdead": "EOWNERDEAD"}
+    for flag, why in cases.items():
+        _, m = mutex_scene(**{flag: True})
+        assert not m.mutex_waits[0].owner_known and why in m.mutex_waits[0].unknown, (flag, m.mutex_waits[0].unknown)
+    _, m = mutex_scene(ownerdead=True)
+    assert m.mutex_waits[0].acquired and m.mutex_waits[0].ret == -1      # EOWNERDEAD is an acquisition
+    _, m = mutex_scene(count_word=0x00000001)                    # recursive (no _NTO_SYNC_NONRECURSIVE), count 1
+    assert "recursive mutex" in m.mutex_waits[0].unknown
+    _, m = mutex_scene(unlocker=(200, 3))                        # a thread first seen after the waiter's read
+    assert "did not exist throughout the wait" in m.mutex_waits[0].unknown
+    _, m = mutex_scene(unlocker=M)                               # the same address in another process
+    assert m.mutex_waits[0].unknown == "no successful SyncMutexUnlock of this mutex seen during the wait"
+    _, m = mutex_scene(count_word=0xA0000000)                    # priority ceiling: priorities only observed
+    from tracestudio.analyses import mutex_wait_text, mutex_waits
+    (r,) = mutex_waits(m)
+    assert r["ceiling"] and "(priority ceiling)" in mutex_wait_text(r) and "inherit" not in mutex_wait_text(r)
+
+
+def leaf_total(segs, lo, hi):
+    """Sum of leaf durations; checks that children tile their parent and siblings tile [lo, hi] in order."""
+    t, total = lo, 0
+    for s in segs:
+        assert s.t0 == t and s.t1 > s.t0, (s.kind, s.label)
+        total += leaf_total(s.children, s.t0, s.t1) if s.children else s.t1 - s.t0
+        t = s.t1
+    assert t == hi
+    return total
 
 
 def test_critical_path_follows_a_mutex_owner_into_its_request():
@@ -1713,6 +1759,7 @@ def test_critical_path_follows_a_mutex_owner_into_its_request():
     g.wait_receive(0, T + 1040, M, 10)
     g.send_exit(0, T + 1060, S2, 10)
     g.kcall(0, T + 1100, K_MUTEX_UNLOCK, [0x1000, 0x80000000, 0x80001002])
+    g.kcall(0, T + 1105, K_MUTEX_UNLOCK, [0, 0], EXIT)
     g.state(0, T + 1110, READY, S, 10)
     g.state(0, T + 1200, RUNNING, S, 10)
     g.kcall(0, T + 1210, K_MUTEX_LOCK, [0, 0], EXIT)
@@ -1724,19 +1771,26 @@ def test_critical_path_follows_a_mutex_owner_into_its_request():
     assert owner_req.trustworthy and tx.trustworthy and m.mutex_waits[0].owner == S2
     tl = Timeline(m)
     segs = critical_path(m, tx, tl)
-    assert sum(s.t1 - s.t0 for s in segs) == tx.t_exit - tx.t_call
+    assert leaf_total(segs, tx.t_call, tx.t_exit) == tx.t_exit - tx.t_call     # every leaf counted once
     (n,) = [s for s in segs if s.kind == "nested request"]
     assert "MUTEX-blocked on mutex 0x1000 owned by server/s2, which waits for mid (txn 0)" in n.label
     assert any(k.label == "mid/m running this request" for k in n.children)
+    cyc = critical_path(m, tx, tl, _seen=frozenset({owner_req.idx}))       # the owner's request already on the path
+    assert leaf_total(cyc, tx.t_call, tx.t_exit) == tx.t_exit - tx.t_call
+    assert any("a cycle on this path, not followed" in s.label for s in cyc)
     assert chain_text(tl, blocking_chain(tl, S, T + 500)) == (
         "server/s1 MUTEX-blocked on mutex 0x1000 (owner server/s2) -> server/s2 REPLY-blocked on mid (txn 0) "
         "-> mid/m RUNNING")
     (r,) = mutex_waits(m, tl)
-    assert r["owner"] == "server/s2" and r["blocked_us"] == 0.9
+    assert (r["owner"], r["blocked_us"], r["owner_known_us"], r["owner_not_traced_us"], r["until_return_us"]) == (
+        "server/s2", 0.9, 0.9, 0.0, 0.1)
     assert mutex_wait_text(r).startswith("server/s1 (prio 10) MUTEX-blocked 0.9 us on mutex 0x1000 owned by "
-                                         "server/s2, which was REPLY-blocked on mid (txn 0)")
+                                         "server/s2 for 0.9 us of it, which was REPLY-blocked on mid (txn 0)")
     tp = tp_of(m, "mutex")
     if tp:
         no_import_errors(tp)
-        assert [x.name for x in rows(tp, "SELECT name FROM slice WHERE name LIKE 'MUTEX %'")] == ["MUTEX 0x1000 (owner s2)"]
+        got = [(x.name, x.ts - T, x.dur) for x in rows(tp, "SELECT name, ts, dur FROM slice WHERE name LIKE 'MUTEX %' "
+                                                          "ORDER BY ts")]
+        assert got == [("MUTEX 0x1000 (owner s2)", 210, 890), ("MUTEX 0x1000 (owner not traced after the release)",
+                       1100, 10), ("MUTEX 0x1000 woken, until SyncMutexLock returns", 1110, 100)], got
         tp.close()

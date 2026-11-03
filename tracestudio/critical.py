@@ -140,8 +140,10 @@ def _held(tl, key, a, b, wprio):
                          " + ".join("%s (%s)" % (_tn(m, o2), p2) for _, o2, p2 in known)), True
 
 
-def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
-    """Segments covering [tx.t_call, tx.t_exit] of one transaction."""
+def critical_path(model, tx, tl=None, max_depth=4, _depth=0, _seen=frozenset()):
+    """Segments covering [tx.t_call, tx.t_exit] of one transaction. Nested requests are followed to max_depth and
+    never twice on one path (a cycle is reported, not followed)."""
+    _seen = _seen | {tx.idx}
     tl = tl or Timeline(model)
     m = model
     segs = []
@@ -191,8 +193,11 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                     add_wait(g, h, "mutex owner preempted" if explained else "unexplained ready", owner, oprio, text)
             elif ocode in (ST_SEND, ST_REPLY):
                 k = tl.client_txn_at(owner, e)
-                if k is not None and k.causal and _depth < max_depth:
-                    kids = _clip(m, critical_path(m, k, tl, max_depth, _depth + 1), e, f)
+                if k is not None and k.idx in _seen:
+                    add(e, f, "mutex owner blocked", "%s, which waits for %s (txn %d, a cycle on this path, not "
+                        "followed)" % (pre, m.server_name(k), k.idx), owner, oprio, short="%s: cycle" % ws)
+                elif k is not None and k.causal and _depth < max_depth:
+                    kids = _clip(m, critical_path(m, k, tl, max_depth, _depth + 1, _seen), e, f)
                     add(e, f, "nested request", "%s, which waits for %s (txn %d)" % (pre, m.server_name(k), k.idx),
                         owner, oprio, kids, short="%s: owner %s waits for %s" % (ws, on, m.server_name(k)))
                 else:
@@ -266,8 +271,8 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                     add_wait(e, f, "server preempted" if explained else "unexplained ready", srv, sprio, text)
             elif scode in (ST_SEND, ST_REPLY):
                 k = tl.client_txn_at(srv, c)
-                if k is not None and k.parent == tx.idx and k.trustworthy and _depth < max_depth:
-                    kids = _clip(m, critical_path(m, k, tl, max_depth, _depth + 1), c, d)
+                if k is not None and k.parent == tx.idx and k.trustworthy and _depth < max_depth and k.idx not in _seen:
+                    kids = _clip(m, critical_path(m, k, tl, max_depth, _depth + 1, _seen), c, d)
                     add(c, d, "nested request", "%s waits for %s (txn %d)" % (sl, m.server_name(k), k.idx),
                         srv, sprio, kids, short="%s waits for %s" % (ss, m.server_name(k)))
                 elif k is not None and k.parent == tx.idx:

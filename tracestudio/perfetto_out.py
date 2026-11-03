@@ -410,14 +410,23 @@ class Writer:
     def _mutexes(self):
         """A slice on the waiter's track for each blocking SyncMutexLock, naming the owner only when it is known."""
         m = self.m
-        for w in m.mutex_waits:
+        for w in m.mutex_waits:      # split at the owner's release and at the wake: each part says what is known
             end = w.t_exit if w.t_exit is not None else m.end_ts
+            wake = w.t_wake if w.t_wake is not None else end
             known = w.owner_known
-            self.add((w.waiter, None), w.t_block, end, "MUTEX 0x%x (owner %s)" % (
-                w.sync, self.comm(w.owner) if known else "unknown"),
-                {"mutex": "0x%x" % w.sync, "owner": m.label(w.owner) if known else None,
-                 "owner_value": None if w.owner_value is None else "0x%x" % w.owner_value,
-                 "owner_unknown": None if known else w.unknown, "result": w.ret, "errno": w.errno})
+            base = {"mutex": "0x%x" % w.sync, "wait": w.idx,
+                    "owner_value": None if w.owner_value is None else "0x%x" % w.owner_value,
+                    "result": w.ret, "errno": w.errno}
+            cut = min(w.t_release, wake) if known else w.t_block
+            if known:
+                self.add((w.waiter, None), w.t_block, cut, "MUTEX 0x%x (owner %s)" % (w.sync, self.comm(w.owner)),
+                         dict(base, owner=m.label(w.owner), evidence="the owner's successful SyncMutexUnlock"))
+            if wake > cut:
+                self.add((w.waiter, None), cut, wake, "MUTEX 0x%x (owner %s)" % (
+                    w.sync, "not traced after the release" if known else "unknown"),
+                    dict(base, owner_unknown="released; the next owner is not traced" if known else w.unknown))
+            if end > wake:
+                self.add((w.waiter, None), wake, end, "MUTEX 0x%x woken, until SyncMutexLock returns" % w.sync, base)
         self.stats["mutex_waits"] = len(m.mutex_waits)
 
     def _critical_paths(self):
