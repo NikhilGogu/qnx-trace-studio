@@ -31,6 +31,15 @@ def num(v):
     return -x if m.group(1) else x
 
 
+def same(a, b):
+    """Equal, or equal as 32/64-bit two's complement (traceprinter prints some fields signed)."""
+    if a == b:
+        return True
+    if isinstance(a, int) and isinstance(b, int):
+        return (a - b) % (1 << 32) == 0 if max(abs(a), abs(b)) < (1 << 32) else (a - b) % (1 << 64) == 0
+    return False
+
+
 def parse_tp(path):
     evs, cur = [], None
     for ln in open(path, errors="replace"):
@@ -103,8 +112,7 @@ def main(kev_path, tp_path):
             if k not in targs or isinstance(v, str) and k != "name":
                 continue
             tv = targs[k]
-            ok = (tv == v) or (isinstance(tv, int) and isinstance(v, int) and ((tv - v) % (1 << 32) == 0 and abs(tv) < (1 << 32) and abs(v) < (1 << 32))
-                                                                       or (tv - v) % (1 << 64) == 0)
+            ok = same(tv, v)
             if k == "name":
                 ok = str(tv) == v.split()[0] if v else True
             checked += 1

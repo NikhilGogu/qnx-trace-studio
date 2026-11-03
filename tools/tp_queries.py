@@ -91,6 +91,8 @@ for path in sys.argv[1:]:
     print("==", path)
     tp = TraceProcessor(trace=path)
     show(tp, "table population", TABLES)
+    show(tp, "import errors and data loss reported by TraceProcessor",
+         "SELECT name, idx, severity, value FROM stats WHERE value > 0 AND severity IN ('error', 'data_loss')")
     show(tp, "Q1 per-request end-to-end latency (MsgSend slices)", LATENCY)
     show(tp, "Q2 longest blocking chains", CHAIN)
     if "prio" in path:

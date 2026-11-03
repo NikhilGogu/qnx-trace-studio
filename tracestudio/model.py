@@ -184,6 +184,11 @@ class Model:
                         # events were lost on this CPU: whoever we thought was running is unknown now,
                         # and every open exchange may be missing its middle
                         c["lost_buffer_gaps"] += 1
+                        old = running.get(ev.cpu)
+                        if old is not None:   # close the CPU: it ran something unknown during the gap
+                            ot = self.threads.get(old)
+                            self.switches.append((ev.ts, ev.cpu, old, self.state_at(old),
+                                                  ot.prios[-1][1] if ot and ot.prios else None, None, 0))
                         running[ev.cpu] = None
                         for tx in open_by_client.values():
                             tx.warnings.append("spans lost buffer on cpu %d" % ev.cpu)
@@ -199,6 +204,7 @@ class Model:
                     t = self.thread(*key)
                     prio = a.get("priority")
                     prev_state = t.states[-1][1] if t.states else None
+                    prio_before = t.prios[-1][1] if t.prios else None
                     t.states.append((ev.ts, ev.code, prio, ev.cpu, ev.injected))
                     if prio is not None and (not t.prios or t.prios[-1][1] != prio):
                         t.prios.append((ev.ts, prio))
@@ -208,6 +214,9 @@ class Model:
                         prev = running.get(ev.cpu)
                         oc = where.get(key)
                         if oc is not None and oc != ev.cpu and running.get(oc) == key:
+                            # migrated before its old CPU switched to anything else: that CPU went idle
+                            self.switches.append((ev.ts, oc, key, prev_state, prio_before, None, 0))
+                            c["migrations_without_switch_out"] += 1
                             running[oc] = None
                         pt = self.threads.get(prev) if prev else None
                         self.switches.append((ev.ts, ev.cpu, prev, self.state_at(prev) if prev else None,
