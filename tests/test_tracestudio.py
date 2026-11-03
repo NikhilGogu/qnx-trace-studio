@@ -208,7 +208,9 @@ def test_fault_injection_never_links_wrong():
     k2 = KevFile("dropped.kev", data)
     assert [(l.kind, l.count) for l in k2.losses] == [("buffers", 1)] * 4
     res, _, _ = validate(Model(k2), os.path.join(DATA, "ipc_wide.logs"))
-    assert not any(":WRONG" in c for c in res["checks"]), res["checks"]
+    links = ("server_pid", "server_tid", "rcvid", "coid", "payload_id", "parent_link")
+    assert not any(c.startswith(links) and c.endswith(":WRONG") for c in res["checks"]), res["checks"]
+    assert "WRONG_unflagged" not in res["checks"]          # outcomes contradict the log only on flagged exchanges
     assert res["matched"] < res["requests"] == 200 and not res["ok"]
 
 

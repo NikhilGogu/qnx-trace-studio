@@ -1376,3 +1376,65 @@ def test_failed_send_keeps_status_and_errno():
     _, m = model(g)
     (tx,) = m.txns
     assert (tx.outcome, tx.status, tx.errno) == ("cancelled", -1, 260)
+
+
+def write_logs(d, client_rows, server_rows):
+    os.makedirs(d, exist_ok=True)
+    for name, rows in (("clients-100.csv", client_rows), ("front-200.csv", server_rows)):
+        with open(os.path.join(d, name), "w") as f:
+            f.write("# synthetic\ncycles,role,pid,tid,ev,id,a,b,c,d\n")
+            for r in rows:
+                f.write(",".join(map(str, r)) + "\n")
+
+
+def validate_scene(tag, client_rows=None, server_rows=None, pulse=False):
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    exchange(g, 0, T + 1000, C, S, 0x10001, msg=(0x7101, 7, 0), coid=0x40000001)   # request 7: [1010, 2130]
+    _, m = model(g)
+    cl = client_rows if client_rows is not None else [
+        (T + 1000, "clients", 100, 1, "SEND", 7, 0x40000001, 0, 0, 0),
+        (T + 2200, "clients", 100, 1, "SEND_DONE", 7, 0x40000001, 0, 200, 1)]
+    if pulse:
+        cl = cl + [(T + 2300, "clients", 100, 1, "PULSE_SEND", 7, 0x40000001, 0, 0, 0)]
+    sv = server_rows if server_rows is not None else [
+        (T + 1200, "front", 200, 1, "RX", 7, 0x10001, 100, 1, 0x40000001),
+        (T + 1900, "front", 200, 1, "REPLY", 7, 0x10001, 100, 1, 0)]
+    d = os.path.join(TMP, "logs_" + tag)
+    write_logs(d, cl, sv)
+    return validate(m, d)[0], d
+
+
+def test_validation_fails_on_unpaired_shared_wrong_coid_outcome_and_pulses():
+    r, d = validate_scene("good")
+    assert r["ok"] and r["checks"]["coid:ok"] == 1 and r["checks"]["outcome:ok"] == 1
+    send7 = (T + 1000, "clients", 100, 1, "SEND", 7, 0x40000001, 0, 0, 0)
+    done7 = (T + 2200, "clients", 100, 1, "SEND_DONE", 7, 0x40000001, 0, 200, 1)
+    r, _ = validate_scene("unpaired", [send7, done7, (T + 2500, "clients", 100, 1, "SEND", 8, 0x40000001, 0, 0, 0)])
+    assert not r["ok"] and r["unpaired_log_records"][0][0] == "SEND without DONE"
+    r, _ = validate_scene("shared", [send7, done7, (T + 900, "clients", 100, 1, "SEND", 9, 0x40000001, 0, 0, 0),
+                                     (T + 2300, "clients", 100, 1, "SEND_DONE", 9, 0x40000001, 0, 200, 1)],
+                          [(T + 1200, "front", 200, 1, "RX", 7, 0x10001, 100, 1, 0),
+                           (T + 1200, "front", 200, 1, "RX", 9, 0x10001, 100, 1, 0)])
+    assert not r["ok"] and r["problems"]["shared_with_another_request"] == 2
+    r, _ = validate_scene("coid", [send7[:6] + (0x40000002,) + send7[7:], done7])
+    assert not r["ok"] and "coid:WRONG" in r["failed_checks"]
+    r, _ = validate_scene("outcome", [send7, done7[:7] + (-1,) + done7[8:]])
+    assert not r["ok"] and "outcome:WRONG" in r["failed_checks"]
+    r, _ = validate_scene("pulse", pulse=True)                   # a logged pulse the trace does not have
+    assert not r["ok"] and "client_pulses:WRONG" in r["failed_checks"]
+    from tracestudio.cli import main
+    with open(os.path.join(d, "clients-100.csv"), "a") as f:
+        f.write("%d,clients,100\n" % (T + 3000))                 # a short record
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        path = os.path.join(TMP, "validate_scene.kev")
+        g = Gen(ncpu=1)
+        g.buffer(0, T)
+        g.state(0, T, RUNNING, C, 10)
+        with open(path, "wb") as f:
+            f.write(g.bytes())
+        assert main(["validate", path, "--logs", d]) == 1
+    assert "lacks" in err.getvalue() and "Traceback" not in err.getvalue()
