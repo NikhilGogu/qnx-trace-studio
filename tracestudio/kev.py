@@ -190,11 +190,11 @@ class KevFile:
     def _build(self):
         st = self.stats
         table = self._buffer_table()
-        # a buffer whose slot count differs from its header may miss slots anywhere inside it; only a
-        # file cut inside its last slot is known to miss them at the end
+        # a buffer whose slot count differs from its header may miss slots anywhere inside it; only a last
+        # buffer that lacks exactly the one slot the file ends inside is known to miss nothing else
         bad = []
         for n, (a, b, cpu, want) in enumerate(table):
-            tail_cut = n == len(table) - 1 and st.trailing_bytes and b - a < want
+            tail_cut = n == len(table) - 1 and st.trailing_bytes and b - a == want - 1
             bad.append(b - a != want and not tail_cut)
         anchor = {}      # cpu -> full timestamp of the latest TIME event on that cpu
         last_any = None  # latest anchor of any cpu, for slots before their own cpu's first TIME

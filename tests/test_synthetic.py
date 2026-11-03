@@ -19,7 +19,7 @@ from kevgen import (C_COMM, C_CONTROL, C_KERCALL, C_PRTH, DEAD, EXIT, INT, K_PUL
                     S_CONT, S_END, SEM, SEND, SPULSE, Gen)
 from tracestudio.analyses import (SEVERAL, Timeline, ipc_latency, server_priority_while_handling,  # noqa: E402
                                   suspected_inversions)
-from tracestudio.critical import Segment, _clip, critical_path  # noqa: E402
+from tracestudio.critical import Segment, _clip, critical_path, render  # noqa: E402
 from tracestudio.kev import KevFile  # noqa: E402
 from tracestudio.model import UNKNOWN, Model  # noqa: E402
 
@@ -463,7 +463,7 @@ def test_pulse_queue_loses_sync_at_a_loss():
 
 # ---- inversion inference ---------------------------------------------------------------
 def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, other_prio=None, after_receive=True,
-               chan_flags=0x1, sibling=False, gen=False, server_policy=2):
+               chan_flags=0x1, sibling=False, gen=False, server_policy=2, replier=S):
     """hi (30) asks server s1 (10, fixed priority) for 0.5 ms of work; preemptor takes CPU 0 for 2 ms."""
     g = Gen(ncpu=2)
     g.buffer(0, T)
@@ -489,7 +489,9 @@ def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, ot
         g.state(0, T + 3 * ms + 10, RUNNING, S, 10)
     else:
         g.receive(0, T + 3 * ms + 10, S, H, 0x10001, prio=10)
-    g.reply(0, T + 3 * ms + 400_000, S, H, 0x10001, 30)
+    if replier != S:
+        g.state(0, T + 3 * ms + 399_000, RUNNING, replier, 10)
+    g.reply(0, T + 3 * ms + 400_000, replier, H, 0x10001, 30)
     g.send_exit(0, T + 3 * ms + 400_100, H, 30)
     return g if gen else model(g)
 
@@ -556,6 +558,8 @@ def send_phase_scene(sibling):
     g.channel(0, T + 12, 0x1)
     if sibling:
         g.state(0, T + 15, RECEIVE, S2, 10)
+    if sibling == "reused":
+        g.state(0, T + 18, DEAD, S2, 10)                       # s2 dies; its tid comes back below
     g.runmask(0, T + 20, 0x1)
     g.wait_receive(0, T + 40, S, 10)
     ms = 1_000_000
@@ -564,6 +568,8 @@ def send_phase_scene(sibling):
     g.receive(0, T + ms + 40, S, B, 0x10001, prio=10)
     g.state(0, T + ms + 100_000, READY, S, 10)
     g.state(0, T + ms + 100_010, RUNNING, M, 20)
+    if sibling == "reused":
+        g.state(0, T + ms + 150_000, RECEIVE, S2, 10)
     g.state(0, T + ms + 200_000, READY, M, 20)
     g.state(0, T + ms + 200_010, RUNNING, H, 30)
     g.send(0, T + ms + 200_020, H, S[0], 0x20002, prio=30, block=SEND)
@@ -1003,8 +1009,9 @@ def test_paths_need_a_confirmed_open_and_names_a_resource_manager():
     a_open, a_read, b_open, b_read = m.txns
     assert a_open.path is None and a_read.path is None and a_read.msg_type is None
     assert a_read.msg_desc.startswith("type 0x0101")
-    assert (b_open.msg_type, b_open.path) == ("_IO_CONNECT_OPEN", "/data/b")
-    assert (b_read.msg_type, b_read.path) == ("_IO_READ", "/data/b")
+    # an answered _IO_CONNECT (type 0x100) could be an application message: names and paths are candidates
+    assert (b_open.msg_type, b_open.msg_candidate, b_open.path) == ("_IO_CONNECT_OPEN", True, "/data/b")
+    assert (b_read.msg_label, b_read.path) == ("_IO_READ (candidate)", "/data/b")
 
 
 # ---- diff inputs -----------------------------------------------------------------------------------
@@ -1058,3 +1065,222 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 print("FAIL", name, e)
     sys.exit(1 if failed else 0)
+
+
+# ---- third review (v0.1b): counterexamples -----------------------------------------------------------
+def test_initial_buffer_loss_converts():
+    g = Gen(ncpu=2)
+    g.buffer(1, T)
+    g.names(1, T, NAMES)
+    g.state(1, T + 10, RUNNING, C, 10)
+    g.buffer(0, T + 500, seq=3)                                 # buffers 1 and 2 of CPU 0 are missing
+    g.state(0, T + 510, RUNNING, S, 10)
+    k, m = model(g)
+    assert [(l.kind, l.t0) for l in k.losses] == [("buffers", None)]
+    tp = tp_of(m, "initial_loss")                               # the writer used to fail on the missing start
+    if tp:
+        no_import_errors(tp)
+        r = rows(tp, "SELECT ts, dur FROM slice WHERE name LIKE 'CPU 0: buffers%'")
+        assert [(x.ts - T, x.dur) for x in r] == [(0, 500)]
+        tp.close()
+
+
+def test_partial_final_slot_keeps_whole_buffer_uncertain():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 1000, RUNNING, C, 10)
+    g.send(0, T + 1010, C, S[0], 0x10001, prio=10)
+    b = g.buffer(0, T + 1030)
+    g.receive(0, T + 1040, S, C, 0x10001, prio=10)             # MsgReceivev exit: an 8-slot combine
+    g.reply(0, T + 6060, S, C, 0x10001, 10)
+    g.send_exit(0, T + 6120, C, 10)
+    conts = [i for i, sl in enumerate(b[3]) if sl[0] >> 30 == S_CONT and (sl[0] >> 10) & 0x1F == C_KERCALL]
+    b[2] = len(b[3])
+    del b[3][conts[1]]                                          # a middle slot is missing ...
+    data = g.bytes()
+    k = KevFile("cut2.kev", data[:-8])                          # ... and the file ends inside the last slot
+    assert "short buffer" in [l.kind for l in k.losses]
+    assert all(e.partial for e in k.events() if e.cls == C_KERCALL and e.code == K_RECEIVEV | EXIT)
+    (tx,) = Model(k).txns
+    assert not tx.trustworthy
+
+
+def test_sole_thread_tracks_lifetimes_and_inventory():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, S, 10)
+    g.state(0, T + 15, RECEIVE, S2, 10)
+    g.state(0, T + 20, DEAD, S2, 10)                            # s2 dies ...
+    g.state(0, T + 500, RECEIVE, S2, 10)                        # ... and its tid is used again
+    g.state(0, T + 600, RUNNING, S, 10)
+    k, m = model(g)
+    tl = Timeline(m)
+    assert tl.sole_thread(S, T + 30, T + 400) and not tl.sole_thread(S, T + 30, T + 700)
+    g.event(0, T + 900, C_CONTROL, 8, [1, 0])                   # DROPPED: a thread could be created unseen
+    g.state(0, T + 1000, DEAD, S2, 10)
+    g.state(0, T + 1100, RUNNING, S, 10)
+    _, m = model(g)
+    tl = Timeline(m)
+    assert tl.sole_thread(S, T + 30, T + 400) and not tl.sole_thread(S, T + 2000, T + 3000)
+    _, m = send_phase_scene(sibling="reused")
+    r = suspected_inversions(m)
+    assert r["suspected"] == []
+    assert "other threads of server may receive on the channel" in r["insufficient_evidence"][0]["reasons"]
+
+
+def test_loss_forgets_channel_identities():
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, S, 10)
+    g.channel(0, T + 12, 0x1)                                  # chid 1: fixed priority, run masks not inherited
+    g.runmask(0, T + 20, 0x1)
+    g.wait_receive(0, T + 40, S, 10)
+    exchange(g, 0, T + 1000, C, S, 0x10001, msg=(0x00020100, 0, 0), coid=3)   # chid 1 answers an _IO_CONNECT
+    g.state(1, T + 5000, RUNNING, B, 10)
+    g.event(1, T + 5100, C_CONTROL, 8, [3, 0])                 # DROPPED: chid 1 may be destroyed and reused
+    g.state(0, T + 6000, RUNNING, S, 10)
+    g.runmask(0, T + 6010, 0x1)
+    g.wait_receive(0, T + 6040, S, 10)
+    exchange(g, 0, T + 7000, C, S, 0x20002, msg=(0x0101, 4096, 0), coid=3)
+    _, m = model(g)
+    tl = Timeline(m)
+    assert tl.runmask_at(S, T + 2000) == 0x1                    # flags traced: the mask survives a receive
+    assert tl.runmask_at(S, T + 6020) == 0x1 and tl.runmask_at(S, T + 7100) is None
+    first, second = m.txns
+    assert first.msg_type == "_IO_CONNECT_OPEN" and second.msg_type is None and not second.rm_chan
+    assert list(m.fixed_priority_channels()) == [(200, 1)]      # the report of created channels is kept
+    # pulses: after a loss, blocking on the old channel does not put the scoid's queue in sync
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T, RUNNING, S, 10)
+    g.kcall(0, T + 1, K_RECEIVEV, [1, 1])
+    g.state(0, T + 2, RECEIVE, S, 10)
+    g.state(1, T + 10, RUNNING, C, 10)
+    g.pulse(1, T + 20, C, S[0], 0x10001, 0)
+    receive_pulse(g, 0, T + 100, S, 0x10001)                    # learns the channel, then S blocks: in sync
+    g.state(1, T + 400, RUNNING, C, 10)
+    g.event(1, T + 500, C_CONTROL, 8, [1, 0])                  # DROPPED
+    g.state(0, T + 1000, RUNNING, S, 10)
+    g.kcall(0, T + 1010, K_RECEIVEV, [1, 1])
+    g.state(0, T + 1020, RECEIVE, S, 10)                        # blocks on chid 1 again
+    g.state(1, T + 1100, RUNNING, C, 10)
+    g.pulse(1, T + 1200, C, S[0], 0x10001, 1)
+    receive_pulse(g, 0, T + 1300, S, 0x10001)                   # the scoid's channel must be learnt again
+    g.pulse(1, T + 1400, C, S[0], 0x10001, 2)
+    receive_pulse(g, 0, T + 1500, S, 0x10001)
+    _, m = model(g)
+    assert [p.match for p in m.pulses] == ["unsynced", "unsynced", "unique"]
+
+
+def test_receive_attribution_and_handoffs():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.send(0, T + 20, C, S[0], 0x10001, prio=10, block=SEND)    # nobody receives yet
+    g.state(0, T + 50, RUNNING, S, 10)                          # s1 runs its own code for 1000 ns ...
+    g.kcall(0, T + 1050, K_RECEIVEV, [1, 1])                    # ... then calls MsgReceivev
+    g.receive(0, T + 1060, S, C, 0x10001, prio=10)
+    g.reply(0, T + 2000, S, C, 0x10001, 10)
+    g.wait_receive(0, T + 2040, S, 10)
+    g.send_exit(0, T + 2060, C, 10)
+    _, m = model(g)
+    (tx,) = m.txns
+    assert tx.t_rx_call == T + 1050
+    segs = critical_path(m, tx)
+    got = [(sg.kind, sg.t0 - T, sg.t1 - T) for sg in segs if sg.thread == S]
+    assert ("server busy", 50, 1050) in got and ("server running", 1050, 1080) in got
+    assert [sg.label for sg in segs if sg.t0 == T + 1050] == ["server/s1 receiving this request (in MsgReceivev)"]
+    # replied by another thread: after the receive the path is unknown, and so is the inversion evidence
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, B, 10)
+    g.send(0, T + 210, B, S[0], 0x20001)
+    g.receive(0, T + 300, S, B, 0x20001)
+    g.wait_receive(0, T + 450, S)
+    g.state(0, T + 500, RUNNING, S2, 10)
+    g.reply(0, T + 510, S2, B, 0x20001)
+    g.send_exit(0, T + 700, B)
+    _, m = model(g)
+    (y,) = m.txns
+    after = [sg for sg in critical_path(m, y) if sg.t0 >= y.t_rx_exit and sg.thread != B]
+    assert after and all(sg.kind == "unknown" and "handed off" in sg.label for sg in after)
+    _, m = prio_scene(0x1, M, 20, replier=S2)
+    r = suspected_inversions(m)
+    assert r["suspected"] == []
+    assert any(k.startswith("request handed off") for k in r["insufficient_evidence"][0]["reasons"])
+
+
+def test_paths_and_protocols_are_labelled_candidates():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 1, RECEIVE, S, 10)
+    g.state(0, T + 2, RECEIVE, (1, 7), 10)
+    t = opened(g, 0, T + 10, B, S, "/data/b", 4, 0x30003)       # PATHMGR + ConnectAttach + answered 0x100
+    t = exchange(g, 0, t, B, S, 0x40004, msg=(0x0101, 4096, 0), coid=4)
+    exchange(g, 0, t, B, (1, 7), 0x50005, msg=(0x0101, 4096, 0), coid=5)   # to procnto: a known protocol
+    _, m = model(g)
+    b_open, b_read, to_proc = m.txns
+    assert b_read.msg_label == "_IO_READ (candidate)" and b_read.path == "/data/b"
+    assert (to_proc.msg_label, to_proc.msg_candidate) == ("_IO_READ", False)
+    assert "(_IO_READ (candidate))" in render(m, b_read, critical_path(m, b_read))[0]
+    tp = tp_of(m, "candidates")
+    if tp:
+        no_import_errors(tp)
+        r = rows(tp, "SELECT name, extract_arg(arg_set_id, 'debug.path_candidate') AS p, "
+                     "extract_arg(arg_set_id, 'debug.message') AS msg FROM slice WHERE name LIKE 'MsgSend%' ORDER BY ts")
+        assert [(x.name, x.p, x.msg) for x in r] == [
+            ("MsgSend _IO_CONNECT_OPEN (candidate) -> server", "/data/b", "_IO_CONNECT_OPEN (candidate)"),
+            ("MsgSend _IO_READ (candidate) -> server", "/data/b", "_IO_READ (candidate)"),
+            ("MsgSend _IO_READ -> procnto-smp-instr", None, "_IO_READ")]
+        tp.close()
+
+
+def test_wakeup_evidence_needs_the_same_wake():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T, RUNNING, C, 10)
+    g.state(0, T + 40, RECEIVE, S, 10)
+    g.send(0, T + 100, C, S[0], 0x10001)
+    g.state(0, T + 115, READY, S, 10)                          # inside C's MsgSendv, after SND_MESSAGE ...
+    g.state(0, T + 130, RUNNING, S, 10)
+    g.state(0, T + 140, RECEIVE, S, 10)                        # ... but S blocks again before receiving it
+    g.state(0, T + 180, READY, S, 10)
+    g.receive(0, T + 200, S, C, 0x10001)
+    _, m = model(g)
+    assert m.wakeups == [] and m.counters["wakeups_with_evidence"] == 0
+
+
+def test_untrustworthy_exchange_has_no_arrows_and_warns_on_every_slice():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 1000, RUNNING, C, 10)
+    g.send(0, T + 1010, C, S[0], 0x10001)
+    g.receive(0, T + 1050, S, C, 0x10001, info_client=B)       # _msg_info names another sender
+    g.reply(0, T + 2000, S, C, 0x10001)
+    g.wait_receive(0, T + 2040, S)
+    g.send_exit(0, T + 2100, C)
+    _, m = model(g)
+    (tx,) = m.txns
+    assert tx.complete and not tx.trustworthy
+    tp = tp_of(m, "untrusted")
+    if tp:
+        no_import_errors(tp)
+        assert rows(tp, "SELECT COUNT(*) n FROM flow")[0].n == 0
+        r = rows(tp, "SELECT name, extract_arg(arg_set_id, 'debug.warnings') AS w, "
+                     "extract_arg(arg_set_id, 'debug.trustworthy') AS ok FROM slice WHERE extract_arg(arg_set_id, "
+                     "'debug.txn') = 0 AND name NOT LIKE 'txn %' ORDER BY ts")
+        assert sorted(x.name for x in r) == ["MsgReply [not trustworthy]", "MsgSend -> server [not trustworthy]",
+                                             "handle client/c [not trustworthy]", "reply received [not trustworthy]"]
+        assert all(x.w and "_msg_info names" in x.w and x.ok == 0 for x in r)
+        tp.close()

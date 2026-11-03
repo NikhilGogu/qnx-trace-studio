@@ -366,8 +366,9 @@ class Writer:
             send_flow, reply_flow = 2 * tx.idx + 1, 2 * tx.idx + 2
             args = {"txn": tx.idx, "rcvid": "0x%08x" % tx.rcvid, "server_pid": tx.server_pid,
                     "server": m.label(tx.server), "client": m.label(tx.client),
-                    "message": tx.msg_type or tx.msg_desc,
-                    "path": tx.path, "client_blocked": tx.client_block, "parent_txn": tx.parent,
+                    "message": tx.msg_label or tx.msg_desc,
+                    "path_candidate": tx.path, "client_blocked": tx.client_block, "parent_txn": tx.parent,
+                    "client_qnx_prio": tx.client_prio,
                     "error": tx.error, "outcome": tx.outcome, "trustworthy": tx.trustworthy}
             if tx.coid is not None:
                 args["coid"] = "0x%08x" % tx.coid
@@ -379,25 +380,30 @@ class Writer:
                 args["latency_us"] = round((tx.t_exit - tx.t_call) * 1e6 / cps, 3)
             if tx.warnings:
                 args["warnings"] = "; ".join(tx.warnings)
+            # every slice of an exchange says whether it can be trusted; untrustworthy ones get no arrows
+            common = {"txn": tx.idx, "trustworthy": tx.trustworthy, "warnings": args.get("warnings")}
+            mark = "" if tx.trustworthy else " [not trustworthy]"
+            linked = tx.trustworthy
             have_handle = tx.server is not None and tx.t_rx_exit is not None and tx.t_reply_call is not None
             have_send = tx.t_call is not None and tx.t_exit is not None
             have_reply = tx.t_reply_call is not None and tx.t_reply_exit is not None
             t_back = tx.t_unblock or tx.t_reply_msg
             have_back = have_send and have_reply and t_back is not None and tx.t_call <= t_back <= tx.t_exit
-            label = "MsgSend %s-> %s" % (tx.msg_type + " " if tx.msg_type else "", sname)
-            self.add((tx.client, None), tx.t_call, tx.t_exit, label, args,
-                     flows=(send_flow,) if have_send and have_handle else ())
+            mtype = tx.msg_label + " " if tx.msg_type else ""
+            self.add((tx.client, None), tx.t_call, tx.t_exit, "MsgSend %s-> %s%s" % (mtype, sname, mark), args,
+                     flows=(send_flow,) if linked and have_send and have_handle else ())
             if have_handle:
                 self.add((tx.server, None), tx.t_rx_exit, tx.t_reply_call,
-                         "handle %s%s" % (tx.msg_type + " " if tx.msg_type else "", m.label(tx.client)),
-                         {"txn": tx.idx, "client": m.label(tx.client), "rcvid": "0x%08x" % tx.rcvid},
-                         term=(send_flow,) if have_send else ())
+                         "handle %s%s%s" % (mtype, m.label(tx.client), mark),
+                         dict(common, client=m.label(tx.client), rcvid="0x%08x" % tx.rcvid),
+                         term=(send_flow,) if linked and have_send else ())
             if have_reply:
                 self.add((tx.replier or tx.server, None), tx.t_reply_call, tx.t_reply_exit,
-                         "MsgError" if tx.error is not None else "MsgReply", {"txn": tx.idx},
-                         flows=(reply_flow,) if have_back else ())
+                         ("MsgError" if tx.error is not None else "MsgReply") + mark, common,
+                         flows=(reply_flow,) if linked and have_back else ())
             if have_back:
-                self.add((tx.client, None), t_back, tx.t_exit, "reply received", {"txn": tx.idx}, term=(reply_flow,))
+                self.add((tx.client, None), t_back, tx.t_exit, "reply received" + mark, common,
+                         term=(reply_flow,) if linked else ())
             self.stats["ipc_txns"] += 1
 
     def _critical_paths(self):
@@ -420,7 +426,7 @@ class Writer:
             segs = critical_path(m, tx, tl)
             track = "%s critical path" % self.comm(tx.client)
             self.add((tx.client, track), tx.t_call, tx.t_exit, "txn %d %s-> %s: %.1f us" % (
-                tx.idx, tx.msg_type + " " if tx.msg_type else "", m.server_name(tx), us(m, tx.t_exit - tx.t_call)),
+                tx.idx, tx.msg_label + " " if tx.msg_type else "", m.server_name(tx), us(m, tx.t_exit - tx.t_call)),
                 {"txn": tx.idx, "kind": "request"})
             put(tx.client, track, segs, 1)
             self.stats["critical_paths"] += 1
@@ -455,9 +461,11 @@ class Writer:
         self.stats["interrupts"] = len(self.m.interrupts)
 
     def _losses(self):
-        for g in self.m.gaps:
-            t1 = g.t1 if g.t1 is not None else self.m.end_ts
-            self.add((None, "lost events"), g.t0, max(t1, g.t0), "CPU %d: %s%s" % (
+        m = self.m
+        for g in m.gaps:     # a loss before a CPU's first buffer has no start, one at the end no end
+            t0 = g.t0 if g.t0 is not None else m.start_ts
+            t1 = g.t1 if g.t1 is not None else m.end_ts
+            self.add((None, "lost events"), t0, max(t1, t0), "CPU %d: %s%s" % (
                 g.cpu, g.kind, " (%d)" % g.count if g.count is not None else ""), {"detail": g.detail, "cpu": g.cpu})
 
 

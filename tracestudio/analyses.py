@@ -220,12 +220,6 @@ class Timeline:
         o = self.open_at(server, ts)
         return o[0] if len(o) == 1 else None
 
-    def next_received_after(self, server, ts):
-        """The first request the server thread received after ts, or None."""
-        lst, rx, _, _ = self._handled_index(server)
-        i = bisect.bisect_right(rx, ts)
-        return lst[i] if i < len(lst) else None
-
     def client_txn_at(self, key, ts):
         """The exchange in which thread `key` was the client at ts (MsgSendv entered, not yet returned)."""
         cache = self.__dict__.setdefault("_client_cache", {})
@@ -240,21 +234,44 @@ class Timeline:
         return None
 
     def sole_thread(self, key, t0, t1):
-        """True when `key` is provably the only live thread of its process during [t0, t1]."""
+        """True when `key` is provably the only live thread of its process during [t0, t1]: the inventory of
+        its threads is complete (process created in the trace, or its threads listed at trace start, and no
+        lost events since then that could hide a thread) and no other thread is alive in the interval. A
+        thread id that dies and is used again starts a new lifetime."""
         m = self.m
         p = m.processes.get(key[0])
-        if p is None or (p.created_ts is None and key[0] not in m.injected_pids):
+        if p is None:
+            return False
+        if p.created_ts is not None:
+            since = p.created_ts
+        elif key[0] in m.injected_pids:
+            since = m.start_ts
+        else:
             return False      # threads that existed before the trace may never show up
+        for lst in m.loss_windows.values():
+            if any(w0 < t1 and w1 > since for w0, w1 in lst):
+                return False  # a thread created inside lost events may never show up either
         for other, t in m.threads.items():
             if other[0] != key[0] or other == key or not t.states:
                 continue
-            if t.states[0][0] > t1:
-                continue
-            gone = [s[0] for s in t.states if s[1] in (ST_DEAD, ST_DESTROY)]
-            if gone and gone[0] <= t0:
-                continue
-            return False
+            if any(b < t1 and (d is None or d > t0) for b, d in _lifetimes(t)):
+                return False
         return True
+
+
+def _lifetimes(t):
+    """[(birth, death or None)] of one thread id: from its first event to DEAD or DESTROY, again after reuse."""
+    out, born = [], None
+    for s in t.states:
+        if s[1] in (ST_DEAD, ST_DESTROY):
+            if born is not None:
+                out.append((born, s[0]))
+                born = None
+        elif born is None:
+            born = s[0]
+    if born is not None:
+        out.append((born, None))
+    return out
 
 
 def thread_key(model, key, prio):
@@ -362,6 +379,12 @@ def _inversion(tl, tx):
         if ccode not in (ST_SEND, ST_REPLY):
             continue
         send_phase = ccode == ST_SEND and (tx.t_rx_exit is None or a < tx.t_rx_exit)
+        if not send_phase and tx.replier is not None and tx.replier != srv:
+            # another thread replied: after the receive the work may be anywhere in the server process
+            unk += b - a
+            reasons["request handed off: received by %s (tid %d), replied by %s (tid %d)" % (
+                m.label(srv), srv[1], m.label(tx.replier), tx.replier[1])] += b - a
+            continue
         sole = not send_phase or tl.sole_thread(srv, a, b)
         for c, d, scode, sprio in tl.segments(srv, a, b):
             if scode in (None, ST_UNKNOWN):

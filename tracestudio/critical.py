@@ -13,12 +13,14 @@ latency exactly:
                      or it holds several received requests and the trace does not say which one it serves
   server waiting     the receiving thread is still RECEIVE-blocked (message not yet delivered)
   server preempted   the server thread is READY while threads at or above its priority hold its CPUs
-  server running     the server thread receives, runs or replies to this request
+  server running     the server thread runs inside the MsgReceivev call that returns this request,
+                     runs this request, or replies to it
   nested request     the server thread waits in its own request to another server;
                      that request's critical path is nested inside, recursively, when it is trustworthy
   server blocked     the server thread is blocked in another state (MUTEX, ...) or in a
                      request that is not part of this one
-  unknown            no events (lost data) or nothing known yet
+  unknown            no events (lost data), nothing known yet, or the request was handed off (another
+                     thread replied, or the receiver went back to MsgReceive with the request open)
 """
 from __future__ import annotations
 
@@ -162,15 +164,27 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
             segs.append(last)
         last.pieces.append((a, b, holder))
 
+    rx0 = tx.t_rx_call if tx.t_rx_call is not None else tx.t_rmsg    # the receive call, as far as it is known
+
     def server_part(a, b):
         if srv is None:
             add(a, b, "unknown", "receiving server thread not identified", short="server unknown")
             return
         sl = m.label(srv)
         ss = _tn(m, srv)
+        if tx.replier is not None and tx.replier != srv and tx.t_rx_exit is not None and b > tx.t_rx_exit:
+            # replied by another thread: which threads worked on it after the receive is not in the trace
+            if a < tx.t_rx_exit:
+                server_part(a, tx.t_rx_exit)
+            add(max(a, tx.t_rx_exit), b, "unknown", "handed off: %s received it, %s replied (not followed)" % (
+                sl, m.label(tx.replier)), srv, short="handed off to %s" % _tn(m, tx.replier))
+            return
         for c, d, scode, sprio in tl.segments(srv, a, b):
             if scode == ST_RUNNING:
                 cuts = {c, d}
+                for x in (rx0, tx.t_rx_exit):
+                    if x is not None and c < x < d:
+                        cuts.add(x)
                 lst, rx, reach, ends = tl._handled_index(srv)
                 i0 = j = bisect.bisect_right(rx, c)
                 while j < len(lst) and rx[j] < d:          # requests received inside (c, d)
@@ -187,7 +201,10 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                 for e, f in zip(cuts, cuts[1:]):
                     opened = tl.open_at(srv, e)
                     h = opened[0] if len(opened) == 1 else None
-                    if len(opened) > 1:     # which of them the thread works on is not in the trace
+                    if rx0 is not None and rx0 <= e < tx.t_rx_exit:
+                        add(e, f, "server running", "%s receiving this request (in MsgReceivev)" % sl, srv, sprio,
+                            short="%s receiving" % ss)
+                    elif len(opened) > 1:     # which of them the thread works on is not in the trace
                         add(e, f, "server busy", "%s running with %d requests open (%s)" % (
                             sl, len(opened), ", ".join("txn %d" % x.idx for x in sorted(opened, key=lambda x: x.idx))),
                             srv, sprio, short="%s: %d requests open" % (ss, len(opened)))
@@ -197,10 +214,6 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                     elif h is not None:
                         add(e, f, "server busy", "%s running %s's request (txn %d)" % (sl, m.label(h.client), h.idx),
                             srv, sprio, short="%s busy: %s's request" % (ss, _tn(m, h.client)))
-                    elif tx.t_rx_exit is not None and e < tx.t_rx_exit and (
-                            (tl.next_received_after(srv, e) or tx).t_rx_exit >= tx.t_rx_exit):
-                        add(e, f, "server running", "%s receiving this request" % sl, srv, sprio,
-                            short="%s receiving" % ss)
                     elif tx.t_reply_call is not None and e >= tx.t_reply_call:
                         add(e, f, "server running", "%s replying" % sl, srv, sprio, short="%s replying" % ss)
                     else:
@@ -222,14 +235,15 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                 elif k is not None:
                     add(c, d, "server blocked", "%s %s-blocked on %s (txn %d%s)" % (
                         sl, state_name(scode), m.server_name(k), k.idx,
-                        "" if k.parent == tx.idx else ", not part of this request"), srv, sprio,
+                        ", parent ambiguous, not followed" if tx.idx in k.parent_candidates
+                        else ", not part of this request"), srv, sprio,
                         short="%s %s-blocked on %s" % (ss, state_name(scode), m.server_name(k)))
                 else:
                     add(c, d, "server blocked", "%s %s-blocked" % (sl, state_name(scode)), srv, sprio,
                         short="%s %s-blocked" % (ss, state_name(scode)))
             elif scode == ST_RECEIVE and tx.t_rx_exit is not None and c >= tx.t_rx_exit:
-                # received, not yet replied, waiting for other messages: the work went elsewhere
-                add(c, d, "server blocked", "%s RECEIVE-blocked, this request still open (handed off, not followed)"
+                # received, not yet replied, waiting for other messages: the work may be anywhere
+                add(c, d, "unknown", "%s RECEIVE-blocked, this request still open (handed off, not followed)"
                     % sl, srv, sprio, short="%s handed off" % ss)
             elif scode == ST_RECEIVE:
                 add(c, d, "server waiting", "%s RECEIVE-blocked" % sl, srv, sprio, short="%s RECEIVE-blocked" % ss)
@@ -276,7 +290,7 @@ def to_json(model, tx, segs):
             d["nested"] = [seg(c) for c in s.children]
         return d
     return {"txn": tx.idx, "client": model.label(tx.client), "server": model.server_name(tx),
-            "message": tx.msg_type, "latency_us": round(us(model, tx.t_exit - tx.t_call), 1),
+            "message": tx.msg_label or None, "latency_us": round(us(model, tx.t_exit - tx.t_call), 1),
             "trustworthy": tx.trustworthy, "warnings": tx.warnings, "by_kind_us": totals(model, segs),
             "segments": [seg(s) for s in segs]}
 
@@ -284,8 +298,11 @@ def to_json(model, tx, segs):
 def render(model, tx, segs):
     lat = us(model, tx.t_exit - tx.t_call)
     lines = ["txn %d: %s -> %s%s, MsgSend latency %.1f us%s" % (
-        tx.idx, model.label(tx.client), model.server_name(tx), " (%s)" % tx.msg_type if tx.msg_type else "", lat,
+        tx.idx, model.label(tx.client), model.server_name(tx), " (%s)" % tx.msg_label if tx.msg_type else "", lat,
         "" if tx.trustworthy else "  [not trustworthy: %s]" % "; ".join(tx.warnings or ["incomplete"]))]
+    if tx.parent_candidates:
+        lines.append("   parent ambiguous (txn %s): not part of any other request's critical path"
+                     % ", ".join(map(str, tx.parent_candidates)))
     lines.append("   start us       us      %  what")
 
     def walk(ss, depth):

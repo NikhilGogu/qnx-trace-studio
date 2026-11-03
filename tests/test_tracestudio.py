@@ -85,8 +85,10 @@ def test_priority_story():
     assert all(x["preempted_by"][0]["thread"].endswith("/hog") for x in sus)
     assert all(x["server_run_mask"] == "0x1" and x["server_prio_while_ready"] == 10 for x in sus)
     assert all(x["while"].get("SEND", 0) > 7000 for x in sus)       # hog runs while hi waits for the receive
-    assert not inv_f["insufficient_evidence"]
-    assert inv_i["suspected"] == [] and inv_i["insufficient_evidence"] == []
+    for x in inv_f["insufficient_evidence"] + inv_i["insufficient_evidence"]:   # only requests to procnto
+        assert list(x["reasons"]) == [k for k in x["reasons"] if k.startswith("request handed off")], x
+        assert x["server"].startswith("procnto-smp-instr/"), x
+    assert inv_i["suspected"] == []
     assert any(v["flags"] & 1 for v in fixed.channels.values())         # _NTO_CHF_FIXED_PRIORITY seen
     assert not any(v["flags"] & 1 for v in inherit.channels.values())
 
@@ -182,8 +184,8 @@ def test_resource_manager_names_and_paths():
     out = os.path.join(TMP, "rm_small.perfetto-trace")
     write(m, out)
     tp = TraceProcessor(trace=out)
-    r = list(tp.query("SELECT COUNT(*) n, SUM(extract_arg(arg_set_id, 'debug.path') = '/system/lib/libxo.so.0') p "
-                      "FROM slice WHERE name = 'MsgSend _IO_READ -> devb-eide'"))[0]
+    r = list(tp.query("SELECT COUNT(*) n, SUM(extract_arg(arg_set_id, 'debug.path_candidate') = "
+                      "'/system/lib/libxo.so.0') p FROM slice WHERE name = 'MsgSend _IO_READ (candidate) -> devb-eide'"))[0]
     assert r.n >= 30 and r.p >= 30, (r.n, r.p)
     tp.close()
 
