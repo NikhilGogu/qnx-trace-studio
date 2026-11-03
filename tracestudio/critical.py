@@ -37,6 +37,7 @@ class Segment:
     txn: int | None = None
     children: list = field(default_factory=list)
     held_by: dict = field(default_factory=dict)   # for READY waits: who held the CPUs -> cycles
+    short: str = ""                               # compact name for the Perfetto slice
 
 
 def _clip(segs, a, b):
@@ -45,12 +46,17 @@ def _clip(segs, a, b):
         lo, hi = max(s.t0, a), min(s.t1, b)
         if hi > lo:
             out.append(Segment(lo, hi, s.kind, s.label, s.thread, s.prio, s.txn, _clip(s.children, lo, hi),
-                               dict(s.held_by)))
+                               dict(s.held_by), s.short))
     return out
 
 
+def _tn(m, key):
+    t = m.threads.get(key)
+    return t.name if t and t.name else m.label(key)
+
+
 def _held(tl, key, a, b):
-    """Who held the CPUs `key` may run on during [a, b]: [(e, f, text, main thread, its prio)]."""
+    """Who held the CPUs `key` may run on during [a, b]: [(e, f, (text, short text), main thread, its prio)]."""
     m = tl.m
     cuts = {a, b}
     for cpu in tl.cpus:
@@ -63,16 +69,17 @@ def _held(tl, key, a, b):
         occ = [(x, tl.occupant(x, e)) for x in cpus]
         known = [(x, o, tl.prio_at(o, e)) for x, o in occ if o not in (None, UNKNOWN)]
         if len(known) < len(occ):
-            yield e, f, "occupant of a CPU it may use unknown", None, None
+            yield e, f, ("occupant of a CPU it may use unknown", "unknown"), None, None
             continue
         known.sort(key=lambda r: -(r[2] if r[2] is not None else -1))
         x, o, p = known[0]
         if len(known) == 1 and o == key:
-            yield e, f, "the kernel on CPU %d (switching)" % x, None, None
+            yield e, f, ("the kernel on CPU %d (switching)" % x, "kernel"), None, None
         elif len(known) == 1:
-            yield e, f, "%s (prio %s) on CPU %d" % (m.label(o), p, x), o, p
+            yield e, f, ("%s (prio %s) on CPU %d" % (m.label(o), p, x), "%s (%s)" % (_tn(m, o), p)), o, p
         else:
-            yield e, f, " + ".join("%s (prio %s) on CPU %d" % (m.label(o2), p2, x2) for x2, o2, p2 in known), o, p
+            yield e, f, (" + ".join("%s (prio %s) on CPU %d" % (m.label(o2), p2, x2) for x2, o2, p2 in known),
+                         " + ".join("%s (%s)" % (_tn(m, o2), p2) for _, o2, p2 in known)), o, p
 
 
 def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
@@ -83,14 +90,14 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
     client, srv = tx.client, tx.server
     cl = m.label(client)
 
-    def add(a, b, kind, label, thread=None, prio=None, children=None):
+    def add(a, b, kind, label, thread=None, prio=None, children=None, short=None):
         if b <= a:
             return
         last = segs[-1] if segs else None
         if last and not children and not last.children and last.kind == kind and last.label == label and last.t1 == a:
             last.t1 = b
             return
-        segs.append(Segment(a, b, kind, label, thread, prio, tx.idx, children or []))
+        segs.append(Segment(a, b, kind, label, thread, prio, tx.idx, children or [], short=short or label))
 
     def add_wait(a, b, kind, waiter, wprio, holder):
         """READY waits merge while the waiting thread and its priority stay the same."""
@@ -106,9 +113,10 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
 
     def server_part(a, b):
         if srv is None:
-            add(a, b, "unknown", "receiving server thread not identified")
+            add(a, b, "unknown", "receiving server thread not identified", short="server unknown")
             return
         sl = m.label(srv)
+        ss = _tn(m, srv)
         handled = tl._handled(srv)
         for c, d, scode, sprio in tl.segments(srv, a, b):
             if scode == ST_RUNNING:
@@ -121,17 +129,20 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                 for e, f in zip(cuts, cuts[1:]):
                     h = tl.handling_at(srv, e)
                     if h is tx:
-                        add(e, f, "server running", "%s running this request" % sl, srv, sprio)
+                        add(e, f, "server running", "%s running this request" % sl, srv, sprio,
+                            short="%s runs this request" % ss)
                     elif h is not None:
                         add(e, f, "server busy", "%s running %s's request (txn %d)" % (sl, m.label(h.client), h.idx),
-                            srv, sprio)
+                            srv, sprio, short="%s busy: %s's request" % (ss, _tn(m, h.client)))
                     elif tx.t_rx_exit is not None and e < tx.t_rx_exit and (
                             not handled or not any(x.t_rx_exit > e and x.t_rx_exit < tx.t_rx_exit for x in handled)):
-                        add(e, f, "server running", "%s receiving this request" % sl, srv, sprio)
+                        add(e, f, "server running", "%s receiving this request" % sl, srv, sprio,
+                            short="%s receiving" % ss)
                     elif tx.t_reply_call is not None and e >= tx.t_reply_call:
-                        add(e, f, "server running", "%s replying" % sl, srv, sprio)
+                        add(e, f, "server running", "%s replying" % sl, srv, sprio, short="%s replying" % ss)
                     else:
-                        add(e, f, "server busy", "%s running, not in a request" % sl, srv, sprio)
+                        add(e, f, "server busy", "%s running, not in a request" % sl, srv, sprio,
+                            short="%s busy (no request)" % ss)
             elif scode == ST_READY:
                 for e, f, text, who, p in _held(tl, srv, c, d):
                     add_wait(e, f, "server preempted", srv, sprio, text)
@@ -141,46 +152,52 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                 if k is not None and k.parent == tx.idx and k.t_exit is not None and _depth < max_depth:
                     kids = _clip(critical_path(m, k, tl, max_depth, _depth + 1), c, d)
                     add(c, d, "nested request", "%s waits for %s (txn %d)" % (sl, m.server_name(k), k.idx),
-                        srv, sprio, kids)
+                        srv, sprio, kids, short="%s waits for %s" % (ss, m.server_name(k)))
                 elif k is not None:
                     add(c, d, "server blocked", "%s %s-blocked on %s (txn %d%s)" % (
                         sl, state_name(scode), m.server_name(k), k.idx,
-                        "" if k.parent == tx.idx else ", not part of this request"), srv, sprio)
+                        "" if k.parent == tx.idx else ", not part of this request"), srv, sprio,
+                        short="%s %s-blocked on %s" % (ss, state_name(scode), m.server_name(k)))
                 else:
-                    add(c, d, "server blocked", "%s %s-blocked" % (sl, state_name(scode)), srv, sprio)
+                    add(c, d, "server blocked", "%s %s-blocked" % (sl, state_name(scode)), srv, sprio,
+                        short="%s %s-blocked" % (ss, state_name(scode)))
             elif scode == ST_RECEIVE and tx.t_rx_exit is not None and c >= tx.t_rx_exit:
                 # received, not yet replied, waiting for other messages: the work went elsewhere
                 add(c, d, "server blocked", "%s RECEIVE-blocked, this request still open (handed off, not followed)"
-                    % sl, srv, sprio)
+                    % sl, srv, sprio, short="%s handed off" % ss)
             elif scode == ST_RECEIVE:
-                add(c, d, "server waiting", "%s RECEIVE-blocked" % sl, srv, sprio)
+                add(c, d, "server waiting", "%s RECEIVE-blocked" % sl, srv, sprio, short="%s RECEIVE-blocked" % ss)
             elif scode in (None, ST_UNKNOWN):
-                add(c, d, "unknown", "no events for %s" % sl, srv)
+                add(c, d, "unknown", "no events for %s" % sl, srv, short="unknown (no events)")
             else:
-                add(c, d, "server blocked", "%s blocked in %s" % (sl, state_name(scode)), srv, sprio)
+                add(c, d, "server blocked", "%s blocked in %s" % (sl, state_name(scode)), srv, sprio,
+                    short="%s %s" % (ss, state_name(scode)))
 
     for a, b, code, prio in tl.segments(client, tx.t_call, tx.t_exit):
         if code == ST_RUNNING:
-            add(a, b, "client running", "%s running" % cl, client, prio)
+            add(a, b, "client running", "%s running" % cl, client, prio, short="%s running" % _tn(m, client))
         elif code == ST_READY:
             for e, f, text, who, p in _held(tl, client, a, b):
                 add_wait(e, f, "client ready", client, prio, text)
         elif code in (ST_SEND, ST_REPLY):
             server_part(a, b)
         elif code in (None, ST_UNKNOWN):
-            add(a, b, "unknown", "no events for %s" % cl, client)
+            add(a, b, "unknown", "no events for %s" % cl, client, short="unknown (no events)")
         else:
-            add(a, b, "client blocked", "%s blocked in %s" % (cl, state_name(code)), client, prio)
+            add(a, b, "client blocked", "%s blocked in %s" % (cl, state_name(code)), client, prio,
+                short="%s %s" % (_tn(m, client), state_name(code)))
     for sg in segs:
         if sg.held_by:
             top = sorted(sg.held_by.items(), key=lambda kv: -kv[1])
             if len(top) == 1:
-                sg.label = "%s READY at prio %s, CPU held by %s" % (m.label(sg.thread), sg.prio, top[0][0])
+                sg.label = "%s READY at prio %s, CPU held by %s" % (m.label(sg.thread), sg.prio, top[0][0][0])
             else:
                 more = sum(v for _, v in top[3:])
                 sg.label = "%s READY at prio %s, CPUs held by %s%s" % (
-                    m.label(sg.thread), sg.prio, ", ".join("%s %.1f us" % (k, us(m, v)) for k, v in top[:3]),
+                    m.label(sg.thread), sg.prio, ", ".join("%s %.1f us" % (k[0], us(m, v)) for k, v in top[:3]),
                     ", %d more %.1f us" % (len(top) - 3, us(m, more)) if more else "")
+            sg.short = "%s READY (%s), CPU: %s%s" % (_tn(m, sg.thread), sg.prio, top[0][0][1],
+                                                    " +%d more" % (len(top) - 1) if len(top) > 1 else "")
     return segs
 
 
@@ -198,7 +215,8 @@ def to_json(model, tx, segs):
         if s.thread is not None:
             d["thread"], d["prio"] = model.label(s.thread), s.prio
         if s.held_by:
-            d["cpu_held_by_us"] = {k: round(us(model, v), 1) for k, v in sorted(s.held_by.items(), key=lambda kv: -kv[1])}
+            d["cpu_held_by_us"] = {k[0]: round(us(model, v), 1)
+                                   for k, v in sorted(s.held_by.items(), key=lambda kv: -kv[1])}
         if s.children:
             d["nested"] = [seg(c) for c in s.children]
         return d

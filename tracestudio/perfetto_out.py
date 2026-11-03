@@ -404,9 +404,10 @@ class Writer:
 
         def put(key, track, segs, depth):
             for sg in segs:
-                args = {"kind": sg.kind, "txn": sg.txn, "thread": m.label(sg.thread) if sg.thread else None,
-                        "qnx_prio": sg.prio, "us": round(us(m, sg.t1 - sg.t0), 3)}
-                self.add((key, track), sg.t0, sg.t1, sg.label, args)
+                args = {"kind": sg.kind, "what": sg.label, "txn": sg.txn,
+                        "thread": m.label(sg.thread) if sg.thread else None, "qnx_prio": sg.prio,
+                        "us": round(us(m, sg.t1 - sg.t0), 3)}
+                self.add((key, track), sg.t0, sg.t1, sg.short or sg.label, args)
                 put(key, track, sg.children, depth + 1)
 
         for tx in m.txns:
