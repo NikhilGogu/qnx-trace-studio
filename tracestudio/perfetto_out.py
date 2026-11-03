@@ -14,7 +14,8 @@ Mapping:
     appear as "QNX priority" counter tracks, "qnx_prio" arguments, and in the
     priority column of Perfetto's sched table, which here holds the QNX value,
     not a Linux prio.
-  * processes and threads -> ProcessTree. Perfetto tids are global, QNX tids
+  * processes and threads -> ProcessTree plus process track descriptors with
+    the short process name (the path is left out). Perfetto tids are global, QNX tids
     are per process, so thread (pid, tid) becomes pid*100+tid when that fits
     in 31 bits (readable: 109365703 = pid 1093657 tid 3), else a counter.
   * exact QNX thread states (SEND, RECEIVE, REPLY, MUTEX, ..., UNKNOWN for
@@ -275,10 +276,11 @@ class Writer:
         p = pb.TracePacket()
         pt = p.process_tree
         for pid, pr in sorted(m.processes.items()):
+            # no cmdline: TraceProcessor would name the process after it (the full path) instead of
+            # the short name in the process track descriptor below
             x = pt.processes.add()
             x.pid = pid
             x.ppid = pr.ppid or 0
-            x.cmdline.append(pr.path or pr.name)
         for key, t in sorted(m.threads.items()):
             if m.is_idle(key):
                 continue
@@ -289,14 +291,16 @@ class Writer:
         if any(sw[5] == UNKNOWN for sw in m.switches):
             x = pt.processes.add()
             x.pid = UNKNOWN_TID
-            x.cmdline.append("trace-studio: CPU occupant unknown (lost events or migration)")
             x = pt.threads.add()
             x.tid, x.tgid, x.name = UNKNOWN_TID, UNKNOWN_TID, "UNKNOWN"
         self.trace.packet.append(p)
-        for pid, pr in sorted(m.processes.items()):   # short process names; ProcessTree keeps the path
+        names = [(pid, pr.name) for pid, pr in sorted(m.processes.items())]
+        if any(sw[5] == UNKNOWN for sw in m.switches):
+            names.append((UNKNOWN_TID, "trace-studio: CPU occupant unknown"))
+        for pid, name in names:
             d = pb.TrackDescriptor(uuid=self.uuid())
             d.process.pid = pid
-            d.process.process_name = pr.name
+            d.process.process_name = name
             self.descriptor(d)
 
     def _sched(self):

@@ -124,7 +124,7 @@ class KevFile:
         self.ncpu = int(self.attrs.get("CPU_NUM", "1"))
         self.version = (int(self.attrs.get("VER_MAJOR", "0")), int(self.attrs.get("VER_MINOR", "0")))
         self.stats = KevStats()
-        self.losses: list[Loss] = []
+        self._losses: list[Loss] = []
         self._events = None
 
     # ---- header -----------------------------------------------------------
@@ -159,6 +159,11 @@ class KevFile:
         for i, (h, d0, d1, d2) in enumerate(_SLOT.iter_unpack(body[:n * 16])):
             yield i, h, d0, d1, d2
 
+    @property
+    def losses(self) -> list[Loss]:
+        self.events()
+        return self._losses
+
     # ---- events -------------------------------------------------------------
     def events(self):
         if self._events is None:
@@ -186,7 +191,7 @@ class KevFile:
             for key in [k for k in pending if k[0] == cpu]:
                 close_partial(key)
             loss = Loss(cpu, t0, t1, kind, count, detail, idx)
-            self.losses.append(loss)
+            self._losses.append(loss)
             return loss
 
         def close_buffer(end_index, t0, t1):
@@ -304,7 +309,7 @@ class KevFile:
 
         if cur is not None:
             close_buffer(st.slots, latest.get(cur[0]), None)
-        if st.trailing_bytes and not any(l.kind == "truncated file" for l in self.losses):
+        if st.trailing_bytes and not any(l.kind == "truncated file" for l in self._losses):
             c = cur[0] if cur else 0
             lose(c, latest.get(c), "truncated file", None, "%d bytes after the last whole slot" % st.trailing_bytes,
                  st.slots, None)

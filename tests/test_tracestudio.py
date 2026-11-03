@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression checks on real QNX 8.0 traces (tests/data/run1, captured with
 workload/run_scenarios.sh). Run with pytest or directly:  python3 tests/test_tracestudio.py
-Optional parts run when available: host traceprinter ($QNX_HOST) and the perfetto package.
+The traceprinter comparison needs the QNX SDP host tools on PATH and the Perfetto checks
+need the perfetto package; both are skipped when absent unless TS_REQUIRE_ALL=1, which
+makes a missing tool a failure (use it for release checks).
 """
 import gzip
 import os
@@ -13,6 +15,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
+sys.path.insert(0, os.path.join(HERE, "..", "tools"))
+from drop_buffer import drop_buffers  # noqa: E402
 from tracestudio.kev import KevFile  # noqa: E402
 from tracestudio.model import Model  # noqa: E402
 from tracestudio.validate import validate  # noqa: E402
@@ -21,6 +25,12 @@ from tracestudio.analyses import deadline_misses, suspected_inversions  # noqa: 
 DATA = os.path.join(HERE, "data", "run1")
 TMP = tempfile.mkdtemp(prefix="ts-test-")
 SCEN = ["ipc_wide", "ipc_fast", "prio_inherit", "prio_fixed"]
+
+
+def skip(why):
+    if os.environ.get("TS_REQUIRE_ALL"):
+        raise AssertionError("required for release checks: " + why)
+    print("skip:", why)
 
 
 def kev(name):
@@ -44,8 +54,7 @@ def test_parser_invariants():
 def test_traceprinter_event_by_event():
     tp = shutil.which("traceprinter")
     if not tp:
-        print("skip: traceprinter not on PATH")
-        return
+        return skip("traceprinter not on PATH (source qnxsdp-env.sh)")
     for s in SCEN:
         txt = os.path.join(TMP, s + ".txt")
         subprocess.run([tp, "-f", kev(s), "-o", txt], check=True)
@@ -86,8 +95,7 @@ def test_perfetto_loads():
         from perfetto.trace_processor import TraceProcessor
         from tracestudio.perfetto_out import write
     except ImportError:
-        print("skip: perfetto package not installed")
-        return
+        return skip("perfetto package not installed")
     for s in ("ipc_wide", "prio_fixed"):
         out = os.path.join(TMP, s + ".perfetto-trace")
         write(Model(KevFile(kev(s))), out)
@@ -101,11 +109,43 @@ def test_perfetto_loads():
         errs = [(r.name, r.value) for r in tp.query(
             "SELECT name, value FROM stats WHERE value > 0 AND severity IN ('error', 'data_loss')")]
         assert not errs, errs
+        bad_flows = list(tp.query(
+            "SELECT COUNT(*) n FROM flow f JOIN slice a ON a.id = f.slice_out JOIN slice b ON b.id = f.slice_in "
+            "WHERE extract_arg(a.arg_set_id, 'debug.txn') IS NOT extract_arg(b.arg_set_id, 'debug.txn')"))[0].n
+        assert bad_flows == 0
+        assert list(tp.query("SELECT COUNT(*) n FROM slice WHERE dur < 0"))[0].n == 0
+        if s == "prio_fixed":
+            m = Model(KevFile(kev(s)))
+            want = sorted(m.kev.cycles_to_ns(t.t_exit) - m.kev.cycles_to_ns(t.t_call) for t in m.txns
+                          if m.threads[t.client].name == "hi" and m.server_name(t) == "ts_psrv")
+            got = sorted(r.dur for r in tp.query(
+                "SELECT s.dur FROM slice s JOIN thread_track tt ON s.track_id = tt.id JOIN thread t USING (utid) "
+                "WHERE t.name = 'hi' AND s.name = 'MsgSend -> ts_psrv'"))
+            assert len(want) == 20 and got == want, (got, want)
+            cp = list(tp.query(
+                "SELECT COUNT(*) n FROM slice s JOIN track tr ON s.track_id = tr.id "
+                "WHERE tr.name = 'hi critical path' AND s.depth = 0 AND s.name LIKE 'txn % -> ts_psrv: %'"))[0].n
+            assert cp == 20, cp
         tp.close()
+
+
+def test_fault_injection_never_links_wrong():
+    k = KevFile(kev("ipc_wide"))
+    data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window
+    k2 = KevFile("dropped.kev", data)
+    assert [(l.kind, l.count) for l in k2.losses] == [("buffers", 1)] * 4
+    res, _, _ = validate(Model(k2), os.path.join(DATA, "ipc_wide.logs"))
+    assert not any(":WRONG" in c for c in res["checks"]), res["checks"]
+    assert res["matched"] < res["requests"] == 200 and not res["ok"]
 
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            fn()
+            print("ok", name)
+    import test_synthetic   # noqa: E402  (runs the unit tests too when started directly)
+    for name, fn in list(vars(test_synthetic).items()):
         if name.startswith("test_"):
             fn()
             print("ok", name)
