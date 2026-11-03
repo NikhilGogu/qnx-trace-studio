@@ -11,10 +11,10 @@ of fast and wide events decode correctly.
 from __future__ import annotations
 
 from .kev import (C_COMM, C_CONTROL, C_INT, C_KERCALL, C_PRTH, C_SYSTEM, C_USER, CLASS_NAMES)
-from .qnx_tables import KERCALLS, STATES
+from .qnx_tables import IO_CONNECT_SUBTYPES, KERCALLS, MSG_TYPES, STATES
 
 KER_EXIT_BIT = 0x80
-KER_INT_BIT = 0x100       # interrupted kernel call (KERCALLINT)
+KER_INT_BIT = 0x100       # interrupted kernel call (KERCALLINT); bit position not yet seen in a capture
 KER_64_BIT = 0x200        # 64-bit argument variant
 STATE_MAX = 63
 
@@ -67,6 +67,8 @@ KER_ARGS = {
     ("SCHED_SET", 0, 1): ("pid:d tid:d", "pid:d tid:d policy:d sched_priority:d sched_curpriority:d"),
     ("THREAD_CTL", 0, 0): ("cmd:d data:x", "cmd:d data:x"),
     ("THREAD_CTL", 0, 1): ("cmd:d data:x", "cmd:d data:q"),
+    ("THREAD_CTL", 1, 0): ("ret_val:d", "ret_val:d"),
+    ("CONNECT_DETACH", 0, 0): ("coid:x", "coid:x"),
 }
 for _n in ("MSG_SENDVNC",):
     for _k in [k for k in KER_ARGS if k[0] == "MSG_SENDV"]:
@@ -122,7 +124,20 @@ def is_thread_state(ev):
 
 
 def state_name(code):
+    if code == -1:
+        return "UNKNOWN"     # trace-studio's own marker: events were lost, state not known
     return STATES.get(code, "STATE%d" % code)
+
+
+def msg_type_name(msg0, to_procnto):
+    """Name of a message from its first 32-bit word: _IO_* types (and the _IO_CONNECT subtype)
+    for any server, system manager types (< 0x100) only for messages to procnto."""
+    t = msg0 & 0xFFFF
+    if t == 0x100:
+        return IO_CONNECT_SUBTYPES.get(msg0 >> 16, "_IO_CONNECT")
+    if 0x100 < t <= 0x1FF or (t < 0x100 and to_procnto):
+        return MSG_TYPES.get(t)
+    return None
 
 
 def kercall(ev):
@@ -149,7 +164,7 @@ def describe(ev):
         return "PROCESS", name, unpack(w, "ppid:d pid:d")
     if c == C_KERCALL:
         name, is_exit, is64, intr = kercall(ev)
-        label = "KER_INT" if intr else ("KER_EXIT" if is_exit else "KER_CALL")
+        label = "INT_CALL" if intr else ("KER_EXIT" if is_exit else "KER_CALL")
         spec = KER_ARGS.get((name, int(is_exit), int(is64))) or KER_ARGS.get((name, int(is_exit), 0))
         args = {}
         if spec:

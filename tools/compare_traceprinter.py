@@ -73,7 +73,7 @@ def main(kev_path, tp_path):
     tp = parse_tp(tp_path)
     def key(r):
         ev = r[3]
-        if r[2].startswith("KER_"):
+        if r[2] in ("KER_CALL", "KER_EXIT", "INT_CALL"):
             ev = ev.rsplit("/", 1)[-1].lstrip("0")
         elif r[2] == "SYSTEM":
             ev = ""
