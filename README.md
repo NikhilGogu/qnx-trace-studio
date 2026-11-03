@@ -87,6 +87,33 @@ Resource-manager traffic (`rm_small`): `cat`'s `MsgSend _IO_READ (candidate) -> 
 ![_IO_READ slices](docs/img/io_read.png)
 ![_IO_READ arguments](docs/img/io_read_details.png)
 
+## Open in Perfetto with one command
+
+```
+tracestudio open prio_fixed.kev                      # converts once, then opens ui.perfetto.dev with the trace loaded
+tracestudio open prio_fixed.kev --no-browser         # on a build box: prints the URL and an ssh port-forward line
+tracestudio open ipc_wide.kev --pin '^front-rx0 ' --pin 'CPU 0'
+```
+
+`open` converts the trace (the `.perfetto-trace` is kept next to the `.kev`, or in the temp directory when that folder is not writable, and reused while it is newer than the trace), serves it on 127.0.0.1 only and opens a small local page in the default browser. The page opens ui.perfetto.dev and hands it the trace with Perfetto's documented postMessage protocol: it sends `PING` until the UI answers `PONG`, then `{perfetto: {buffer, title, fileName}}`. The trace goes from this machine to the browser tab, not to a server. The UI URL carries `startupCommands` with `dev.perfetto.PinTracksByRegex`, so the tracks that matter are pinned at the top: by default the critical-path and QNX state tracks of the clients that missed `--deadline THREAD=US`, else of the two clients with the slowest trustworthy MsgSend to a server other than procnto; `--pin REGEX` (repeatable, matched against track names) replaces them. The command stops once the trace is delivered, or on Ctrl-C. If the browser blocks the Perfetto window, the page shows a button that opens it.
+
+On a remote build box, use `--no-browser` and forward the port (the run checked in headless Chromium, see `docs/DESIGN.md`; user, host and paths shortened):
+
+```
+$ tracestudio open prio_fixed.kev --no-browser
+converted prio_fixed.kev -> prio_fixed.perfetto-trace
+serving prio_fixed.perfetto-trace (2733245 bytes) at http://127.0.0.1:8765/ (this machine only)
+pinning tracks matching ^lo (critical path|QNX state), ^hi (critical path|QNX state) (clients ts_pload/lo, ts_pload/hi)
+open http://127.0.0.1:8765/ in a browser on this machine; from another machine, forward the port first:
+  ssh -N -L 8765:127.0.0.1:8765 <user>@<build box>     then open http://127.0.0.1:8765/ there
+waiting for the browser (Ctrl-C to stop) ...
+trace delivered to the Perfetto UI
+```
+
+What ui.perfetto.dev (v59.1) showed after that session: lo's and hi's QNX state and critical-path tracks pinned above the CPU tracks.
+
+![Pinned tracks after tracestudio open](docs/img/open_pinned.png)
+
 ## Analyze
 
 ```
@@ -176,6 +203,82 @@ Rows are matched by role (client process, thread name and priority, server proce
 
 Other commands: `tracestudio info trace.kev` (header, losses, decoder counters as JSON) and `tracestudio validate trace.kev --logs DIR` (ground-truth check against the logs of the `ipc_*` and `prio_*` workloads). validate exits with status 1 when a logged SEND or DONE record has no partner, a logged request matches no decoded exchange or the same one as another request, any check disagrees or has no decoded value (client and server thread, rcvid, coid, MsgSend outcome, timing against the logs, the request id in wide mode, the parent of a forwarded request), or the pulse counts differ from the log (receives always, values in wide mode).
 
+## Check real-time budgets in CI
+
+```
+tracestudio check prio_fixed.kev --deadline hi=5000 --no-inversions --junit report.xml
+```
+
+`check` evaluates assertions with the analyses behind `analyze`, on trustworthy exchanges only, prints one PASS or FAIL line per assertion with its numbers (and the evidence of a failure), and exits with status 0 when all pass, 1 when any fails and 2 on usage errors. Assertions: `--deadline THREAD=US` (every MsgSend of the client threads with that name ends within US microseconds), `--max-latency CLIENT=US` (the same for client threads whose label contains CLIENT), `--no-inversions` (no suspected priority inversion) and `--max-insufficient N` (at most N requests with insufficient evidence); `--runmask`, `--assume-unpinned` and `--min-us` work as for `analyze`. Nothing passes silently: a trace that lost events fails its `trace integrity` assertion, and a latency assertion whose requests include excluded or unfinished ones fails, unless `--allow-loss` is given (they are still reported); an assertion with no trustworthy request to check always fails. `--junit FILE` also writes a JUnit XML report: a `testsuite` with one `testcase` per assertion, and a `failure` element with the evidence for each one that failed.
+
+A worked CI job, `tools/ci_qemu_check.sh SCENARIO [check options]`, does what a CI runner with the SDP and KVM would do: build the workload with the SDP, boot a fresh QEMU target with mkqnximage, run the scenario under tracelogger, fetch the `.kev` and run `tracestudio check`; it stops the target on exit and exits with check's status. These are the commands it ran on the build box (from its `set -x` trace; `$SSHO` holds the ssh options, `$IP` the target address):
+
+```
+source ~/qnx800/qnxsdp-env.sh
+make -C ~/work/trace-studio/workload                    # qcc -Vgcc_ntox86_64 ... -o build/x86_64/ts_* (6 programs)
+python3 -m venv ~/work/ts-ci/prio_fixed/venv
+~/work/ts-ci/prio_fixed/venv/bin/pip install -q ~/work/trace-studio
+cd ~/work/ts-ci/prio_fixed/target
+mkqnximage --type=qemu --arch=x86_64 --ssh-ident=~/.ssh/id_ed25519.pub --noprompt --run=-h
+IP=$(mkqnximage --getip | tail -1)
+ssh $SSHO root@$IP true                                  # repeated until the target answers
+ssh $SSHO root@$IP mkdir -p /tmp/ts/bin
+scp -q $SSHO ~/work/trace-studio/workload/build/x86_64/ts_* ~/work/trace-studio/workload/run_scenarios.sh root@$IP:/tmp/ts/bin/
+ssh $SSHO root@$IP sh /tmp/ts/bin/run_scenarios.sh /tmp/ts/bin /tmp/ts/out prio_fixed
+scp -q $SSHO root@$IP:/tmp/ts/out/prio_fixed.kev ~/work/ts-ci/prio_fixed/
+~/work/ts-ci/prio_fixed/venv/bin/tracestudio check ~/work/ts-ci/prio_fixed/prio_fixed.kev --junit ~/work/ts-ci/prio_fixed/prio_fixed.junit.xml --deadline hi=5000 --no-inversions
+mkqnximage --stop                                        # on exit
+```
+
+The failing run (fixed-priority channel), output abridged:
+
+```
+$ CI_WORK=~/work/ts-ci/prio_fixed tools/ci_qemu_check.sh prio_fixed --deadline hi=5000 --no-inversions; echo "exit $?"
+...
+hi: 20 of 20 requests missed the 5000 us deadline, slowest 11002 us              (ts_pload's own log, on the target)
+prio_fixed: 860037 bytes, logs: pload-679960.csv psrv_fixed-667671.csv
+PASS trace integrity: no lost events, 679 of 691 message exchanges trustworthy
+FAIL deadline hi=5000 us: 20 of 21 trustworthy requests over 5000 us, max 10985.7 us
+  txn 564: ts_pload/hi -> ts_psrv, 10985.7 us (budget 5000 us)
+  ...
+FAIL no suspected priority inversions: 20 suspected (checked 669 exchanges, 9 excluded as untrustworthy, 10 with an
+  ambiguous parent)
+  txn 474: ts_pload/hi (prio 30) waited 10928.9 us in MsgSend; for 8143.1 us of it (SEND-blocked 8143.1 us)
+  ts_psrv/psrv-rx was READY at prio 10 while every CPU it may run on (CPU 0, run mask 0x1) ran a thread above prio 10, ...
+  ...
+check: 3 assertions, 2 failed
+wrote ~/work/ts-ci/prio_fixed/prio_fixed.junit.xml
+exit 1
+```
+
+The passing run (priority inheritance):
+
+```
+$ CI_WORK=~/work/ts-ci/prio_inherit tools/ci_qemu_check.sh prio_inherit --deadline hi=5000 --no-inversions; echo "exit $?"
+...
+hi: 0 of 20 requests missed the 5000 us deadline, slowest 2859 us
+prio_inherit: 854333 bytes, logs: pload-679960.csv psrv_inherit-667671.csv
+PASS trace integrity: no lost events, 682 of 692 message exchanges trustworthy
+PASS deadline hi=5000 us: 0 of 21 trustworthy requests over 5000 us, max 2843.1 us
+PASS no suspected priority inversions: 0 suspected (checked 672 exchanges, 7 excluded as untrustworthy, 10 with an
+  ambiguous parent)
+check: 3 assertions, 0 failed
+wrote ~/work/ts-ci/prio_inherit/prio_inherit.junit.xml
+exit 0
+```
+
+The JUnit report of the failing run starts like this:
+
+```
+<testsuites name="tracestudio check" tests="3" failures="2" errors="0" time="0.160">
+  <testsuite name="tracestudio check prio_fixed" tests="3" failures="2" errors="0" skipped="0" time="0.160" ...>
+    ...
+    <testcase classname="tracestudio.check.prio_fixed" name="deadline hi=5000 us" time="0">
+      <failure message="20 of 21 trustworthy requests over 5000 us, max 10985.7 us" type="DeadlineMissed">20 of 21 ...
+```
+
+The 21 requests are hi's 20 requests to ts_psrv and one to procnto. The workload's own measurement (11002 us) is about 15 us longer than the traced MsgSend, as noted under Limitations.
+
 ## Support matrix
 
 | | status |
@@ -203,7 +306,7 @@ All numbers come from commands run on the build box (Ubuntu 22.04, QNX SDP 8.0) 
 - Resource managers: summing the bytes of `cat`'s `_IO_READ` replies per candidate path gives 26 paths in `rm_traffic`: 25 equal the file size (`wc -c` on the target) and `librcheck.so.1` has twice its size, because `cat` also read it through the symlink `librcheck.so`; both files in `rm_small` match. In `rm_traffic` 7,293 `_IO_*` names are candidates (servers other than procnto), and 90 messages with an `_IO_*` number on connections with no `_IO_CONNECT` evidence are left unnamed. This checks the path heuristic on these captures only.
 - Fault injection (`tools/drop_buffer.py`): removing 4 of the 15 kernel buffers inside the workload window of `ipc_wide` leaves 108 of 200 requests matched, 62 without a candidate, no wrong link in that test (server, rcvid, coid, request id, parent); 2 outcomes contradict the log, both on exchanges flagged untrustworthy, and the pulse counts differ, so validation fails as it should.
 - Perfetto import: TraceProcessor 0.59.1 loads all 14 converted captures with no error or data-loss stats; every flow joins slices of one transaction; no slice has a negative duration.
-- Tests: `python3 tests/test_tracestudio.py` (or pytest) runs 72 tests: 62 on synthetic slot streams (one checks that gzip-compressed traces read like plain ones), including a counterexample for each finding of the second, third and fourth reviews (among them: deleted middle slots, a partial final slot, losses at trace start, unanchored timestamps, READY inside a loss window, untraced and supplied run masks, inheriting channels, stale channel identities after a loss, other possible receivers, reused thread ids, sporadic scheduling, clipped attribution, untrustworthy children, receive attribution, cross-thread replies, stale replies, ambiguous parents, wakeups across a re-block, pulse queues out of sync, candidate paths and names, untrustworthy exchanges without arrows, failed kernel-call exits, INT_CALL, signed 64-bit and `_msg_info` fields, MsgSendPulsePtr, unpaired and shared log records, wrong coid, outcome and pulse counts, diff rows without samples and changed priority shares, non-finite or negative numbers, unreadable input and short CSV records), and 10 on the captures in `tests/data` (including CLI exit codes). With `TS_REQUIRE_ALL=1` a missing `traceprinter` or perfetto package fails the run; all 72 pass that way on the build box.
+- Tests: `python3 tests/test_tracestudio.py` (or pytest) runs 76 tests: 64 on synthetic slot streams (one checks that gzip-compressed traces read like plain ones), including a counterexample for each finding of the second, third and fourth reviews (among them: deleted middle slots, a partial final slot, losses at trace start, unanchored timestamps, READY inside a loss window, untraced and supplied run masks, inheriting channels, stale channel identities after a loss, other possible receivers, reused thread ids, sporadic scheduling, clipped attribution, untrustworthy children, receive attribution, cross-thread replies, stale replies, ambiguous parents, wakeups across a re-block, pulse queues out of sync, candidate paths and names, untrustworthy exchanges without arrows, failed kernel-call exits, INT_CALL, signed 64-bit and `_msg_info` fields, MsgSendPulsePtr, unpaired and shared log records, wrong coid, outcome and pulse counts, diff rows without samples and changed priority shares, non-finite or negative numbers, unreadable input and short CSV records, `open`'s page and protocol, `check` on lost events and empty assertions), and 12 on the captures in `tests/data` (including CLI exit codes, `check` on `prio_fixed` and `prio_inherit` with their JUnit reports, and `open`'s cache and default pins). With `TS_REQUIRE_ALL=1` a missing `traceprinter` or perfetto package fails the run; all 76 pass that way on the build box.
 - Packaging: a wheel and an sdist built with `python -m build` install in fresh venvs and run on Python 3.10 (build box) and 3.12 (development host). The sdist carries the test files but not `tests/kevgen.py` or the fixtures; run the tests from the repository.
 - Speed on the build box: `ipc_wide` (1.7 MB, 44,807 events) converts in 0.87 s with 103 MB peak memory; `rm_traffic` in 7.5 s with 734 MB; `analyze` takes 0.37 s and 2.8 s.
 
