@@ -43,8 +43,10 @@ SYSTEM_NAMES = {1: "RESERVED", 2: "PATHMGR", 3: "APS_NAME", 4: "APS_BUDGETS", 5:
 
 # Field kinds: x = u32 (hex), d = s32, q = u64 (lo, hi words), e = s64 (lo, hi words),
 # s = NUL-terminated string (rest), _ = skip
-_MSGINFO32 = "nd:_ srcnd:_ pid:d tid:d chid:d scoid:x coid:x msglen:d srcmsglen:d dstmsglen:d priority:d flags:x"
-_MSGINFO64 = "nd:_ srcnd:_ pid:d tid:d chid:d scoid:x coid:x msglen:q srcmsglen:q dstmsglen:q priority:d flags:x"
+# struct _msg_info32/_msg_info64 in <sys/neutrino.h>: scoid and coid _Int32t, lengths _Ssize32t/_Ssize64t,
+# priority and flags _Int16t (one trace word each): all signed (a pulse's info is all ones, -1)
+_MSGINFO32 = "nd:_ srcnd:_ pid:d tid:d chid:d scoid:d coid:d msglen:d srcmsglen:d dstmsglen:d priority:d flags:d"
+_MSGINFO64 = "nd:_ srcnd:_ pid:d tid:d chid:d scoid:d coid:d msglen:e srcmsglen:e dstmsglen:e priority:d flags:d"
 # (name, exit, is64) -> (fast, wide)
 KER_ARGS = {
     ("MSG_SENDV", 0, 0): ("coid:x msg0:x", "coid:x sparts:d rparts:d msg0:x msg1:x msg2:x"),

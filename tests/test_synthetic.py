@@ -1324,6 +1324,9 @@ def layout_trace():
     g.kcall(0, T + 110, K_RECEIVEV, [1, 0xFFFFFFF0, 0xFFFFFFFF], i64)
     g.kcall(0, T + 120, 73, [0xFFFFFFFF, 22], EXIT)                              # TimerInfo failed: EINVAL
     g.kcall(0, T + 130, K_RECEIVEV, [0xFFFFFFFF, 3, 0, 0], EXIT | i64)          # 64-bit exit, failed
+    m1 = 0xFFFFFFFF                                                              # a pulse's _msg_info: all ones
+    g.kcall(0, T + 140, K_RECEIVEV, [0, 0x7101, 0, 0, 0, 0, 100, 1, 1, m1, m1, m1, m1, m1, m1, m1, m1, 10, m1, 0],
+            EXIT | i64)
     return g
 
 
@@ -1343,7 +1346,9 @@ def test_kernel_call_layouts_follow_the_sat_guide():
                       "smsg2": 3}),
         ("KER_CALL", {"chid": 1, "rparts": -16}),
         ("KER_EXIT", {"ret_val": -1, "errno": 22}),
-        ("KER_EXIT", {"ret_val": -1, "errno": 3})]
+        ("KER_EXIT", {"ret_val": -1, "errno": 3}),
+        ("KER_EXIT", {"rcvid": 0, "rmsg0": 0x7101, "rmsg1": 0, "rmsg2": 0, "pid": 100, "tid": 1, "chid": 1, "scoid": -1,
+                      "coid": -1, "msglen": -1, "srcmsglen": -1, "dstmsglen": -1, "priority": 10, "flags": -1})]
     # the same events printed by the SDP's traceprinter (black-box oracle), when it is installed
     import shutil
     import subprocess
