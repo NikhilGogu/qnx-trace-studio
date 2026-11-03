@@ -1495,3 +1495,61 @@ def test_cli_rejects_bad_numbers_and_reports_io_errors():
     j = json.loads(out.getvalue())
     assert j["client_filter"] == "client/c" and [r["client"] for r in j["ipc_latency"]] == ["client/c@10"]
     assert j["inversions"]["checked"] == 1 and list(j["deadlines"]["c"]["by_server"]) == ["server"]
+
+
+# ---- open and check (phase 2a) ------------------------------------------------------------------------
+def test_open_serves_the_page_and_the_trace_without_coop():
+    import threading
+    import urllib.parse
+    import urllib.request
+    from tracestudio.serve import make_server, regex_literal, serve_until_delivered
+    pin = "^" + regex_literal("a.b (x)") + " critical path"
+    srv = make_server(b"\x0a\x02trace", "t.kev", "t.perfetto-trace", [pin], 0)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    done = []
+    th = threading.Thread(target=lambda: done.append(serve_until_delivered(srv, 30)))
+    th.start()
+    with urllib.request.urlopen(base + "/") as r:
+        page = r.read().decode()
+        assert r.headers.get("Cross-Origin-Opener-Policy") is None
+    ui = json.loads(page.split("const UI = ", 1)[1].split(", ORIGIN", 1)[0])
+    assert ui.startswith("https://ui.perfetto.dev/#!/?startupCommands=")
+    cmds = json.loads(urllib.parse.unquote(ui.split("startupCommands=", 1)[1]))
+    assert cmds == [{"id": "dev.perfetto.PinTracksByRegex", "args": [r"^a\.b \(x\) critical path"]}]
+    assert '"PING"' in page and "perfetto: {buffer: trace, title: TITLE, fileName: FILE}" in page
+    with urllib.request.urlopen(base + "/trace") as r:
+        assert r.read() == b"\x0a\x02trace"
+    urllib.request.urlopen(urllib.request.Request(base + "/delivered", data=b"", method="POST")).close()
+    th.join(10)
+    assert done == [True]
+
+
+def test_check_fails_on_lost_events_and_on_nothing_checked():
+    from tracestudio.cli import main
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    exchange(g, 0, T + 1000, C, S, 0x10001)
+    g.state(1, T + 3000, RUNNING, B, 10)
+    g.event(1, T + 3100, C_CONTROL, 8, [5, 0])                   # DROPPED on CPU 1, after the exchange
+    path = os.path.join(TMP, "check_loss.kev")
+    with open(path, "wb") as f:
+        f.write(g.bytes())
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["check", path, "--deadline", "c=10000"]) == 1
+        assert main(["check", path, "--deadline", "c=10000", "--allow-loss"]) == 0
+        assert main(["check", path, "--deadline", "nobody=10000", "--allow-loss"]) == 1
+    text = out.getvalue()
+    assert "FAIL trace integrity: 1 loss records" in text and "CPU 1: dropped" in text
+    assert "PASS trace integrity: 1 loss records, allowed by --allow-loss" in text
+    assert "FAIL deadline nobody=10000 us: no trustworthy request to check" in text
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert main(["check", path]) == 2                         # no assertion given
+        try:
+            main(["check", path, "--max-latency", "client=inf"])
+        except SystemExit as e:
+            assert e.code == 2
+        else:
+            raise AssertionError("accepted inf")

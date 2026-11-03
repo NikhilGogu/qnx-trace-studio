@@ -214,6 +214,55 @@ def test_fault_injection_never_links_wrong():
     assert res["matched"] < res["requests"] == 200 and not res["ok"]
 
 
+
+def test_check_fails_prio_fixed_and_passes_prio_inherit():
+    import contextlib
+    import io
+    import xml.etree.ElementTree as ET
+    from tracestudio.cli import main
+    for name, code in (("prio_fixed", 1), ("prio_inherit", 0)):
+        xml = os.path.join(TMP, name + ".junit.xml")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main(["check", kev(name), "--deadline", "hi=5000", "--no-inversions", "--junit", xml]) == code
+        text = out.getvalue()
+        root = ET.parse(xml).getroot()
+        (suite,) = root.findall("testsuite")
+        cases = suite.findall("testcase")
+        assert root.tag == "testsuites" and suite.get("tests") == "3" and suite.get("errors") == "0"
+        assert [c.get("name") for c in cases] == ["trace integrity", "deadline hi=5000 us",
+                                                  "no suspected priority inversions"]
+        failures = [c.find("failure") for c in cases]
+        if code:
+            assert "FAIL deadline hi=5000 us: 20 of 21 trustworthy requests over 5000 us, max 11429.5 us" in text
+            assert "FAIL no suspected priority inversions: 20 suspected" in text and "txn 520: ts_pload/hi (prio 30)" in text
+            assert suite.get("failures") == "2" and failures[0] is None
+            assert failures[1].get("type") == "DeadlineMissed" and "txn 524: ts_pload/hi -> ts_psrv" in failures[1].text
+            assert failures[2].get("type") == "PriorityInversion" and "ts_pload/hog (prio 20)" in failures[2].text
+        else:
+            assert "check: 3 assertions, 0 failed" in text and "FAIL" not in text
+            assert suite.get("failures") == "0" and failures == [None, None, None]
+
+
+def test_open_converts_once_and_pins_the_slowest_clients():
+    import contextlib
+    import io
+    import shutil
+    from tracestudio.cli import main
+    from tracestudio.serve import default_pins
+    pins, labels = default_pins(Model(KevFile(kev("prio_fixed"))))
+    assert pins == ["^lo (critical path|QNX state)", "^hi (critical path|QNX state)"]
+    assert labels == ["ts_pload/lo", "ts_pload/hi"]
+    path = os.path.join(TMP, "open_me.kev")
+    shutil.copy(kev("prio_fixed"), path)
+    for want in ("converted ", "using "):                # converts once, then reuses the cached file
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            assert main(["open", path, "--no-browser", "--port", "0", "--timeout", "1", "--pin", "^hi "]) == 1
+        assert want in out.getvalue() and "pinning tracks matching ^hi " in out.getvalue()
+    assert os.path.exists(os.path.join(TMP, "open_me.perfetto-trace"))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
