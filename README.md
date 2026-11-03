@@ -2,6 +2,8 @@
 
 trace-studio reads QNX OS 8.0 kernel event traces (`.kev` files written by `tracelogger`) on a development host, converts them to Perfetto traces, and analyses QNX message passing in them. It is for engineers who need to explain a deadline miss in a system built from communicating processes: which server a client waited for, what that server was doing, who held the CPU it needed, and whether the cause was a priority inversion.
 
+New to QNX tracing? The codelab [Find a priority inversion in QNX message passing](https://nikhil-qnx-codelabs.pages.dev/find-priority-inversion/) walks through the whole workflow in about 40 minutes: build a server and three clients, watch the high-priority client miss every deadline, capture a kernel trace, prove the inversion, fix it and prove the fix (source in [codelab/](codelab/find-priority-inversion.md), dry runs in [codelab/DRYRUN.md](codelab/DRYRUN.md)).
+
 What it does:
 
 - Reads `.kev` files directly with its own parser, so no QNX libraries are needed on the host. On the 14 captures listed below every event matches the SDP's `traceprinter` (timestamp, CPU, class, event), and so does every argument value both print, sign included; Validation evidence says which arguments that covers.
