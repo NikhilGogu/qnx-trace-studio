@@ -3,10 +3,13 @@
 """Event naming and argument decoding for QNX 8.0 kernel events.
 
 Payload layouts follow the "Current Trace Events and Data" appendix of the
-System Analysis Toolkit guide. Fast-mode events carry a two-word summary in
+System Analysis Toolkit guide (the "#Args" letters: H hex, D signed decimal,
+E signed 64-bit, X hex 64-bit). Fast-mode events carry a two-word summary in
 one slot; wide-mode events carry the full argument list in a combine event.
 The layout is chosen from the payload length, so traces with a per-class mix
-of fast and wide events decode correctly.
+of fast and wide events decode correctly. A kernel call that fails exits with
+its return code (-1) and errno instead of its data, and an interrupted call
+(INT_CALL) has no arguments; traceprinter prints both that way.
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from .kev import (C_COMM, C_CONTROL, C_INT, C_KERCALL, C_PRTH, C_SYSTEM, C_USER,
 from .qnx_tables import IO_CONNECT_SUBTYPES, KERCALLS, MSG_TYPES, STATES
 
 KER_EXIT_BIT = 0x80
-KER_INT_BIT = 0x100       # interrupted kernel call (KERCALLINT); bit position not yet seen in a capture
+KER_INT_BIT = 0x100       # interrupted kernel call (KERCALLINT): traceprinter labels it INT_CALL; not seen in a capture
 KER_64_BIT = 0x200        # 64-bit argument variant
 STATE_MAX = 63
 
@@ -38,27 +41,30 @@ SYSTEM_NAMES = {1: "RESERVED", 2: "PATHMGR", 3: "APS_NAME", 4: "APS_BUDGETS", 5:
                 26: "APS_THREAD", 27: "APS_PROCESS", 28: "SCHED_CONF", 29: "IST_ATTACH", 30: "IST_DETACH",
                 31: "PCTRACE", 32: "SEND_IPI"}
 
-# Field kinds: x = u32 (hex), d = s32, q = u64 (lo, hi words), s = NUL-terminated string (rest), _ = skip
+# Field kinds: x = u32 (hex), d = s32, q = u64 (lo, hi words), e = s64 (lo, hi words),
+# s = NUL-terminated string (rest), _ = skip
 _MSGINFO32 = "nd:_ srcnd:_ pid:d tid:d chid:d scoid:x coid:x msglen:d srcmsglen:d dstmsglen:d priority:d flags:x"
 _MSGINFO64 = "nd:_ srcnd:_ pid:d tid:d chid:d scoid:x coid:x msglen:q srcmsglen:q dstmsglen:q priority:d flags:x"
 # (name, exit, is64) -> (fast, wide)
 KER_ARGS = {
     ("MSG_SENDV", 0, 0): ("coid:x msg0:x", "coid:x sparts:d rparts:d msg0:x msg1:x msg2:x"),
-    ("MSG_SENDV", 0, 1): ("coid:x msg0:x", "coid:x sparts:q rparts:q msg0:x msg1:x msg2:x"),
+    ("MSG_SENDV", 0, 1): ("coid:x msg0:x", "coid:x sparts:e rparts:e msg0:x msg1:x msg2:x"),
     ("MSG_SENDV", 1, 0): ("status:d rmsg0:x", "status:d rmsg0:x rmsg1:x rmsg2:x"),
-    ("MSG_SENDV", 1, 1): ("status:q", "status:q rmsg0:x rmsg1:x rmsg2:x"),
+    ("MSG_SENDV", 1, 1): ("status:e", "status:e rmsg0:x rmsg1:x rmsg2:x"),
     ("MSG_RECEIVEV", 0, 0): ("chid:x rparts:d", "chid:x rparts:d"),
-    ("MSG_RECEIVEV", 0, 1): ("chid:x rparts:d", "chid:x rparts:q"),
+    ("MSG_RECEIVEV", 0, 1): ("chid:x rparts:d", "chid:x rparts:e"),
     ("MSG_RECEIVEV", 1, 0): ("rcvid:x rmsg0:x", "rcvid:x rmsg0:x rmsg1:x rmsg2:x " + _MSGINFO32),
     ("MSG_RECEIVEV", 1, 1): ("rcvid:x rmsg0:x", "rcvid:x rmsg0:x rmsg1:x rmsg2:x " + _MSGINFO64),
     ("MSG_REPLYV", 0, 0): ("rcvid:x status:x", "rcvid:x sparts:d status:x smsg0:x smsg1:x smsg2:x"),
-    ("MSG_REPLYV", 0, 1): ("rcvid:x status:x", "rcvid:x sparts:q status:q smsg0:x smsg1:x smsg2:x"),
+    ("MSG_REPLYV", 0, 1): ("rcvid:x status:x", "rcvid:x sparts:e status:q smsg0:x smsg1:x smsg2:x"),
     ("MSG_REPLYV", 1, 0): ("ret_val:d", "ret_val:d"),
     ("MSG_ERROR", 0, 0): ("rcvid:x err:d", "rcvid:x err:d"),
     ("MSG_ERROR", 1, 0): ("ret_val:d", "ret_val:d"),
-    ("MSG_SEND_PULSE", 0, 0): ("coid:x code:d", "coid:x priority:d code:d value:x"),
-    ("MSG_SEND_PULSE", 1, 0): ("status:d", "status:d"),
-    ("MSG_SEND_PULSEPTR", 0, 1): ("coid:x code:d", "coid:x priority:d code:d value:q"),
+    ("MSG_SEND_PULSE", 0, 0): ("coid:x code:x", "coid:x priority:d code:x value:x"),
+    ("MSG_SEND_PULSE", 1, 0): ("status:d empty:x", "status:d empty:x"),
+    ("MSG_SEND_PULSEPTR", 0, 0): ("coid:x code:x", "coid:x priority:d code:x value:x"),
+    ("MSG_SEND_PULSEPTR", 0, 1): ("coid:x code:x", "coid:x priority:d code:x value:q"),
+    ("MSG_SEND_PULSEPTR", 1, 0): ("status:d empty:x", "status:d empty:x"),
     ("CHANNEL_CREATE", 0, 0): ("flags:x", "flags:x"),
     ("CHANNEL_CREATE", 1, 0): ("chid:d", "chid:d"),
     ("CONNECT_ATTACH", 0, 0): ("nd:_ pid:d", "nd:_ pid:d chid:d index:x flags:x"),
@@ -103,10 +109,11 @@ def unpack(words, spec_text):
             args[name] = raw.split(b"\0", 1)[0].decode("utf-8", "replace")
             i = n
             break
-        if kind == "q":
+        if kind in ("q", "e"):
             if i + 1 >= n:
                 break
-            args[name] = words[i] | (words[i + 1] << 32)
+            v = words[i] | (words[i + 1] << 32)
+            args[name] = v - (1 << 64) if kind == "e" and v >> 63 else v
             i += 2
             continue
         if i >= n:
@@ -168,10 +175,15 @@ def describe(ev):
     if c == C_KERCALL:
         name, is_exit, is64, intr = kercall(ev)
         label = "INT_CALL" if intr else ("KER_EXIT" if is_exit else "KER_CALL")
-        spec = KER_ARGS.get((name, int(is_exit), int(is64))) or KER_ARGS.get((name, int(is_exit), 0))
         args = {}
-        if spec:
-            args = unpack(w, spec[0] if len(w) <= 2 else spec[1])
+        if intr:
+            pass                       # logged with no parameters
+        elif is_exit and w and w[0] == 0xFFFFFFFF:
+            args = unpack(w, "ret_val:d errno:d")      # failed call: return code and errno, any variant
+        else:
+            spec = KER_ARGS.get((name, int(is_exit), int(is64))) or KER_ARGS.get((name, int(is_exit), 0))
+            if spec:
+                args = unpack(w, spec[0] if len(w) <= 2 else spec[1])
         return label, "%s/%02d" % (name, ev.code & 0x7F), args
     if c == C_COMM:
         name = COMM_NAMES.get(ev.code, "COMM%d" % ev.code)

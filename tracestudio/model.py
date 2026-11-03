@@ -151,6 +151,7 @@ class Txn:
     t_unblock: int | None = None          # client THREADY after the reply
     t_exit: int | None = None
     status: int | None = None
+    errno: int | None = None              # errno of a failed MsgSendv
     error: int | None = None
     outcome: str | None = None            # replied, error, cancelled, interrupted
     parent: int | None = None
@@ -719,7 +720,8 @@ class Model:
             self.counters["send_exit_without_txn"] += 1
             return
         tx.t_exit = ts
-        tx.status = None if intr else a.get("status")
+        tx.status = None if intr else a.get("status", a.get("ret_val"))
+        tx.errno = None if intr else a.get("errno")
         if intr:
             tx.outcome = "interrupted"
             tx.warnings.append("MsgSendv ended with INT_CALL (interrupted)")

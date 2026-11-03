@@ -6,6 +6,9 @@ the Perfetto output in TraceProcessor. Run with pytest or directly:
     python3 tests/test_synthetic.py
 Set TS_REQUIRE_ALL=1 to turn a missing perfetto package into a failure.
 """
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
@@ -1297,3 +1300,79 @@ def test_gzipped_kev_reads_like_the_plain_file():
     zipped = KevFile("zipped.kev.gz", gzip.compress(raw))
     assert zipped.attrs == plain.attrs and zipped.events_offset == plain.events_offset
     assert [e.ts for e in zipped.events()] == [e.ts for e in plain.events()]
+
+
+# ---- fourth review (v0.1.0 CLI, validate, decoding): counterexamples ------------------------------------
+from tracestudio.events import describe  # noqa: E402
+from tracestudio.validate import validate  # noqa: E402
+
+
+def layout_trace():
+    """Kernel-call events whose layouts the SAT guide gives and traceprinter prints (checked on this trace)."""
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    i64 = 0x200
+    g.kcall(0, T + 10, 6, [0x40000001, 10, 0xFFFFFFF0, 0x1234])                  # MsgSendPulsePtr entry
+    g.kcall(0, T + 20, 6, [0x40000001, 10, 5, 0x89ABCDEF, 0x01234567], i64)      # ... 64-bit value
+    g.kcall(0, T + 30, 6, [0, 0], EXIT)
+    g.kcall(0, T + 40, K_SENDV, [0x40000001, 0xFFFFFFF0, 0xFFFFFFFF, 0xFFFFFFE0, 0xFFFFFFFF, 0x7101, 1, 0], i64)
+    g.kcall(0, T + 50, K_SENDV, [0xFFFFFFFF, 4], EXIT)                           # failed: -1, EINTR
+    g.kcall(0, T + 60, K_SENDV, [7, 8], 0x100)                                   # INT_CALL
+    g.kcall(0, T + 70, K_SENDV, [0xFFFFFFFE, 0xFFFFFFFF, 1, 2, 3, 0], EXIT | i64)   # status -2: not a failure
+    g.kcall(0, T + 80, K_REPLYV, [0x10001, 0xFFFFFFF0, 0xFFFFFFFB, 1, 2, 3])
+    g.kcall(0, T + 100, K_REPLYV, [0x10001, 0xFFFFFFF0, 0xFFFFFFFF, 0xFFFFFFFB, 0xFFFFFFFF, 1, 2, 3], i64)
+    g.kcall(0, T + 110, K_RECEIVEV, [1, 0xFFFFFFF0, 0xFFFFFFFF], i64)
+    g.kcall(0, T + 120, 73, [0xFFFFFFFF, 22], EXIT)                              # TimerInfo failed: EINVAL
+    g.kcall(0, T + 130, K_RECEIVEV, [0xFFFFFFFF, 3, 0, 0], EXIT | i64)          # 64-bit exit, failed
+    return g
+
+
+def test_kernel_call_layouts_follow_the_sat_guide():
+    evs = [e for e in kev(layout_trace()).events() if e.cls == C_KERCALL]
+    got = [describe(e)[0::2] for e in evs]
+    assert got == [
+        ("KER_CALL", {"coid": 0x40000001, "priority": 10, "code": 0xFFFFFFF0, "value": 0x1234}),
+        ("KER_CALL", {"coid": 0x40000001, "priority": 10, "code": 5, "value": 0x0123456789ABCDEF}),
+        ("KER_EXIT", {"status": 0, "empty": 0}),
+        ("KER_CALL", {"coid": 0x40000001, "sparts": -16, "rparts": -32, "msg0": 0x7101, "msg1": 1, "msg2": 0}),
+        ("KER_EXIT", {"ret_val": -1, "errno": 4}),
+        ("INT_CALL", {}),
+        ("KER_EXIT", {"status": -2, "rmsg0": 1, "rmsg1": 2, "rmsg2": 3}),
+        ("KER_CALL", {"rcvid": 0x10001, "sparts": -16, "status": 0xFFFFFFFB, "smsg0": 1, "smsg1": 2, "smsg2": 3}),
+        ("KER_CALL", {"rcvid": 0x10001, "sparts": -16, "status": 0xFFFFFFFFFFFFFFFB, "smsg0": 1, "smsg1": 2,
+                      "smsg2": 3}),
+        ("KER_CALL", {"chid": 1, "rparts": -16}),
+        ("KER_EXIT", {"ret_val": -1, "errno": 22}),
+        ("KER_EXIT", {"ret_val": -1, "errno": 3})]
+    # the same events printed by the SDP's traceprinter (black-box oracle), when it is installed
+    import shutil
+    import subprocess
+    tp = shutil.which("traceprinter")
+    if not tp:
+        if os.environ.get("TS_REQUIRE_ALL"):
+            raise AssertionError("traceprinter not found")
+        return
+    sys.path.insert(0, os.path.join(HERE, "..", "tools"))
+    import compare_traceprinter
+    path, txt = os.path.join(TMP, "layouts.kev"), os.path.join(TMP, "layouts.txt")
+    with open(path, "wb") as f:
+        f.write(layout_trace().bytes())
+    subprocess.run([tp, "-f", path, "-o", txt], check=True, stdout=subprocess.DEVNULL)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert compare_traceprinter.main(path, txt) == 0, out.getvalue()
+    assert "mismatches: 0 (sign only: 0)" in out.getvalue()
+
+
+def test_failed_send_keeps_status_and_errno():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.send(0, T + 20, C, S[0], 0x10001)
+    g.state(0, T + 500, RUNNING, C, 10)
+    g.kcall(0, T + 510, K_SENDV, [0xFFFFFFFF, 260], EXIT)                       # ETIMEDOUT
+    _, m = model(g)
+    (tx,) = m.txns
+    assert (tx.outcome, tx.status, tx.errno) == ("cancelled", -1, 260)

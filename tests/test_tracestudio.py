@@ -159,6 +159,7 @@ def test_cancellation_matches_the_workload_log():
                  and s["cycles"] <= t.t_call <= r["cycles"]]
         if r["b"] == -1:      # ETIMEDOUT (tmo) or EINTR (sig): MsgSendv exits with -1, no INT_CALL is traced
             assert r["c"] in (4, 260) and tx.outcome == "cancelled" and tx.status == -1 and not tx.trustworthy
+            assert tx.errno == r["c"]                  # EINTR or ETIMEDOUT, from the failed exit's errno word
         else:
             assert tx.outcome == "replied" and tx.trustworthy, tx
         seen += 1

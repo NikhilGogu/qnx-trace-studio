@@ -7,9 +7,13 @@
     python3 tools/compare_traceprinter.py trace.kev trace.txt
 
 Compares timestamp (64-bit cycles), CPU, class and event label of every event,
-the per-CPU event order, and every decoded argument that both sides print.
+the per-CPU event order, and every decoded argument that both sides print, as
+exact values (a value that agrees only modulo 2^32 or 2^64 is a sign mismatch).
+It also counts what is not compared: arguments traceprinter prints that
+trace-studio does not decode, and the reverse. The last line is a JSON summary.
 """
 import collections
+import json
 import os
 import re
 import sys
@@ -20,7 +24,7 @@ from tracestudio.events import describe  # noqa: E402
 
 LINE = re.compile(r"^t:0x([0-9a-f]+) CPU:(\d+) (\S+?)\s*:(\S*)\s*(.*)$")
 ARG = re.compile(r"([A-Za-z_][\w\[\]\->().]*?):(\"[^\"]*\" \([^)]*\)|\S+)")
-KEYMAP = {"msg[0]": "msg", "rmsg[0]": "rmsg", "smsg[0]": "smsg", "lsb(offset)": "lsb"}
+KEYMAP = {"msg[0]": "msg", "rmsg[0]": "rmsg", "smsg[0]": "smsg", "lsb(offset)": "lsb", "data_p": "data"}
 
 
 def num(v):
@@ -31,13 +35,11 @@ def num(v):
     return -x if m.group(1) else x
 
 
-def same(a, b):
-    """Equal, or equal as 32/64-bit two's complement (traceprinter prints some fields signed)."""
-    if a == b:
-        return True
-    if isinstance(a, int) and isinstance(b, int):
-        return (a - b) % (1 << 32) == 0 if max(abs(a), abs(b)) < (1 << 32) else (a - b) % (1 << 64) == 0
-    return False
+def sign_only(a, b):
+    """Different values that agree as 32- or 64-bit two's complement: a signedness disagreement."""
+    if a == b or not (isinstance(a, int) and isinstance(b, int)):
+        return False
+    return (a - b) % (1 << 32) == 0 if max(abs(a), abs(b)) < (1 << 32) else (a - b) % (1 << 64) == 0
 
 
 def parse_tp(path):
@@ -99,8 +101,9 @@ def main(kev_path, tp_path):
     by_key = collections.defaultdict(list)
     for r in tp:
         by_key[key(r)].append(r[4])
-    checked = bad = 0
+    checked = bad = signs = 0
     per_field = collections.Counter()
+    tp_only, mine_only, no_args = collections.Counter(), collections.Counter(), collections.Counter()
     labels = set()
     examples = []
     for r in mine:
@@ -108,28 +111,42 @@ def main(kev_path, tp_path):
         if not lst:
             continue
         targs = lst.pop(0)
+        ev = "%s %s" % (r[2], r[3].split("/")[0])
+        if targs and not r[4]:
+            no_args[ev] += 1
+        for k in targs:
+            if k not in r[4] and not any(k.startswith(m) and k[len(m):].isdigit() for m in r[4]):
+                tp_only["%s %s" % (ev, k)] += 1
         for k, v in r[4].items():
             if k not in targs or isinstance(v, str) and k != "name":
+                if k not in targs and not isinstance(v, str):
+                    mine_only["%s %s" % (ev, k)] += 1
                 continue
             tv = targs[k]
-            ok = same(tv, v)
+            ok = tv == v
             if k == "name":
                 ok = str(tv) == v.split()[0] if v else True
             checked += 1
-            per_field[(r[2], r[3].split("/")[0], k)] += 1
+            per_field["%s %s" % (ev, k)] += 1
             labels.add(r[3])
             if not ok:
                 bad += 1
+                signs += sign_only(tv, v)
                 if len(examples) < 8:
                     examples.append((hex(r[0]), r[2], r[3], k, v, tv))
-    print(f"argument values compared: {checked}, mismatches: {bad}, distinct (class, event, field): {len(per_field)}, "
-          f"event types with args: {len(labels)}")
+    print(f"argument values compared: {checked}, mismatches: {bad} (sign only: {signs}), distinct (class, event, "
+          f"field): {len(per_field)}, event types with args: {len(labels)}")
     for ex in examples:
         print("  mismatch", ex)
+    print(f"not compared: {sum(tp_only.values())} values traceprinter prints and trace-studio does not decode "
+          f"({len(tp_only)} kinds), {sum(no_args.values())} events of {len(no_args)} kinds without any decoded "
+          f"argument, {sum(mine_only.values())} decoded values traceprinter does not print")
     st = kf.stats
     print(f"combine events: {st.combine_events}, partial: {st.partial_combines}, orphan slots: {st.orphan_slots}, "
           f"rollovers: {st.rollovers}, ts adjusted: {st.ts_adjusted}, per-CPU regressions: {st.per_cpu_regressions}, "
           f"buffers: {st.buffers}, lost: {st.lost_buffers}, dropped events: {st.dropped_events}")
+    print("json:", json.dumps({"compared": per_field, "tp_only": tp_only, "mine_only": mine_only, "no_args": no_args,
+                               "mismatches": bad, "sign_only": signs}))
     return 0 if not only_mine and not only_tp and not bad else 1
 
 
