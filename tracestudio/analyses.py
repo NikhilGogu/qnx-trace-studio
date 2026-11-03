@@ -310,12 +310,13 @@ def ipc_latency(model):
     return out
 
 
-def deadline_misses(model, thread_name, deadline_us):
-    """{server process: {requests, missed, max_us, excluded, unfinished}} for client threads with this name."""
+def deadline_misses(model, thread_name, deadline_us, only=None):
+    """{server process: {requests, missed, max_us, excluded, unfinished}} for client threads with this name
+    (and, with `only`, for which only(client key) holds)."""
     out = {}
     for t in model.txns:
         th = model.threads.get(t.client)
-        if not th or th.name != thread_name:
+        if not th or th.name != thread_name or only is not None and not only(t.client):
             continue
         r = out.setdefault(model.server_name(t), {"requests": 0, "missed": 0, "max_us": 0.0, "excluded": 0,
                                                  "unfinished": 0})
@@ -464,7 +465,7 @@ def _inversion(tl, tx):
                                          "assumed": sorted(assumed)}
 
 
-def suspected_inversions(model, tl=None, min_us=100.0):
+def suspected_inversions(model, tl=None, min_us=100.0, only=None):
     """{"suspected": [...], "insufficient_evidence": [...], "checked": n, "excluded_untrustworthy": n}"""
     tl = tl or Timeline(model)
     m = model
@@ -472,6 +473,8 @@ def suspected_inversions(model, tl=None, min_us=100.0):
     checked = excluded = ambiguous = 0
     for tx in m.txns:
         if tx.server is None or tx.t_call is None or tx.t_exit is None:
+            continue
+        if only is not None and not only(tx.client):
             continue
         if not tx.trustworthy:
             excluded += 1

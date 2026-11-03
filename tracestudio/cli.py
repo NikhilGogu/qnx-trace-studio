@@ -14,7 +14,9 @@ or when a trace has no events, 2 on usage errors.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import sys
 import time
 
@@ -29,14 +31,33 @@ def _load(path):
     return kev, model, time.time() - t0
 
 
-def _deadlines(specs):
-    out = []
-    for spec in specs or []:
-        name, sep, val = spec.rpartition("=")
-        if not sep or not name:
-            raise SystemExit("--deadline wants THREAD=MICROSECONDS, got %r" % spec)
-        out.append((name, float(val)))
-    return out
+def _us(text):
+    """A finite, nonnegative number of microseconds."""
+    try:
+        v = float(text)
+    except ValueError:
+        v = None
+    if v is None or not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError("want a finite number of microseconds >= 0, got %r" % text)
+    return v
+
+
+def _count(text):
+    try:
+        n = int(text)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError("want a whole number >= 0, got %r" % text)
+    return n
+
+
+def _deadline_spec(spec):
+    """THREAD=US -> (thread name, microseconds)."""
+    name, sep, val = spec.rpartition("=")
+    if not sep or not name:
+        raise argparse.ArgumentTypeError("want THREAD=MICROSECONDS, got %r" % spec)
+    return name, _us(val)
 
 
 def _runmask_spec(spec):
@@ -101,21 +122,26 @@ def cmd_convert(a):
 
 
 def _analysis(model, a, tl):
+    """Everything analyze and diff report, for text and JSON alike; --client filters every per-client part."""
     from .analyses import deadline_misses, ipc_latency, server_priority_while_handling, suspected_inversions, us
-    out = {"trace": a.trace, "transactions": len(model.txns), "trustworthy": model.counters["txns_trustworthy"],
+    only = (lambda key: a.client in model.label(key)) if a.client else None
+    out = {"trace": a.trace, "client_filter": a.client, "transactions": len(model.txns),
+           "trustworthy": model.counters["txns_trustworthy"],
            "ambiguous_parent": sum(1 for t in model.txns if t.trustworthy and t.parent_candidates),
-           "losses": _loss_summary(model.kev), "ipc_latency": ipc_latency(model)}
-    out["inversions"] = suspected_inversions(model, tl=tl, min_us=a.min_us)
+           "losses": _loss_summary(model.kev),
+           "ipc_latency": [r for r in ipc_latency(model) if a.client is None or a.client in r["client"]]}
+    out["inversions"] = suspected_inversions(model, tl=tl, min_us=a.min_us, only=only)
     out["fixed_priority_channels"] = [{"process": model.processes[k[0]].name if k[0] in model.processes else k[0],
                                        "pid": k[0], "chid": k[1], "flags": "0x%x" % v["flags"]}
                                       for k, v in sorted(model.fixed_priority_channels().items())]
     out["deadlines"] = {}
-    for name, dl in _deadlines(a.deadline):
-        out["deadlines"][name] = {"deadline_us": dl, "by_server": deadline_misses(model, name, dl)}
+    for name, dl in a.deadline or []:
+        out["deadlines"][name] = {"deadline_us": dl, "by_server": deadline_misses(model, name, dl, only)}
     sp = server_priority_while_handling(model, tl)
     out["server_priority_while_handling"] = [
-        {"server": s, "client": c, "prio_us": {str(p): round(v, 1) for p, v in sorted(d.items())}}
-        for (s, c), d in sorted(sp.items())]
+        {"server": s, "client": c, "prio_us": {str(p): round(v, 1) for p, v in sorted(d.items())},
+         "prio_share": {str(p): v / sum(d.values()) for p, v in sorted(d.items())} if sum(d.values()) > 0 else {}}
+        for (s, c), d in sorted(sp.items()) if a.client is None or a.client in c]
     return out
 
 
@@ -157,10 +183,7 @@ def cmd_analyze(a):
           % out["ambiguous_parent"])
     for l in out["losses"]:
         p("  lost events on CPU %d: %s %s" % (l["cpu"], l["kind"], l["detail"]))
-    rows = out["ipc_latency"]
-    if a.client:
-        rows = [r for r in rows if a.client in r["client"]]
-    rows = sorted((r for r in rows if r["n"]), key=lambda r: -r["max_us"])[:a.top]
+    rows = sorted((r for r in out["ipc_latency"] if r["n"]), key=lambda r: -r["max_us"])[:a.top]
     p("\nMsgSend latency of trustworthy requests, %d slowest client@priority -> server pairs (us):" % len(rows))
     p("  %-34s %-22s %5s %9s %9s %9s %9s  %s" % ("client", "server", "n", "p50", "p90", "p99", "max",
                                                "excluded/unfinished"))
@@ -213,11 +236,16 @@ def cmd_diff(a):
         a.trace = path
         sides.append(_analysis(model, a, _timeline(model, a)))
     A, B = sides
+    cmp = _compare(A, B)
     if a.json:
-        print(json.dumps({"before": A, "after": B}, indent=1, default=str))
+        print(json.dumps({"before": A, "after": B, "comparison": cmp}, indent=1, default=str))
         return 0
     p = print
     p("before: %s\nafter:  %s" % (a.before, a.after))
+    if a.client:
+        p("client filter: %r (applies to every row below)" % a.client)
+    p("message exchanges: before %d (%d trustworthy, %d loss records) | after %d (%d trustworthy, %d loss records)" % (
+        A["transactions"], A["trustworthy"], len(A["losses"]), B["transactions"], B["trustworthy"], len(B["losses"])))
     for name, d in A["deadlines"].items():
         for srv in sorted(set(d["by_server"]) | set(B["deadlines"][name]["by_server"])):
             ra, rb = d["by_server"].get(srv), B["deadlines"][name]["by_server"].get(srv)
@@ -226,41 +254,75 @@ def cmd_diff(a):
                 ", %d excluded, %d unfinished" % (r["excluded"], r["unfinished"])
                 if r["excluded"] or r["unfinished"] else "") if r else "-"
             p("deadline %s=%g us on %s: before %s | after %s" % (name, d["deadline_us"], srv, fmt(ra), fmt(rb)))
-    p("suspected priority inversions: before %d | after %d (insufficient evidence: %d | %d; relying on supplied "
-      "run masks: %d | %d)" % (
-        len(A["inversions"]["suspected"]), len(B["inversions"]["suspected"]),
-        len(A["inversions"]["insufficient_evidence"]), len(B["inversions"]["insufficient_evidence"]),
-        A["inversions"]["suspected_using_assumptions"], B["inversions"]["suspected_using_assumptions"]))
+    ia, ib = A["inversions"], B["inversions"]
+    p("suspected priority inversions: before %d | after %d (checked %d | %d exchanges; insufficient evidence: %d | %d; "
+      "relying on supplied run masks: %d | %d)" % (
+        len(ia["suspected"]), len(ib["suspected"]), ia["checked"], ib["checked"], len(ia["insufficient_evidence"]),
+        len(ib["insufficient_evidence"]), ia["suspected_using_assumptions"], ib["suspected_using_assumptions"]))
     fc = lambda S: ", ".join("%s chid %d" % (c["process"], c["chid"]) for c in S["fixed_priority_channels"]) or "none"
     p("fixed-priority channels: before %s | after %s" % (fc(A), fc(B)))
-    # rows are matched by role: client process, thread name and priority, and server process
-    la = {(r["client"], r["server"]): r for r in A["ipc_latency"] if r["n"]}
-    lb = {(r["client"], r["server"]): r for r in B["ipc_latency"] if r["n"]}
-    keys = [k for k in set(la) | set(lb) if a.client is None or a.client in k[0]]
-    keys.sort(key=lambda k: -abs((la.get(k) or {"p99_us": 0})["p99_us"] - (lb.get(k) or {"p99_us": 0})["p99_us"]))
-    p("\nMsgSend latency (us), %d pairs with the largest p99 change:" % min(len(keys), a.top))
-    p("  %-30s %-16s %-6s %5s %9s %9s %9s %9s  %s" % ("client@priority", "server", "", "n", "p50", "p90", "p99",
-                                                    "max", "excluded/unfinished"))
-    for k in keys[:a.top]:
-        for tag, r in (("before", la.get(k)), ("after", lb.get(k))):
-            if r:
-                p("  %-30s %-16s %-6s %5d %9.1f %9.1f %9.1f %9.1f  %d/%d" % (
-                    k[0][:30], k[1][:16], tag, r["n"], r["p50_us"], r["p90_us"], r["p99_us"], r["max_us"],
-                    r["excluded"], r["unfinished"]))
-            else:
-                p("  %-30s %-16s %-6s %5s" % (k[0][:30], k[1][:16], tag, "-"))
-    sa = {(r["server"], r["client"]): r["prio_us"] for r in A["server_priority_while_handling"]}
-    sb = {(r["server"], r["client"]): r["prio_us"] for r in B["server_priority_while_handling"]}
-    keys = sorted((k for k in set(sa) | set(sb) if (a.client is None or a.client in k[1])
-                   and set(sa.get(k, {})) != set(sb.get(k, {}))),
-                  key=lambda k: -(sum(sa.get(k, {}).values()) + sum(sb.get(k, {}).values())))
-    if keys:
-        p("\nserver priority while handling each client's request (share of the server's running time):")
-        share = lambda d: ", ".join("prio %s %.0f%%" % (pr, 100 * v / sum(d.values()))
-                                    for pr, v in sorted(d.items(), key=lambda kv: int(kv[0]))) if d else "-"
+    la = {(r["client"], r["server"]): r for r in A["ipc_latency"]}
+    lb = {(r["client"], r["server"]): r for r in B["ipc_latency"]}
+    lat = cmp["latency"]
+    p("\nMsgSend latency (us) by client@priority -> server: %d pairs compared (trustworthy requests on both sides), "
+      "%d without trustworthy requests on a side, %d only before, %d only after" % (
+          len(lat["compared"]), len(lat["no_samples_on_a_side"]), len(lat["only_before"]), len(lat["only_after"])))
+    head = "  %-30s %-16s %-6s %5s %9s %9s %9s %9s  %s" % ("client@priority", "server", "", "n", "p50", "p90", "p99",
+                                                          "max", "excluded/unfinished")
+
+    def row(k, tag, r):
+        if r is None:
+            p("  %-30s %-16s %-6s %5s" % (k[0][:30], k[1][:16], tag, "-"))
+        elif r["n"]:
+            p("  %-30s %-16s %-6s %5d %9.1f %9.1f %9.1f %9.1f  %d/%d" % (
+                k[0][:30], k[1][:16], tag, r["n"], r["p50_us"], r["p90_us"], r["p99_us"], r["max_us"],
+                r["excluded"], r["unfinished"]))
+        else:
+            p("  %-30s %-16s %-6s %5d %39s  %d/%d" % (k[0][:30], k[1][:16], tag, 0, "", r["excluded"], r["unfinished"]))
+    for title, keys in (("largest p99 change", lat["compared"]), ("without trustworthy requests on a side",
+                        lat["no_samples_on_a_side"]), ("only before (removed)", lat["only_before"]),
+                        ("only after (added)", lat["only_after"])):
+        if not keys:
+            continue
+        p("%s%s:" % (title, ", first %d" % a.top if len(keys) > a.top else ""))
+        p(head)
         for k in keys[:a.top]:
-            p("  %s for %s: before %s | after %s" % (k[0], k[1], share(sa.get(k)), share(sb.get(k))))
+            row(k, "before", la.get(tuple(k)))
+            row(k, "after", lb.get(tuple(k)))
+    pr = cmp["server_priority"]
+    if pr:
+        p("\nserver priority while handling each client's request (share of the server's running time, changes of "
+          "1 point or more):")
+        share = lambda d: ", ".join("prio %s %.0f%%" % (k, 100 * v) for k, v in sorted(d.items(), key=lambda kv: int(kv[0]))
+                                    ) if d else "-"
+        for x in pr[:a.top]:
+            p("  %s for %s: before %s | after %s" % (x["server"], x["client"], share(x["before"]), share(x["after"])))
     return 0
+
+
+def _compare(A, B):
+    """Latency rows by role (compared, no samples on a side, only before, only after) and server priority shares
+    that changed, from both sides' analyses."""
+    la = {(r["client"], r["server"]): r for r in A["ipc_latency"]}
+    lb = {(r["client"], r["server"]): r for r in B["ipc_latency"]}
+    both = set(la) & set(lb)
+    compared = sorted((k for k in both if la[k]["n"] and lb[k]["n"]),
+                      key=lambda k: (-abs(la[k]["p99_us"] - lb[k]["p99_us"]), k))
+    sa = {(r["server"], r["client"]): r for r in A["server_priority_while_handling"]}
+    sb = {(r["server"], r["client"]): r for r in B["server_priority_while_handling"]}
+    pr = []
+    for k in set(sa) | set(sb):
+        da, db = (sa[k]["prio_share"] if k in sa else {}), (sb[k]["prio_share"] if k in sb else {})
+        delta = max(abs(da.get(q, 0.0) - db.get(q, 0.0)) for q in set(da) | set(db)) if da or db else 0.0
+        if set(da) != set(db) or delta >= 0.01:
+            total = sum((sa[k]["prio_us"] if k in sa else {}).values()) + sum((sb[k]["prio_us"] if k in sb else {}).values())
+            pr.append({"server": k[0], "client": k[1], "before": da, "after": db, "max_share_change": delta,
+                       "running_us": total})
+    pr.sort(key=lambda x: (-x["running_us"], x["server"], x["client"]))
+    return {"latency": {"compared": compared,
+                        "no_samples_on_a_side": sorted(k for k in both if not (la[k]["n"] and lb[k]["n"])),
+                        "only_before": sorted(set(la) - set(lb)), "only_after": sorted(set(lb) - set(la))},
+            "server_priority": pr}
 
 
 def cmd_validate(a):
@@ -268,7 +330,7 @@ def cmd_validate(a):
     kev, model, _ = _load(a.trace)
     try:
         res, _, _ = validate(model, a.logs)
-    except (OSError, KeyError, ValueError) as e:
+    except (OSError, KeyError, ValueError, csv.Error) as e:
         print("error: cannot read workload logs in %s: %s" % (a.logs, e), file=sys.stderr)
         return 1
     res["match_rate"] = round(res["matched"] / res["requests"], 4) if res["requests"] else None
@@ -294,24 +356,24 @@ def main(argv=None):
                            else "compare two traces (before and after a change)")
         if name == "analyze":
             s.add_argument("trace")
-            s.add_argument("--request", type=int, action="append", metavar="TXN",
+            s.add_argument("--request", type=_count, action="append", metavar="TXN",
                            help="critical path of this transaction (the 'txn' argument in Perfetto); repeatable")
-            s.add_argument("--slowest", type=int, default=0, metavar="N",
+            s.add_argument("--slowest", type=_count, default=0, metavar="N",
                            help="critical paths of the N slowest top-level requests")
         else:
             s.add_argument("before")
             s.add_argument("after")
-        s.add_argument("--deadline", action="append", metavar="THREAD=US",
+        s.add_argument("--deadline", action="append", metavar="THREAD=US", type=_deadline_spec,
                        help="count requests of client threads with this name slower than US microseconds")
         s.add_argument("--client", help="only client threads whose label contains this text")
-        s.add_argument("--min-us", type=float, default=100.0, help="inversion evidence threshold (default 100)")
+        s.add_argument("--min-us", type=_us, default=100.0, help="inversion evidence threshold (default 100)")
         s.add_argument("--runmask", action="append", metavar="PROCESS[/THREAD]=MASK", type=_runmask_spec,
                        help="run mask (hex) set before the trace started, from the program's code or configuration "
                             "(the trace records only masks set while tracing); used until the trace shows a mask "
                             "event for the thread or loses events, and named in every verdict that uses it")
         s.add_argument("--assume-unpinned", action="append", metavar="PROCESS",
                        help="treat this process's threads as allowed on every CPU (your statement, not the trace's)")
-        s.add_argument("--top", type=int, default=15, help="rows to print (default 15)")
+        s.add_argument("--top", type=_count, default=15, help="rows to print (default 15)")
         s.add_argument("--json", action="store_true")
         s.set_defaults(fn=fn)
     s = sub.add_parser("validate", help="check decoded exchanges against workload ground-truth logs")
@@ -324,7 +386,7 @@ def main(argv=None):
     except KevError as e:
         print("error: %s: %s" % (getattr(a, "trace", ""), e), file=sys.stderr)
         return 1
-    except FileNotFoundError as e:
+    except (OSError, EOFError) as e:      # unreadable input, unwritable output, truncated gzip
         print("error: %s" % e, file=sys.stderr)
         return 1
 

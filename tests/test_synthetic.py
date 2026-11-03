@@ -1438,3 +1438,55 @@ def test_validation_fails_on_unpaired_shared_wrong_coid_outcome_and_pulses():
             f.write(g.bytes())
         assert main(["validate", path, "--logs", d]) == 1
     assert "lacks" in err.getvalue() and "Traceback" not in err.getvalue()
+
+
+def test_diff_keeps_rows_without_samples_and_compares_shares():
+    from tracestudio.cli import _compare
+    row = lambda c, n, p99=0.0: {"client": c, "server": "srv", "n": n, "excluded": 0 if n else 3, "unfinished": 0,
+                                 "p99_us": p99}
+    sp = lambda c, d: {"server": "srv/t", "client": c, "prio_us": d,
+                       "prio_share": {k: v / sum(d.values()) for k, v in d.items()} if sum(d.values()) else {}}
+    A = {"ipc_latency": [row("a@10", 5, 900.0), row("gone@10", 2, 50.0), row("b@10", 4, 100.0)],
+         "server_priority_while_handling": [sp("x", {"10": 90.0, "30": 10.0}), sp("z", {"10": 0.0})]}
+    B = {"ipc_latency": [row("a@10", 0), row("new@10", 3, 70.0), row("b@10", 4, 120.0)],
+         "server_priority_while_handling": [sp("x", {"10": 10.0, "30": 90.0}), sp("z", {"10": 0.0})]}
+    c = _compare(A, B)
+    lat = c["latency"]
+    assert lat["compared"] == [("b@10", "srv")]                  # only pairs with trustworthy requests on both sides
+    assert lat["no_samples_on_a_side"] == [("a@10", "srv")]       # all excluded after: not an improvement
+    assert (lat["only_before"], lat["only_after"]) == ([("gone@10", "srv")], [("new@10", "srv")])
+    (x,) = c["server_priority"]                                  # 90/10 -> 10/90 with the same priorities
+    assert x["client"] == "x" and abs(x["max_share_change"] - 0.8) < 1e-9
+
+
+def test_cli_rejects_bad_numbers_and_reports_io_errors():
+    from tracestudio.cli import main
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    exchange(g, 0, T + 1000, C, S, 0x10001)
+    exchange(g, 0, T + 3000, B, S, 0x20002)
+    path = os.path.join(TMP, "cli_scene.kev")
+    with open(path, "wb") as f:
+        f.write(g.bytes())
+    for bad in (["--deadline", "c=nan"], ["--deadline", "c=-5"], ["--deadline", "c=abc"], ["--deadline", "5"],
+                ["--top", "-1"], ["--slowest", "x"], ["--min-us", "inf"], ["--request", "-2"]):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(["analyze", path] + bad)
+            except SystemExit as e:
+                assert e.code == 2, bad
+            else:
+                raise AssertionError("accepted %r" % bad)
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        assert main(["analyze", TMP]) == 1                         # a directory
+        assert main(["convert", path, "-o", os.path.join(TMP, "no", "such", "dir.pftrace")]) == 1
+    assert "Traceback" not in err.getvalue()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["analyze", path, "--json", "--client", "client/c", "--deadline", "c=1"]) == 0
+    j = json.loads(out.getvalue())
+    assert j["client_filter"] == "client/c" and [r["client"] for r in j["ipc_latency"]] == ["client/c@10"]
+    assert j["inversions"]["checked"] == 1 and list(j["deadlines"]["c"]["by_server"]) == ["server"]
