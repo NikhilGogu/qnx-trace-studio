@@ -39,6 +39,24 @@ def _deadlines(specs):
     return out
 
 
+def _runmask_spec(spec):
+    """PROCESS[/THREAD]=MASK (hex) -> (process, thread or None, mask)."""
+    name, sep, val = spec.rpartition("=")
+    proc, _, thr = name.partition("/")
+    try:
+        mask = int(val, 16)
+    except ValueError:
+        mask = None
+    if not sep or not proc or mask is None or mask <= 0:
+        raise argparse.ArgumentTypeError("want PROCESS[/THREAD]=MASK with a hex mask, got %r" % spec)
+    return proc, thr or None, mask
+
+
+def _timeline(model, a):
+    from .analyses import Timeline
+    return Timeline(model, getattr(a, "runmask", None) or [], getattr(a, "assume_unpinned", None) or [])
+
+
 def _loss_summary(kev):
     return [{"cpu": l.cpu, "kind": l.kind, "count": l.count, "detail": l.detail} for l in kev.losses]
 
@@ -85,6 +103,7 @@ def cmd_convert(a):
 def _analysis(model, a, tl):
     from .analyses import deadline_misses, ipc_latency, server_priority_while_handling, suspected_inversions, us
     out = {"trace": a.trace, "transactions": len(model.txns), "trustworthy": model.counters["txns_trustworthy"],
+           "ambiguous_parent": sum(1 for t in model.txns if t.trustworthy and t.parent_candidates),
            "losses": _loss_summary(model.kev), "ipc_latency": ipc_latency(model)}
     out["inversions"] = suspected_inversions(model, tl=tl, min_us=a.min_us)
     out["fixed_priority_channels"] = [{"process": model.processes[k[0]].name if k[0] in model.processes else k[0],
@@ -107,7 +126,7 @@ def cmd_analyze(a):
     if not kev.events():
         print("error: %s has no events" % a.trace, file=sys.stderr)
         return 1
-    tl = Timeline(model)
+    tl = _timeline(model, a)
     out = _analysis(model, a, tl)
     picks = []
     for i in a.request or []:
@@ -116,7 +135,7 @@ def cmd_analyze(a):
             return 2
         picks.append(model.txns[i])
     if a.slowest:
-        top = sorted((t for t in model.txns if t.trustworthy and t.parent is None),
+        top = sorted((t for t in model.txns if t.causal and t.parent is None),
                      key=lambda t: t.t_exit - t.t_call, reverse=True)
         picks += [t for t in top if a.client is None or a.client in model.label(t.client)][:a.slowest]
     cps = []
@@ -133,6 +152,9 @@ def cmd_analyze(a):
     p = print
     p("trace %s: %d message exchanges, %d trustworthy (analyses use only those)" % (
         a.trace, out["transactions"], out["trustworthy"]))
+    if out["ambiguous_parent"]:
+        p("  %d of them have an ambiguous parent: kept in latency, left out of critical paths and inversions"
+          % out["ambiguous_parent"])
     for l in out["losses"]:
         p("  lost events on CPU %d: %s %s" % (l["cpu"], l["kind"], l["detail"]))
     rows = out["ipc_latency"]
@@ -153,8 +175,11 @@ def cmd_analyze(a):
                 " (%d excluded as untrustworthy)" % r["excluded"] if r["excluded"] else "",
                 " (%d unfinished)" % r["unfinished"] if r["unfinished"] else ""))
     inv = out["inversions"]
-    p("\nsuspected priority inversions: %d (checked %d exchanges, %d excluded as untrustworthy, threshold %g us)" % (
-        len(inv["suspected"]), inv["checked"], inv["excluded_untrustworthy"], inv["min_us"]))
+    p("\nsuspected priority inversions: %d (checked %d exchanges, %d excluded as untrustworthy, %d with an ambiguous "
+      "parent, threshold %g us)" % (len(inv["suspected"]), inv["checked"], inv["excluded_untrustworthy"],
+                                    inv["excluded_ambiguous_parent"], inv["min_us"]))
+    if inv["suspected_using_assumptions"]:
+        p("  %d of them rely on --runmask or --assume-unpinned" % inv["suspected_using_assumptions"])
     for r in inv["suspected"][:a.top]:
         p("  txn %d: %s" % (r["txn"], r["evidence"]))
     if len(inv["suspected"]) > a.top:
@@ -179,7 +204,6 @@ def cmd_analyze(a):
 
 
 def cmd_diff(a):
-    from .analyses import Timeline
     sides = []
     for path in (a.before, a.after):
         kev, model, _ = _load(path)
@@ -187,7 +211,7 @@ def cmd_diff(a):
             print("error: %s has no events" % path, file=sys.stderr)
             return 1
         a.trace = path
-        sides.append(_analysis(model, a, Timeline(model)))
+        sides.append(_analysis(model, a, _timeline(model, a)))
     A, B = sides
     if a.json:
         print(json.dumps({"before": A, "after": B}, indent=1, default=str))
@@ -202,9 +226,11 @@ def cmd_diff(a):
                 ", %d excluded, %d unfinished" % (r["excluded"], r["unfinished"])
                 if r["excluded"] or r["unfinished"] else "") if r else "-"
             p("deadline %s=%g us on %s: before %s | after %s" % (name, d["deadline_us"], srv, fmt(ra), fmt(rb)))
-    p("suspected priority inversions: before %d | after %d (insufficient evidence: %d | %d)" % (
+    p("suspected priority inversions: before %d | after %d (insufficient evidence: %d | %d; relying on supplied "
+      "run masks: %d | %d)" % (
         len(A["inversions"]["suspected"]), len(B["inversions"]["suspected"]),
-        len(A["inversions"]["insufficient_evidence"]), len(B["inversions"]["insufficient_evidence"])))
+        len(A["inversions"]["insufficient_evidence"]), len(B["inversions"]["insufficient_evidence"]),
+        A["inversions"]["suspected_using_assumptions"], B["inversions"]["suspected_using_assumptions"]))
     fc = lambda S: ", ".join("%s chid %d" % (c["process"], c["chid"]) for c in S["fixed_priority_channels"]) or "none"
     p("fixed-priority channels: before %s | after %s" % (fc(A), fc(B)))
     # rows are matched by role: client process, thread name and priority, and server process
@@ -279,6 +305,12 @@ def main(argv=None):
                        help="count requests of client threads with this name slower than US microseconds")
         s.add_argument("--client", help="only client threads whose label contains this text")
         s.add_argument("--min-us", type=float, default=100.0, help="inversion evidence threshold (default 100)")
+        s.add_argument("--runmask", action="append", metavar="PROCESS[/THREAD]=MASK", type=_runmask_spec,
+                       help="run mask (hex) set before the trace started, from the program's code or configuration "
+                            "(the trace records only masks set while tracing); used until the trace shows a mask "
+                            "event for the thread or loses events, and named in every verdict that uses it")
+        s.add_argument("--assume-unpinned", action="append", metavar="PROCESS",
+                       help="treat this process's threads as allowed on every CPU (your statement, not the trace's)")
         s.add_argument("--top", type=int, default=15, help="rows to print (default 15)")
         s.add_argument("--json", action="store_true")
         s.set_defaults(fn=fn)

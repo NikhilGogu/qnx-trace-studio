@@ -103,7 +103,8 @@ def _held(tl, key, a, b, wprio):
     cuts.update(tl.runmask_changes(key, a, b))
     cuts = sorted(cuts)
     for e, f in zip(cuts, cuts[1:]):
-        mask = tl.runmask_at(key, e)
+        mask, src = tl.runmask_source(key, e)
+        note = " (run mask 0x%x supplied by %s)" % (mask, src) if src not in (None, "traced") else ""
         cpus = tl.cpus if mask is None else mask_cpus(mask, tl.cpus)
         if not cpus:
             yield e, f, ("run mask 0x%x names no CPU of the trace" % mask, "mask 0x%x" % mask), False
@@ -126,9 +127,9 @@ def _held(tl, key, a, b, wprio):
             continue
         x, o, p = known[0]
         if len(known) == 1:
-            yield e, f, ("%s (prio %s) on CPU %d" % (m.label(o), p, x), "%s (%s)" % (_tn(m, o), p)), True
+            yield e, f, ("%s (prio %s) on CPU %d%s" % (m.label(o), p, x, note), "%s (%s)" % (_tn(m, o), p)), True
         else:
-            yield e, f, (" + ".join("%s (prio %s) on CPU %d" % (m.label(o2), p2, x2) for x2, o2, p2 in known),
+            yield e, f, (" + ".join("%s (prio %s) on CPU %d" % (m.label(o2), p2, x2) for x2, o2, p2 in known) + note,
                          " + ".join("%s (%s)" % (_tn(m, o2), p2) for _, o2, p2 in known)), True
 
 

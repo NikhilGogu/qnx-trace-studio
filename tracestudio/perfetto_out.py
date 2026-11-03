@@ -415,7 +415,7 @@ class Writer:
                 put(key, track, sg.children, depth + 1)
 
         for tx in m.txns:
-            if not tx.trustworthy or tx.parent is not None or m.is_idle(tx.client):
+            if not tx.causal or tx.parent is not None or m.is_idle(tx.client):
                 continue
             segs = critical_path(m, tx, tl)
             track = "%s critical path" % self.comm(tx.client)

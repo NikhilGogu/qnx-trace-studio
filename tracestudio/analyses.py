@@ -55,10 +55,17 @@ def mask_cpus(mask, cpus):
 
 
 class Timeline:
-    """Point queries over a Model: thread state and priority at an instant, CPU occupants, run masks."""
+    """Point queries over a Model: thread state and priority at an instant, CPU occupants, run masks.
 
-    def __init__(self, model):
+    runmasks [(process, thread or None, mask)] and unpinned {process} are what the user states about
+    run masks set before the trace (the trace only records masks set while tracing). They apply to a thread
+    only until the trace shows anything about its mask (a ThreadCtl, an invalidation) and only before the
+    first lost events, and every verdict that uses them says so."""
+
+    def __init__(self, model, runmasks=(), unpinned=()):
         self.m = model
+        self.runmasks = list(runmasks)
+        self.unpinned = set(unpinned)
         self.end = model.end_ts
         self._states = {}
         self.run = defaultdict(list)   # cpu -> [(t0, t1, key)]
@@ -74,6 +81,8 @@ class Timeline:
                 self.run[cpu].append((t0, self.end, key))
         self.run_starts = {cpu: [r[0] for r in lst] for cpu, lst in self.run.items()}
         self.cpus = sorted(set(range(model.kev.ncpu)) | set(self.run))
+        starts = [w0 for lst in model.loss_windows.values() for w0, _ in lst]
+        self.first_loss = min(starts) if starts else None
 
     def _st(self, key):
         v = self._states.get(key)
@@ -142,21 +151,42 @@ class Timeline:
         j = bisect.bisect_left(starts, t1)
         return starts[i:j]
 
-    def runmask_at(self, key, ts):
-        """The run mask traced for the thread at ts, or None when it is not known."""
+    def runmask_source(self, key, ts):
+        """(mask, source): the run mask traced for the thread at ts ("traced"), else one the user supplied
+        ("--runmask", "--assume-unpinned"), else (None, None)."""
         t = self.m.threads.get(key)
+        seen = False
         mask = None
         if t:
             for when, mk in t.runmask:
                 if when <= ts:
-                    mask = mk
+                    seen, mask = True, mk
                 else:
                     break
-        return mask
+        if seen:      # the trace says something about this thread's mask: a supplied one no longer holds
+            return (mask, "traced") if mask is not None else (None, None)
+        if self.first_loss is not None and ts >= self.first_loss:
+            return None, None
+        p = self.m.processes.get(key[0])
+        pname = p.name if p else None
+        tname = t.name if t else None
+        for proc, thr, mk in self.runmasks:
+            if proc == pname and (thr is None or thr == tname):
+                return mk, "--runmask"
+        if pname in self.unpinned:
+            return sum(1 << c for c in self.cpus), "--assume-unpinned"
+        return None, None
+
+    def runmask_at(self, key, ts):
+        """The run mask of the thread at ts (traced, else supplied by the user), or None when not known."""
+        return self.runmask_source(key, ts)[0]
 
     def runmask_changes(self, key, t0, t1):
         t = self.m.threads.get(key)
-        return [w for w, _ in (t.runmask if t else []) if t0 < w < t1]
+        out = [w for w, _ in (t.runmask if t else []) if t0 < w < t1]
+        if (self.runmasks or self.unpinned) and self.first_loss is not None and t0 < self.first_loss < t1:
+            out.append(self.first_loss)
+        return out
 
     def _handled_index(self, server):
         """Requests the server thread received, sorted by receive time, each open until its reply call (or the
@@ -327,7 +357,7 @@ def _inversion(tl, tx):
     culprits = defaultdict(int)       # (thread, prio, cpu) -> cycles
     reasons = Counter()
     phase = Counter()
-    sprios, masks, busy = set(), set(), []
+    sprios, masks, busy, assumed = set(), set(), [], set()
     for a, b, ccode, _cp in tl.segments(tx.client, tx.t_call, tx.t_exit):
         if ccode not in (ST_SEND, ST_REPLY):
             continue
@@ -365,7 +395,7 @@ def _inversion(tl, tx):
             cuts.update(tl.runmask_changes(srv, c, d))
             cuts = sorted(cuts)
             for e, f in zip(cuts, cuts[1:]):
-                mask = tl.runmask_at(srv, e)
+                mask, src = tl.runmask_source(srv, e)
                 if mask is None:
                     unk += f - e
                     reasons["run mask of %s not traced" % m.label(srv)] += f - e
@@ -399,13 +429,16 @@ def _inversion(tl, tx):
                 phase[state_name(ccode)] += f - e
                 sprios.add(sprio)
                 masks.add(mask)
+                if src != "traced":
+                    assumed.add("run mask 0x%x supplied by %s" % (mask, src))
                 for x, o, p in blockers:
                     culprits[(o, p, x)] += f - e
                 if ccode == ST_SEND:
                     h = tl.handling_at(srv, e)
                     if h is not None and h is not tx and h not in busy:
                         busy.append(h)
-    return inv, unk, culprits, reasons, {"phase": phase, "sprios": sprios, "masks": masks, "busy": busy}
+    return inv, unk, culprits, reasons, {"phase": phase, "sprios": sprios, "masks": masks, "busy": busy,
+                                         "assumed": sorted(assumed)}
 
 
 def suspected_inversions(model, tl=None, min_us=100.0):
@@ -413,12 +446,15 @@ def suspected_inversions(model, tl=None, min_us=100.0):
     tl = tl or Timeline(model)
     m = model
     found, unclear = [], []
-    checked = excluded = 0
+    checked = excluded = ambiguous = 0
     for tx in m.txns:
         if tx.server is None or tx.t_call is None or tx.t_exit is None:
             continue
         if not tx.trustworthy:
             excluded += 1
+            continue
+        if not tx.causal:
+            ambiguous += 1
             continue
         checked += 1
         inv, unk, culprits, reasons, d = _inversion(tl, tx)
@@ -442,6 +478,7 @@ def suspected_inversions(model, tl=None, min_us=100.0):
                                  for (k, p, cpu), v in sorted(culprits.items(), key=lambda x: -x[1])],
                 "server_busy_with": [{"txn": h.idx, "client": m.label(h.client)} for h in d["busy"]],
                 "insufficient_evidence_us": round(unk_us, 1),
+                "assumptions": d["assumed"],
             })
             top = row["preempted_by"][0]
             row["evidence"] = (
@@ -454,11 +491,13 @@ def suspected_inversions(model, tl=None, min_us=100.0):
                     row["server_prio_while_ready"], pc, top["thread"], top["prio"], top["cpu"], top["us"],
                     "; the server was busy with %s" % ", ".join("%s's request (txn %d)" % (b["client"], b["txn"])
                                                                for b in row["server_busy_with"])
-                    if row["server_busy_with"] else ""))
+                    if row["server_busy_with"] else "")) + (
+                " Relies on %s." % "; ".join(d["assumed"]) if d["assumed"] else "")
             found.append(row)
         else:
             row.update({"verdict": "insufficient evidence", "unexplained_us": round(unk_us, 1),
                         "reasons": {k: round(us(m, v), 1) for k, v in reasons.most_common()}})
             unclear.append(row)
     return {"suspected": found, "insufficient_evidence": unclear, "checked": checked,
-            "excluded_untrustworthy": excluded, "min_us": min_us}
+            "excluded_untrustworthy": excluded, "excluded_ambiguous_parent": ambiguous,
+            "suspected_using_assumptions": sum(1 for r in found if r["assumptions"]), "min_us": min_us}

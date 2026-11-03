@@ -879,20 +879,71 @@ def test_stale_reply_is_quarantined():
     assert m.counters["reply_msg_quarantined"] == 1 and not y.trustworthy
 
 
-def test_ambiguous_parent_is_not_trustworthy():
+def test_ambiguous_parent_counts_for_latency_only():
     g = Gen(ncpu=1)
     g.buffer(0, T)
-    g.state(0, T, RUNNING, C, 10)
-    g.send(0, T + 10, C, S[0], 0x10001)
+    g.names(0, T, NAMES)
+    g.state(0, T + 1, RECEIVE, M, 10)
+    g.state(0, T + 2, RECEIVE, S, 10)
+    g.state(0, T + 3, RUNNING, C, 10)
+    g.send(0, T + 10, C, S[0], 0x10001, prio=10)
     g.state(0, T + 50, RUNNING, B, 10)
-    g.send(0, T + 60, B, S[0], 0x20001)
-    g.receive(0, T + 100, S, C, 0x10001)
-    g.wait_receive(0, T + 130, S)
-    g.receive(0, T + 150, S, B, 0x20001)
-    g.send(0, T + 200, S, M[0], 0x30001)
+    g.send(0, T + 60, B, S[0], 0x20001, prio=10)
+    g.receive(0, T + 100, S, C, 0x10001, prio=10)
+    g.wait_receive(0, T + 130, S, 10)
+    g.receive(0, T + 150, S, B, 0x20001, prio=10)
+    g.send(0, T + 200, S, M[0], 0x30001, prio=10)               # whose request is this for?
+    g.receive(0, T + 240, M, S, 0x30001, prio=10)
+    g.reply(0, T + 400, M, S, 0x30001, 10)
+    g.send_exit(0, T + 450, S, 10)
     _, m = model(g)
     z = m.txns[2]
-    assert z.parent is None and any("parent ambiguous" in w for w in z.warnings) and not z.trustworthy
+    assert z.parent is None and z.parent_candidates == [0, 1]
+    assert z.trustworthy and not z.causal                       # kept for latency, not for causal analyses
+    assert [r["n"] for r in ipc_latency(m) if r["server"] == "mid"] == [1]
+    assert suspected_inversions(m)["excluded_ambiguous_parent"] == 1
+
+
+def test_supplied_run_mask_is_labelled():
+    # the server was pinned to CPU 0 before the trace started: the trace has no ThreadCtl for it
+    g = prio_scene(None, M, 20, gen=True)
+    k, m = model(g)
+    r = suspected_inversions(m)
+    assert r["suspected"] == [] and list(r["insufficient_evidence"][0]["reasons"]) == ["run mask of server/s1 not traced"]
+    r = suspected_inversions(m, tl=Timeline(m, runmasks=[("server", "s1", 0x1)]))
+    (x,) = r["suspected"]
+    assert x["assumptions"] == ["run mask 0x1 supplied by --runmask"] and r["suspected_using_assumptions"] == 1
+    assert "Relies on run mask 0x1 supplied by --runmask." in x["evidence"]
+    r = suspected_inversions(m, tl=Timeline(m, unpinned=["server"]))   # CPU 1's occupant is not in the trace
+    assert r["suspected"] == [] and "occupant of CPU 1 unknown" in r["insufficient_evidence"][0]["reasons"]
+    import contextlib
+    import io
+    import json
+    from tracestudio.cli import main
+    path = os.path.join(TMP, "pinned_before.kev")
+    with open(path, "wb") as f:
+        f.write(g.bytes())
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["analyze", path, "--runmask", "server/s1=0x1", "--json"]) == 0
+    inv = json.loads(out.getvalue())["inversions"]
+    assert inv["suspected_using_assumptions"] == 1 and inv["suspected"][0]["server_run_mask"] == "0x1"
+    # a supplied mask holds only until the trace says something about the thread's mask, or loses events
+    g.runmask(0, T + 1_000_050, 0x3)
+    g.state(1, T + 1_000_100, RUNNING, C, 10)
+    g.buffer(1, T + 1_500_000, seq=g.seq[1] + 2)
+    _, m = model(g)
+    tl = Timeline(m, runmasks=[("server", "s1", 0x1)])
+    assert tl.runmask_source(S, T + 1_000_000) == (0x1, "--runmask")
+    assert tl.runmask_source(S, T + 1_000_060) == (0x3, "traced")
+    assert tl.runmask_source(S, T + 2_000_000) == (None, None)
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            main(["analyze", path, "--runmask", "server/s1=zz"])
+        except SystemExit as e:
+            assert e.code == 2
+        else:
+            raise AssertionError("bad --runmask accepted")
 
 
 # ---- wakeups ---------------------------------------------------------------------------------------

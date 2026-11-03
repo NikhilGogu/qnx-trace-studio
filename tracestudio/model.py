@@ -28,7 +28,8 @@ Linking rules, all from kernel events, none from message payloads:
     MsgSendv exit (or INT_CALL) on the client ends it.
   * A request sent by a thread that has exactly one received, unreplied
     request is its child. With several the parent is ambiguous: candidates
-    are recorded, no parent is set, and the request carries a warning.
+    are recorded and no parent is set; such a request still counts for
+    latency but not for critical paths or inversion attribution.
   * Lost events (kev.Loss) define loss windows. Inside a window of its CPU no
     event has a known actor and no switch is trusted; every thread that could
     have changed state is UNKNOWN from the window's start until its first
@@ -161,6 +162,18 @@ class Txn:
     @property
     def trustworthy(self):
         return self.complete and not self.warnings
+
+    @property
+    def causal(self):
+        """Usable for causal analyses (critical paths, inversion attribution): trustworthy, parent not ambiguous."""
+        return self.trustworthy and not self.parent_candidates
+
+    @property
+    def msg_label(self):
+        """Message name for display: "_IO_READ", "_IO_READ (candidate)", or ""."""
+        if not self.msg_type:
+            return ""
+        return self.msg_type + (" (candidate)" if self.msg_candidate else "")
 
 
 @dataclass(eq=False)
@@ -773,9 +786,8 @@ class Model:
         if len(cands) == 1:
             tx.parent = cands[0].idx
             cands[0].children.append(tx.idx)
-        elif cands:
+        elif cands:   # kept for latency; left out of causal analyses (see Txn.causal)
             tx.parent_candidates = [x.idx for x in cands]
-            tx.warnings.append("parent ambiguous: sender holds %d received requests" % len(cands))
             c["ambiguous_parents"] += 1
         if tx.coid is not None:
             k = (actor[0], tx.coid)
