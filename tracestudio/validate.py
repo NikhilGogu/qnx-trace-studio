@@ -7,7 +7,9 @@ before MsgSend() and just after it returns, plus the server-side rcvid,
 receiving thread and timestamps. ClockCycles() and trace timestamps share one
 time base, so each logged request must contain exactly one decoded
 transaction from the same client thread, and that transaction must name the
-same server thread and rcvid.
+same server thread and rcvid. Validation fails (ok = False) when there are no
+logged requests, when any request is not matched, or when any check, including
+the parent link of a forwarded request, is wrong or missing.
 """
 from __future__ import annotations
 
@@ -97,6 +99,7 @@ def validate(model, logdir, wide=None):
                     "rcvid": cmp(t.rcvid, rx["a"] & 0xFFFFFFFF),
                     "rx_before_log": None if t.t_rx_exit is None else t.t_rx_exit <= rx["cycles"],
                     "complete": True if t.complete else None,
+                    "trustworthy": True if t.trustworthy else None,
                 }
                 if g["reply"] is not None:
                     checks["reply_after_log"] = None if t.t_reply_call is None else t.t_reply_call >= g["reply"]["cycles"]
@@ -171,6 +174,9 @@ def validate(model, logdir, wide=None):
                      "back_pulses_logged": ticks_log, "back_pulses_received_in_trace": ticks_dec}
     res["problems"] = dict(res["problems"])
     res["checks"] = dict(sorted(res["checks"].items()))
+    failed = [k for k in res["checks"] if k.endswith((":WRONG", ":missing"))]
+    res["ok"] = bool(res["requests"]) and res["matched"] == res["requests"] and not failed
+    res["failed_checks"] = failed
     le = sorted(res.pop("latency_err_us"))
     if le:
         res["log_minus_trace_latency_us"] = {"min": round(le[0], 2), "median": round(le[len(le) // 2], 2),

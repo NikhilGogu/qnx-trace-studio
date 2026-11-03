@@ -36,7 +36,7 @@ def test_parser_invariants():
         k = KevFile(kev(s))
         evs = k.events()
         assert k.stats.orphan_slots == 0 and k.stats.partial_combines == 0, s
-        assert not k.stats.lost_buffers, s
+        assert not k.stats.lost_buffers and not k.losses and not k.stats.short_buffers, s
         assert all(a.ts <= b.ts for a, b in zip(evs, evs[1:])), s
         assert k.stats.rollovers >= 2, s    # 2.7 GHz TSC wraps 32 bits every 1.6 s
 
@@ -67,12 +67,16 @@ def test_priority_story():
     inherit = Model(KevFile(kev("prio_inherit")))
     f = deadline_misses(fixed, "hi", 5000)["ts_psrv"]
     i = deadline_misses(inherit, "hi", 5000)["ts_psrv"]
-    assert f[0] == 20 and f[1] == 20, f      # every hi request misses with a fixed-priority channel
-    assert i[0] == 20 and i[1] == 0, i       # none with priority inheritance
+    assert (f["requests"], f["missed"], f["excluded"]) == (20, 20, 0), f   # all miss with a fixed-priority channel
+    assert (i["requests"], i["missed"], i["excluded"]) == (20, 0, 0), i    # none with priority inheritance
     inv_f, inv_i = suspected_inversions(fixed), suspected_inversions(inherit)
-    assert len(inv_f) == 20 and all(x["client"].endswith("/hi") for x in inv_f)
-    assert all(x["preempted_by"][0]["thread"].endswith("/hog") for x in inv_f)
-    assert inv_i == []
+    sus = inv_f["suspected"]
+    assert len(sus) == 20 and all(x["client"].endswith("/hi") for x in sus), sus
+    assert all(x["preempted_by"][0]["thread"].endswith("/hog") for x in sus)
+    assert all(x["server_run_mask"] == "0x1" and x["server_prio_while_ready"] == 10 for x in sus)
+    assert all(x["while"].get("SEND", 0) > 7000 for x in sus)       # hog runs while hi waits for the receive
+    assert not inv_f["insufficient_evidence"]
+    assert inv_i["suspected"] == [] and inv_i["insufficient_evidence"] == []
     assert any(v["flags"] & 1 for v in fixed.channels.values())         # _NTO_CHF_FIXED_PRIORITY seen
     assert not any(v["flags"] & 1 for v in inherit.channels.values())
 
