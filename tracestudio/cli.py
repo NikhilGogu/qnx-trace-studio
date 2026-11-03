@@ -506,6 +506,8 @@ def main(argv=None):
     s.add_argument("--max-insufficient", type=_count, metavar="N",
                    help="at most N requests with insufficient evidence for the inversion analysis (default 0 "
                         "with --no-inversions)")
+    s.add_argument("--client", metavar="TEXT",
+                   help="limit the inversion assertions to client threads whose label contains TEXT (as for analyze)")
     s.add_argument("--allow-loss", action="store_true",
                    help="do not fail because of lost events or untrustworthy requests (they are still reported)")
     s.add_argument("--min-us", type=_us, default=100.0, help="inversion evidence threshold (default 100)")

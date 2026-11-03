@@ -104,13 +104,15 @@ def run_checks(model, tl, a):
                                       _label_selector(model, selector), a.allow_loss, a.min_requests))
     if not (a.no_inversions or a.max_insufficient is not None):
         return out
-    inv = suspected_inversions(model, tl=tl, min_us=a.min_us)
+    client = getattr(a, "client", None)
+    only = (lambda key: client in model.label(key)) if client else None
+    inv = suspected_inversions(model, tl=tl, min_us=a.min_us, only=only)
     sus, ins, checked = inv["suspected"], inv["insufficient_evidence"], inv["checked"]
     allowed = a.max_insufficient or 0
-    coverage = "checked %d exchanges (at least %d required), %d with insufficient evidence (at most %d allowed), " \
+    coverage = "checked %d exchanges%s (at least %d required), %d with insufficient evidence (at most %d allowed), " \
                "%d excluded as untrustworthy, %d with an ambiguous parent" % (
-                   checked, a.min_checked, len(ins), allowed, inv["excluded_untrustworthy"],
-                   inv["excluded_ambiguous_parent"])
+                   checked, " of clients matching %r" % client if client else "", a.min_checked, len(ins), allowed,
+                   inv["excluded_untrustworthy"], inv["excluded_ambiguous_parent"])
     ins_ev = ["txn %d: %s -> %s, %.1f us unexplained: %s" % (
         r["txn"], r["client"], r["server"], r["unexplained_us"], next(iter(r["reasons"]), "")) for r in ins[:5]]
     if a.no_inversions:

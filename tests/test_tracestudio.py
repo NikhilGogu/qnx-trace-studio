@@ -250,6 +250,10 @@ def test_check_fails_prio_fixed_and_passes_prio_inherit():
     with contextlib.redirect_stdout(out):                       # inconclusive requests count against --no-inversions
         assert main(["check", kev("prio_inherit"), "--no-inversions"]) == 1
     assert "2 with insufficient evidence (at most 0 allowed)" in out.getvalue()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):                       # both are requests to procnto from other clients
+        assert main(["check", kev("prio_inherit"), "--no-inversions", "--client", "ts_pload/"]) == 0
+    assert "checked 118 exchanges of clients matching 'ts_pload/'" in out.getvalue(), out.getvalue()
 
 
 def test_open_converts_once_and_pins_the_slowest_clients():
