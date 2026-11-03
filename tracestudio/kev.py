@@ -34,6 +34,7 @@ closed as partial, so slots from both sides of a gap are never joined.
 """
 from __future__ import annotations
 
+import gzip
 import re
 import struct
 from dataclasses import dataclass, field
@@ -114,6 +115,8 @@ class KevFile:
         if data is None:
             with open(path, "rb") as f:
                 data = f.read()
+        if data[:2] == b"\x1f\x8b":
+            data = gzip.decompress(data)
         self.data = data
         self.attrs, self.syspage, self.events_offset = self._parse_header(self.data)
         if self.attrs.get("LITTLE_ENDIAN", "TRUE") != "TRUE":

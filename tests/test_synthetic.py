@@ -1284,3 +1284,16 @@ def test_untrustworthy_exchange_has_no_arrows_and_warns_on_every_slice():
                                              "handle client/c [not trustworthy]", "reply received [not trustworthy]"]
         assert all(x.w and "_msg_info names" in x.w and x.ok == 0 for x in r)
         tp.close()
+
+
+def test_gzipped_kev_reads_like_the_plain_file():
+    import gzip
+    from tracestudio.kev import KevFile
+    g = Gen(ncpu=1)
+    g.buffer(0, 1000)
+    g.on(0, 2000)
+    raw = g.bytes()
+    plain = KevFile("plain.kev", raw)
+    zipped = KevFile("zipped.kev.gz", gzip.compress(raw))
+    assert zipped.attrs == plain.attrs and zipped.events_offset == plain.events_offset
+    assert [e.ts for e in zipped.events()] == [e.ts for e in plain.events()]
