@@ -210,55 +210,25 @@ class Writer:
             self.descriptor(d)
 
     def _sched(self):
+        """sched_switch and sched_waking as ftrace bundles, per CPU, in timestamp order."""
         m = self.m
-        bundles = {}
-        n = 0
+        per_cpu = {}
         for ts, cpu, prev, prev_code, prev_prio, nxt, next_prio in m.switches:
-            b = bundles.get(cpu)
-            if b is None or len(b.event) >= 2000:
-                pk = pb.TracePacket()
-                b = bundles[cpu] = pk.ftrace_events
-                b.cpu = cpu
-                self._add(ts, 3, pk)
-            fe = b.event.add()
-            fe.timestamp = self.ns(ts)
-            fe.pid = self.tid(prev)
+            fe = pb.FtraceEvent(timestamp=self.ns(ts), pid=self.tid(prev))
             sw = fe.sched_switch
-            sw.prev_comm = self.comm(prev)
-            sw.prev_pid = self.tid(prev)
+            sw.prev_comm, sw.prev_pid = self.comm(prev), self.tid(prev)
             sw.prev_prio = prev_prio if prev_prio is not None else 0
             sw.prev_state = linux_state(prev_code)
-            sw.next_comm = self.comm(nxt)
-            sw.next_pid = self.tid(nxt)
+            sw.next_comm, sw.next_pid = self.comm(nxt), self.tid(nxt)
             sw.next_prio = next_prio if next_prio is not None else 0
-            n += 1
+            per_cpu.setdefault(cpu, []).append(fe)
         for ts, cpu, waker, woken, prio in m.wakeups:
-            b = bundles.get(cpu)
-            if b is None or len(b.event) >= 2000:
-                pk = pb.TracePacket()
-                b = bundles[cpu] = pk.ftrace_events
-                b.cpu = cpu
-                self._add(ts, 3, pk)
-            fe = b.event.add()
-            fe.timestamp = self.ns(ts)
-            fe.pid = self.tid(waker)
+            fe = pb.FtraceEvent(timestamp=self.ns(ts), pid=self.tid(waker))
             wk = fe.sched_waking
-            wk.comm = self.comm(woken)
-            wk.pid = self.tid(woken)
+            wk.comm, wk.pid = self.comm(woken), self.tid(woken)
             wk.prio = prio if prio is not None else 0
-            wk.success = 1
-            wk.target_cpu = cpu
-        self.stats["sched_switch"] = n
-        self.stats["sched_waking"] = len(m.wakeups)
-        # ftrace bundles must be in timestamp order per CPU: rebuild sorted
-        self._sort_ftrace()
-
-    def _sort_ftrace(self):
-        packets = [x for x in self.events if x[1] == 3]
-        self.events = [x for x in self.events if x[1] != 3]
-        per_cpu = {}
-        for _, _, _, pk in packets:
-            per_cpu.setdefault(pk.ftrace_events.cpu, []).extend(pk.ftrace_events.event)
+            wk.success, wk.target_cpu = 1, cpu
+            per_cpu.setdefault(cpu, []).append(fe)
         for cpu, lst in per_cpu.items():
             lst.sort(key=lambda fe: fe.timestamp)
             for i in range(0, len(lst), 2000):
@@ -267,6 +237,8 @@ class Writer:
                 pk.ftrace_events.event.extend(lst[i:i + 2000])
                 self._seq += 1
                 self.events.append((lst[i].timestamp, 3, self._seq, pk))
+        self.stats["sched_switch"] = len(m.switches)
+        self.stats["sched_waking"] = len(m.wakeups)
 
     def _states(self, end_ts):
         m = self.m

@@ -133,8 +133,10 @@ class KevFile:
         pending = {}   # (cpu, cls, code, lsb) -> [first_index, ts, words, injected]
         out = []
 
+        gmsb = [None]  # MSB from the latest TIME event on any CPU, for slots before a CPU's first TIME
+
         def extend(cpu, lsb):
-            m = msb.get(cpu)
+            m = msb.get(cpu, gmsb[0])
             if m is None:
                 return lsb
             prev = last.get(cpu)
@@ -164,6 +166,7 @@ class KevFile:
                 if cpu in msb and d1 != msb[cpu]:
                     st.rollovers += 1
                 msb[cpu] = d1
+                gmsb[0] = d1
             ts = extend(cpu, d0)
             if struct_ == S_SIMPLE:
                 ev = Event(ts, cpu, cls, code, (d1, d2), i, injected)

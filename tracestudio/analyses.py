@@ -85,11 +85,13 @@ def suspected_inversions(model, min_us=100.0, tl=None):
             continue
         culprits = defaultdict(float)
         ready_us = 0.0
+        ready_prios = []
         for a, b, code, ps in m.intervals(tx.server, tl.end):
             lo, hi = max(a, tx.t_call), min(b, tx.t_rx_exit or tx.t_exit)
             if hi <= lo or code != ST_READY or ps is None or ps >= pc:
                 continue
             ready_us += _us(m, hi - lo)
+            ready_prios.append(ps)
             for cpu, r0, r1, key in tl.running_during(lo, hi):
                 if key in (tx.client, tx.server) or m.is_idle(key):
                     continue
@@ -105,8 +107,7 @@ def suspected_inversions(model, min_us=100.0, tl=None):
                     busy_with = other
             out.append({
                 "txn": tx.idx, "client": m.label(tx.client), "client_prio": pc,
-                "server": m.label(tx.server), "server_prio_while_ready": min(p for _, _, c2, p in m.intervals(tx.server, tl.end)
-                                                                            if c2 == ST_READY and p is not None),
+                "server": m.label(tx.server), "server_prio_while_ready": min(ready_prios),
                 "client_blocked": tx.client_block, "latency_us": round(_us(m, tx.t_exit - tx.t_call), 1),
                 "server_ready_us": round(ready_us, 1), "preempted_by": [
                     {"thread": m.label(k), "prio": p, "cpu": cpu, "us": round(v, 1)}

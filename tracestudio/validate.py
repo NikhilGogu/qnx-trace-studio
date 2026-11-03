@@ -165,8 +165,7 @@ def validate(model, logdir, wide=None):
                and p.receiver[0] == next((x["pid"] for x in rows if x["role"] == "front"), -1) for p in dec):
             matched += 1
     back = next((x["pid"] for x in rows if x["role"] == "back"), None)
-    ticks_log = sum(1 for r in rows if r["role"] == "back" and r["ev"] == "PULSE_RX" and r["a"] == 0x7FFFFFFF - 0 or
-                    (r["role"] == "back" and r["ev"] == "PULSE_RX"))
+    ticks_log = sum(1 for r in rows if r["role"] == "back" and r["ev"] == "PULSE_RX")
     ticks_dec = sum(1 for p in model.pulses if p.server_pid == back and p.t_recv is not None and p.receiver is not None)
     res["pulses"] = {"client_pulses_logged": len(sent), "client_pulses_matched_with_value": matched,
                      "back_pulses_logged": ticks_log, "back_pulses_received_in_trace": ticks_dec}

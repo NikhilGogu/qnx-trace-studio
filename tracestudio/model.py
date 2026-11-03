@@ -224,9 +224,6 @@ class Model:
                         running[ev.cpu] = key
                         where[key] = ev.cpu
                     else:
-                        oc = where.get(key)
-                        if oc is not None and running.get(oc) == key and ev.code != ST_READY:
-                            pass  # stays "on CPU" until the next THRUNNING there; state shows it blocked
                         if ev.code == ST_READY and prev_state not in (None, ST_RUNNING, ST_READY):
                             self.wakeups.append((ev.ts, ev.cpu, running.get(ev.cpu), key, prio))
                         if key in open_by_client:
@@ -270,7 +267,7 @@ class Model:
                         pend_send[actor] = (ev.ts, a.get("coid"), tuple(a.get("msg%d" % i) for i in range(3) if "msg%d" % i in a))
                     else:
                         tx = open_by_client.pop(actor, None)
-                        ps = pend_send.pop(actor, None)
+                        pend_send.pop(actor, None)
                         if tx is None:
                             c["send_exit_without_txn"] += 1
                             continue
