@@ -15,10 +15,11 @@ SCEN=${*:-"ipc_wide ipc_fast prio_inherit prio_fixed"}
 mkdir -p /tmp/ts_logs "$O"
 
 # -k 32: 32 kernel buffers per CPU (16 KB each) so short bursts are not
-# dropped; -b 128: tracelogger-side buffers; -s: time-based capture.
+# dropped; -b 128: tracelogger-side buffers; -s: time-based capture (TS_SECONDS overrides the length,
+# for slow emulated targets).
 start_trace() {   # <name> <mode-flag> <seconds>
     rm -f /tmp/ts_logs/*.csv
-    tracelogger $2 -k 32 -b 128 -s $3 -A SCENARIO=$1 -f "$O/$1.kev" > "$O/$1.tracelogger.txt" 2>&1 &
+    tracelogger $2 -k 32 -b 128 -s ${TS_SECONDS:-$3} -A SCENARIO=$1 -f "$O/$1.kev" > "$O/$1.tracelogger.txt" 2>&1 &
     TL=$!
     sleep 1
 }
