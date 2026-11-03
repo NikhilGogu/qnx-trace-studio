@@ -25,6 +25,7 @@ from tracestudio.analyses import deadline_misses, suspected_inversions  # noqa: 
 DATA = os.path.join(HERE, "data", "run1")
 DATA3 = os.path.join(HERE, "data", "run3")
 DATA4 = os.path.join(HERE, "data", "run4")
+DATA5 = os.path.join(HERE, "data", "run5")
 TMP = tempfile.mkdtemp(prefix="ts-test-")
 SCEN = ["ipc_wide", "ipc_fast", "prio_inherit", "prio_fixed"]
 
@@ -36,7 +37,7 @@ def skip(why):
 
 
 def kev(name, data=DATA):
-    out = os.path.join(TMP, name + ".kev")
+    out = os.path.join(TMP, "%s_%s.kev" % (os.path.basename(data), name))      # fixtures of several runs share names
     if not os.path.exists(out):
         with gzip.open(os.path.join(data, name + ".kev.gz")) as f, open(out, "wb") as g:
             shutil.copyfileobj(f, g)
@@ -333,6 +334,33 @@ def test_mutex_chain_captures():
                 dst.write(",".join(parts) + "\n")
     res, _, _ = validate(Model(KevFile(kev("mutex_chain_hog", DATA4))), bad)
     assert not res["ok"] and "mutex_owner_value:WRONG" in res["failed_checks"]
+
+
+
+def test_aarch64le_capture():
+    """prio_fixed captured on an aarch64le QEMU virt target (TCG, 2 CPUs, 62.5 MHz ClockCycles)."""
+    from tracestudio.analyses import Timeline, deadline_misses, suspected_inversions
+    path = kev("prio_fixed", DATA5)
+    k = KevFile(path)
+    assert (k.attrs.get("MACHINE"), k.ncpu, k.cycles_per_sec, k.losses) == ("QEMU_virt", 2, 62500000, [])
+    m = Model(k)
+    res, _, _ = validate(m, os.path.join(DATA5, "prio_fixed.logs"))
+    assert res["ok"] and res["requests"] == res["matched"] == 40, res
+    inv = suspected_inversions(m, tl=Timeline(m))
+    sus = inv["suspected"]
+    assert len(sus) == 20 and all(x["client"] == "ts_pload/hi" and x["server_run_mask"] == "0x1" for x in sus)
+    assert all(set(x["while"]) == {"SEND"} for x in sus)
+    d = deadline_misses(m, "hi@ts_psrv", 5000)["ts_psrv"]
+    assert (d["requests"], d["missed"]) == (20, 20)
+    tp = shutil.which("traceprinter")
+    if tp:
+        txt = os.path.join(TMP, "a64_prio_fixed.txt")
+        subprocess.run([tp, "-f", path, "-o", txt], check=True)
+        r = subprocess.run([sys.executable, os.path.join(HERE, "..", "tools", "compare_traceprinter.py"), path, txt],
+                           capture_output=True, text=True)
+        assert r.returncode == 0 and "mismatches: 0 (sign only: 0)" in r.stdout, r.stdout
+    elif os.environ.get("TS_REQUIRE_ALL"):
+        raise AssertionError("traceprinter not found")
 
 
 if __name__ == "__main__":
