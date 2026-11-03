@@ -6,14 +6,16 @@ The window from the client's MsgSendv entry to its exit is partitioned into
 consecutive segments that never overlap, so the durations add up to the
 latency exactly:
   client running     the client thread executes (kernel call entry and exit)
-  client ready       the client is runnable while other threads hold the CPUs it may use
+  client ready       the client is runnable while threads at or above its priority hold the CPUs it may use
+  unexplained ready  a thread is runnable but the trace does not show why it did not run (an idle,
+                     lower-priority or unknown occupant, or no CPU it is known to be allowed on)
   server busy        the receiving thread runs, but not this request (SEND-blocked client),
                      or it holds several received requests and the trace does not say which one it serves
   server waiting     the receiving thread is still RECEIVE-blocked (message not yet delivered)
-  server preempted   the server thread is READY while other threads hold its CPUs
+  server preempted   the server thread is READY while threads at or above its priority hold its CPUs
   server running     the server thread receives, runs or replies to this request
   nested request     the server thread waits in its own request to another server;
-                     that request's critical path is nested inside, recursively
+                     that request's critical path is nested inside, recursively, when it is trustworthy
   server blocked     the server thread is blocked in another state (MUTEX, ...) or in a
                      request that is not part of this one
   unknown            no events (lost data) or nothing known yet
@@ -23,7 +25,7 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass, field
 
-from .analyses import Timeline, us
+from .analyses import Timeline, mask_cpus, us
 from .events import state_name
 from .model import ST_READY, ST_RECEIVE, ST_REPLY, ST_RUNNING, ST_SEND, ST_UNKNOWN, UNKNOWN
 
@@ -38,18 +40,50 @@ class Segment:
     prio: int | None = None
     txn: int | None = None
     children: list = field(default_factory=list)
-    held_by: dict = field(default_factory=dict)   # for READY waits: who held the CPUs -> cycles
+    pieces: list = field(default_factory=list)    # READY waits: (start, end, (text, short text)) of who held the CPUs
     short: str = ""                               # compact name for the Perfetto slice
 
+    @property
+    def held_by(self):
+        out = {}
+        for e, f, h in self.pieces:
+            out[h] = out.get(h, 0) + (f - e)
+        return out
 
-def _clip(segs, a, b):
+
+def _clip(m, segs, a, b):
+    """Segments cut to [a, b]; READY waits keep only the pieces inside, so their attribution is recomputed."""
     out = []
     for s in segs:
         lo, hi = max(s.t0, a), min(s.t1, b)
         if hi > lo:
-            out.append(Segment(lo, hi, s.kind, s.label, s.thread, s.prio, s.txn, _clip(s.children, lo, hi),
-                               dict(s.held_by), s.short))
+            pieces = [(max(e, lo), min(f, hi), h) for e, f, h in s.pieces if min(f, hi) > max(e, lo)]
+            out.append(Segment(lo, hi, s.kind, s.label, s.thread, s.prio, s.txn, _clip(m, s.children, lo, hi),
+                               pieces, s.short))
+    _label_waits(m, out)
     return out
+
+
+def _label_waits(m, segs):
+    for sg in segs:
+        if not sg.pieces:
+            continue
+        top = sorted(sg.held_by.items(), key=lambda kv: -kv[1])
+        who = m.label(sg.thread)
+        if sg.kind == "unexplained ready":
+            sg.label = "%s READY at prio %s, not explained by the trace: %s" % (
+                who, sg.prio, ", ".join("%s %.1f us" % (k[0], us(m, v)) for k, v in top[:3]))
+            sg.short = "%s READY (%s), unexplained: %s" % (_tn(m, sg.thread), sg.prio, top[0][0][1])
+            continue
+        if len(top) == 1:
+            sg.label = "%s READY at prio %s, CPU held by %s" % (who, sg.prio, top[0][0][0])
+        else:
+            more = sum(v for _, v in top[3:])
+            sg.label = "%s READY at prio %s, CPUs held by %s%s" % (
+                who, sg.prio, ", ".join("%s %.1f us" % (k[0], us(m, v)) for k, v in top[:3]),
+                ", %d more %.1f us" % (len(top) - 3, us(m, more)) if more else "")
+        sg.short = "%s READY (%s), CPU: %s%s" % (_tn(m, sg.thread), sg.prio, top[0][0][1],
+                                                " +%d more" % (len(top) - 1) if len(top) > 1 else "")
 
 
 def _tn(m, key):
@@ -57,8 +91,11 @@ def _tn(m, key):
     return t.name if t and t.name else m.label(key)
 
 
-def _held(tl, key, a, b):
-    """Who held the CPUs `key` may run on during [a, b]: [(e, f, (text, short text), main thread, its prio)]."""
+def _held(tl, key, a, b, wprio):
+    """Who held the CPUs `key` may run on while it was READY in [a, b]: [(e, f, (text, short), explained)].
+    A wait is explained only when every CPU it may use (its traced run mask, or every CPU when none was
+    traced) ran a known thread at or above its priority; an idle, lower-priority or unknown occupant, an
+    unknown priority, or a mask naming no CPU of the trace leaves it unexplained."""
     m = tl.m
     cuts = {a, b}
     for cpu in tl.cpus:
@@ -67,21 +104,32 @@ def _held(tl, key, a, b):
     cuts = sorted(cuts)
     for e, f in zip(cuts, cuts[1:]):
         mask = tl.runmask_at(key, e)
-        cpus = [x for x in tl.cpus if mask is None or (mask >> x) & 1]
-        occ = [(x, tl.occupant(x, e)) for x in cpus]
-        known = [(x, o, tl.prio_at(o, e)) for x, o in occ if o not in (None, UNKNOWN)]
-        if len(known) < len(occ):
-            yield e, f, ("occupant of a CPU it may use unknown", "unknown"), None, None
+        cpus = tl.cpus if mask is None else mask_cpus(mask, tl.cpus)
+        if not cpus:
+            yield e, f, ("run mask 0x%x names no CPU of the trace" % mask, "mask 0x%x" % mask), False
             continue
-        known.sort(key=lambda r: -(r[2] if r[2] is not None else -1))
+        occ = [(x, tl.occupant(x, e)) for x in cpus]
+        missing = [x for x, o in occ if o in (None, UNKNOWN)]
+        if missing:
+            yield e, f, ("occupant of CPU %s unknown" % ",".join(map(str, missing)), "CPU unknown"), False
+            continue
+        known = sorted(((x, o, tl.prio_at(o, e)) for x, o in occ), key=lambda r: -(r[2] if r[2] is not None else -1))
+        if len(known) == 1 and known[0][1] == key:
+            yield e, f, ("the kernel on CPU %d (switching)" % known[0][0], "kernel"), True
+            continue
+        low = [(x, o, p) for x, o, p in known if wprio is None or p is None or p < wprio]
+        if low:
+            x, o, p = low[0]
+            what = "CPU %d idle" % x if m.is_idle(o) else "CPU %d ran %s (prio %s)" % (x, m.label(o), p)
+            yield e, f, (what + ("" if mask is not None else " (no run mask traced)"),
+                         "CPU %d idle" % x if m.is_idle(o) else "%s (%s)" % (_tn(m, o), p)), False
+            continue
         x, o, p = known[0]
-        if len(known) == 1 and o == key:
-            yield e, f, ("the kernel on CPU %d (switching)" % x, "kernel"), None, None
-        elif len(known) == 1:
-            yield e, f, ("%s (prio %s) on CPU %d" % (m.label(o), p, x), "%s (%s)" % (_tn(m, o), p)), o, p
+        if len(known) == 1:
+            yield e, f, ("%s (prio %s) on CPU %d" % (m.label(o), p, x), "%s (%s)" % (_tn(m, o), p)), True
         else:
             yield e, f, (" + ".join("%s (prio %s) on CPU %d" % (m.label(o2), p2, x2) for x2, o2, p2 in known),
-                         " + ".join("%s (%s)" % (_tn(m, o2), p2) for _, o2, p2 in known)), o, p
+                         " + ".join("%s (%s)" % (_tn(m, o2), p2) for _, o2, p2 in known)), True
 
 
 def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
@@ -111,7 +159,7 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
         else:
             last = Segment(a, b, kind, "", waiter, wprio, tx.idx)
             segs.append(last)
-        last.held_by[holder] = last.held_by.get(holder, 0) + (b - a)
+        last.pieces.append((a, b, holder))
 
     def server_part(a, b):
         if srv is None:
@@ -122,17 +170,17 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
         for c, d, scode, sprio in tl.segments(srv, a, b):
             if scode == ST_RUNNING:
                 cuts = {c, d}
-                lst, rx, reach = tl._handled_index(srv)
+                lst, rx, reach, ends = tl._handled_index(srv)
                 i0 = j = bisect.bisect_right(rx, c)
                 while j < len(lst) and rx[j] < d:          # requests received inside (c, d)
                     cuts.add(rx[j])
-                    if lst[j].t_reply_call < d:
-                        cuts.add(lst[j].t_reply_call)
+                    if ends[j] < d:
+                        cuts.add(ends[j])
                     j += 1
                 i = i0 - 1
                 while i >= 0 and reach[i] > c:             # requests received before c, replied inside
-                    if c < lst[i].t_reply_call < d:
-                        cuts.add(lst[i].t_reply_call)
+                    if c < ends[i] < d:
+                        cuts.add(ends[i])
                     i -= 1
                 cuts = sorted(cuts)
                 for e, f in zip(cuts, cuts[1:]):
@@ -158,14 +206,18 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
                         add(e, f, "server busy", "%s running, not in a request" % sl, srv, sprio,
                             short="%s busy (no request)" % ss)
             elif scode == ST_READY:
-                for e, f, text, who, p in _held(tl, srv, c, d):
-                    add_wait(e, f, "server preempted", srv, sprio, text)
+                for e, f, text, explained in _held(tl, srv, c, d, sprio):
+                    add_wait(e, f, "server preempted" if explained else "unexplained ready", srv, sprio, text)
             elif scode in (ST_SEND, ST_REPLY):
                 k = tl.client_txn_at(srv, c)
-                if k is not None and k.parent == tx.idx and k.t_exit is not None and _depth < max_depth:
-                    kids = _clip(critical_path(m, k, tl, max_depth, _depth + 1), c, d)
+                if k is not None and k.parent == tx.idx and k.trustworthy and _depth < max_depth:
+                    kids = _clip(m, critical_path(m, k, tl, max_depth, _depth + 1), c, d)
                     add(c, d, "nested request", "%s waits for %s (txn %d)" % (sl, m.server_name(k), k.idx),
                         srv, sprio, kids, short="%s waits for %s" % (ss, m.server_name(k)))
+                elif k is not None and k.parent == tx.idx:
+                    add(c, d, "server blocked", "%s waits for %s (txn %d, not followed: %s)" % (
+                        sl, m.server_name(k), k.idx, "; ".join(k.warnings) or "depth limit or incomplete"),
+                        srv, sprio, short="%s waits for %s (not followed)" % (ss, m.server_name(k)))
                 elif k is not None:
                     add(c, d, "server blocked", "%s %s-blocked on %s (txn %d%s)" % (
                         sl, state_name(scode), m.server_name(k), k.idx,
@@ -190,8 +242,8 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
         if code == ST_RUNNING:
             add(a, b, "client running", "%s running" % cl, client, prio, short="%s running" % _tn(m, client))
         elif code == ST_READY:
-            for e, f, text, who, p in _held(tl, client, a, b):
-                add_wait(e, f, "client ready", client, prio, text)
+            for e, f, text, explained in _held(tl, client, a, b, prio):
+                add_wait(e, f, "client ready" if explained else "unexplained ready", client, prio, text)
         elif code in (ST_SEND, ST_REPLY):
             server_part(a, b)
         elif code in (None, ST_UNKNOWN):
@@ -199,18 +251,7 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0):
         else:
             add(a, b, "client blocked", "%s blocked in %s" % (cl, state_name(code)), client, prio,
                 short="%s %s" % (_tn(m, client), state_name(code)))
-    for sg in segs:
-        if sg.held_by:
-            top = sorted(sg.held_by.items(), key=lambda kv: -kv[1])
-            if len(top) == 1:
-                sg.label = "%s READY at prio %s, CPU held by %s" % (m.label(sg.thread), sg.prio, top[0][0][0])
-            else:
-                more = sum(v for _, v in top[3:])
-                sg.label = "%s READY at prio %s, CPUs held by %s%s" % (
-                    m.label(sg.thread), sg.prio, ", ".join("%s %.1f us" % (k[0], us(m, v)) for k, v in top[:3]),
-                    ", %d more %.1f us" % (len(top) - 3, us(m, more)) if more else "")
-            sg.short = "%s READY (%s), CPU: %s%s" % (_tn(m, sg.thread), sg.prio, top[0][0][1],
-                                                    " +%d more" % (len(top) - 1) if len(top) > 1 else "")
+    _label_waits(m, segs)
     return segs
 
 

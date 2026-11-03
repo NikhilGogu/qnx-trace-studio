@@ -68,6 +68,9 @@ KER_ARGS = {
     ("THREAD_CTL", 0, 0): ("cmd:d data:x", "cmd:d data:x"),
     ("THREAD_CTL", 0, 1): ("cmd:d data:x", "cmd:d data:q"),
     ("THREAD_CTL", 1, 0): ("ret_val:d", "ret_val:d"),
+    ("THREAD_CTLEXT", 0, 0): ("pid:d tid:d", "pid:d tid:d cmd:d data:x"),
+    ("THREAD_CTLEXT", 0, 1): ("pid:d tid:d", "pid:d tid:d cmd:d data:q"),
+    ("THREAD_CTLEXT", 1, 0): ("ret_val:d", "ret_val:d"),
     ("CONNECT_DETACH", 0, 0): ("coid:x", "coid:x"),
 }
 for _n in ("MSG_SENDVNC",):

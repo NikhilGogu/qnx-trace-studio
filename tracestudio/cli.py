@@ -139,17 +139,19 @@ def cmd_analyze(a):
     if a.client:
         rows = [r for r in rows if a.client in r["client"]]
     rows = sorted((r for r in rows if r["n"]), key=lambda r: -r["max_us"])[:a.top]
-    p("\nMsgSend latency, %d slowest client -> server pairs (us):" % len(rows))
-    p("  %-34s %-22s %5s %9s %9s %9s %9s" % ("client", "server", "n", "p50", "p90", "p99", "max"))
+    p("\nMsgSend latency of trustworthy requests, %d slowest client@priority -> server pairs (us):" % len(rows))
+    p("  %-34s %-22s %5s %9s %9s %9s %9s  %s" % ("client", "server", "n", "p50", "p90", "p99", "max",
+                                               "excluded/unfinished"))
     for r in rows:
-        p("  %-34s %-22s %5d %9.1f %9.1f %9.1f %9.1f%s" % (r["client"][:34], r["server"][:22], r["n"], r["p50_us"],
-                                                         r["p90_us"], r["p99_us"], r["max_us"],
-                                                         "  (%d excluded)" % r["excluded"] if r["excluded"] else ""))
+        p("  %-34s %-22s %5d %9.1f %9.1f %9.1f %9.1f  %d/%d%s" % (
+            r["client"][:34], r["server"][:22], r["n"], r["p50_us"], r["p90_us"], r["p99_us"], r["max_us"],
+            r["excluded"], r["unfinished"], "  (%d threads)" % r["client_threads"] if r["client_threads"] > 1 else ""))
     for name, d in out["deadlines"].items():
         for srv, r in d["by_server"].items():
-            p("\ndeadline %s=%g us on %s: %d of %d requests missed, max %.1f us%s" % (
+            p("\ndeadline %s=%g us on %s: %d of %d requests missed, max %.1f us%s%s" % (
                 name, d["deadline_us"], srv, r["missed"], r["requests"], r["max_us"],
-                " (%d excluded as untrustworthy)" % r["excluded"] if r["excluded"] else ""))
+                " (%d excluded as untrustworthy)" % r["excluded"] if r["excluded"] else "",
+                " (%d unfinished)" % r["unfinished"] if r["unfinished"] else ""))
     inv = out["inversions"]
     p("\nsuspected priority inversions: %d (checked %d exchanges, %d excluded as untrustworthy, threshold %g us)" % (
         len(inv["suspected"]), inv["checked"], inv["excluded_untrustworthy"], inv["min_us"]))
@@ -195,24 +197,30 @@ def cmd_diff(a):
     for name, d in A["deadlines"].items():
         for srv in sorted(set(d["by_server"]) | set(B["deadlines"][name]["by_server"])):
             ra, rb = d["by_server"].get(srv), B["deadlines"][name]["by_server"].get(srv)
-            fmt = lambda r: "%d/%d missed, max %.1f us" % (r["missed"], r["requests"], r["max_us"]) if r else "-"
+            fmt = lambda r: "%d/%d missed, max %.1f us%s" % (
+                r["missed"], r["requests"], r["max_us"],
+                ", %d excluded, %d unfinished" % (r["excluded"], r["unfinished"])
+                if r["excluded"] or r["unfinished"] else "") if r else "-"
             p("deadline %s=%g us on %s: before %s | after %s" % (name, d["deadline_us"], srv, fmt(ra), fmt(rb)))
     p("suspected priority inversions: before %d | after %d (insufficient evidence: %d | %d)" % (
         len(A["inversions"]["suspected"]), len(B["inversions"]["suspected"]),
         len(A["inversions"]["insufficient_evidence"]), len(B["inversions"]["insufficient_evidence"])))
     fc = lambda S: ", ".join("%s chid %d" % (c["process"], c["chid"]) for c in S["fixed_priority_channels"]) or "none"
     p("fixed-priority channels: before %s | after %s" % (fc(A), fc(B)))
+    # rows are matched by role: client process, thread name and priority, and server process
     la = {(r["client"], r["server"]): r for r in A["ipc_latency"] if r["n"]}
     lb = {(r["client"], r["server"]): r for r in B["ipc_latency"] if r["n"]}
     keys = [k for k in set(la) | set(lb) if a.client is None or a.client in k[0]]
     keys.sort(key=lambda k: -abs((la.get(k) or {"p99_us": 0})["p99_us"] - (lb.get(k) or {"p99_us": 0})["p99_us"]))
     p("\nMsgSend latency (us), %d pairs with the largest p99 change:" % min(len(keys), a.top))
-    p("  %-30s %-16s %-6s %5s %9s %9s %9s %9s" % ("client", "server", "", "n", "p50", "p90", "p99", "max"))
+    p("  %-30s %-16s %-6s %5s %9s %9s %9s %9s  %s" % ("client@priority", "server", "", "n", "p50", "p90", "p99",
+                                                    "max", "excluded/unfinished"))
     for k in keys[:a.top]:
         for tag, r in (("before", la.get(k)), ("after", lb.get(k))):
             if r:
-                p("  %-30s %-16s %-6s %5d %9.1f %9.1f %9.1f %9.1f" % (k[0][:30], k[1][:16], tag, r["n"], r["p50_us"],
-                                                                    r["p90_us"], r["p99_us"], r["max_us"]))
+                p("  %-30s %-16s %-6s %5d %9.1f %9.1f %9.1f %9.1f  %d/%d" % (
+                    k[0][:30], k[1][:16], tag, r["n"], r["p50_us"], r["p90_us"], r["p99_us"], r["max_us"],
+                    r["excluded"], r["unfinished"]))
             else:
                 p("  %-30s %-16s %-6s %5s" % (k[0][:30], k[1][:16], tag, "-"))
     sa = {(r["server"], r["client"]): r["prio_us"] for r in A["server_priority_while_handling"]}

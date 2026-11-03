@@ -4,26 +4,30 @@
 handling each client, and suspected priority inversions.
 
 All analyses use trustworthy exchanges only (complete, no warnings) and report
-how many were excluded.
+how many were excluded and how many requests did not finish in the trace.
 
 Suspected priority inversion. For every instant a client at priority Pc is
 SEND- or REPLY-blocked on a server thread, the inference needs:
   * the server thread READY (runnable, not running) at priority Ps < Pc, using
     the priorities known at that instant (from the latest thread event, never
-    from a later one);
-  * every CPU the server may run on (its run mask from ThreadCtl, or all CPUs
-    when no run mask was traced) busy with a thread above Ps, and at least
-    one of those below Pc. Those threads are the evidence.
-The client's wait is split at every state change of client and server, every
-context switch on the eligible CPUs and every run-mask change. While SEND-
-blocked, the dependency is the eventual receiver only when it is the only
-thread seen receiving on that channel. Intervals where a CPU's occupant, a
-state or a priority is unknown, or where an eligible CPU ran something at or
-below the server's priority (the scheduler state is not explained by the
-trace), count as insufficient evidence. A request is reported as a suspected
-inversion when the evidence covers at least min_us; when an unexplained
-low-priority READY server covers min_us instead, it is reported as
-"insufficient evidence" with the reasons.
+    from a later one), under FIFO, round-robin or other scheduling (not
+    sporadic) and with no adaptive partitioning events in the trace;
+  * the server's run mask known at that instant (traced ThreadCtl, not
+    invalidated by lost events or by receiving on a channel that may pass the
+    client's mask on), naming at least one CPU of the trace;
+  * every CPU in that mask busy with a thread above Ps, and at least one of
+    those threads below Pc. Those threads are the evidence.
+While the client is SEND-blocked, the eventual receiver is the dependency only
+when it is provably the only thread of its process: the process was created
+during the trace (or its threads were listed at trace start) and no other
+thread of it was alive. The client's wait is split at every state change of
+client and server, every context switch on the eligible CPUs and every
+run-mask change. Anything else that could explain a low-priority READY server
+(unknown mask, occupant, state or priority, an eligible CPU running something
+at or below Ps, several possible receivers) counts as insufficient evidence. A
+request is reported as a suspected inversion when the evidence covers at least
+min_us; when unexplained time does instead, it is reported as "insufficient
+evidence" with the reasons.
 """
 from __future__ import annotations
 
@@ -31,7 +35,7 @@ import bisect
 from collections import Counter, defaultdict
 
 from .events import state_name
-from .model import ST_READY, ST_RECEIVE, ST_REPLY, ST_RUNNING, ST_SEND, ST_UNKNOWN, UNKNOWN
+from .model import SCHED_SPORADIC, ST_DEAD, ST_DESTROY, ST_READY, ST_RUNNING, ST_SEND, ST_REPLY, ST_UNKNOWN, UNKNOWN
 
 
 def us(model, cyc):
@@ -44,6 +48,10 @@ def pct(sorted_vals, p):
         return None
     k = max(0, min(len(sorted_vals) - 1, -(-len(sorted_vals) * p // 100) - 1))
     return sorted_vals[int(k)]
+
+
+def mask_cpus(mask, cpus):
+    return [x for x in cpus if (mask >> x) & 1]
 
 
 class Timeline:
@@ -83,6 +91,11 @@ class Timeline:
             return None, None
         s = sts[i]
         return s[1], (None if s[1] == ST_UNKNOWN else s[2])
+
+    def policy_at(self, key, ts):
+        tss, sts = self._st(key)
+        i = bisect.bisect_right(tss, ts) - 1
+        return sts[i][5] if i >= 0 and len(sts[i]) > 5 else None
 
     def prio_at(self, key, ts):
         if key is None or key == UNKNOWN:
@@ -130,6 +143,7 @@ class Timeline:
         return starts[i:j]
 
     def runmask_at(self, key, ts):
+        """The run mask traced for the thread at ts, or None when it is not known."""
         t = self.m.threads.get(key)
         mask = None
         if t:
@@ -145,48 +159,40 @@ class Timeline:
         return [w for w, _ in (t.runmask if t else []) if t0 < w < t1]
 
     def _handled_index(self, server):
-        """Requests the server thread received and replied to, sorted by receive time, with the
-        running maximum of their reply times (to stop scanning early)."""
+        """Requests the server thread received, sorted by receive time, each open until its reply call (or the
+        end of the trace when it was never replied to), with the running maximum of those ends."""
         cache = self.__dict__.setdefault("_handled_cache", {})
         v = cache.get(server)
         if v is None:
-            lst = sorted((t for t in self.m.txns if t.server == server and t.t_rx_exit is not None
-                          and t.t_reply_call is not None), key=lambda t: t.t_rx_exit)
+            lst = sorted((t for t in self.m.txns if t.server == server and t.t_rx_exit is not None),
+                         key=lambda t: t.t_rx_exit)
+            ends = [t.t_reply_call if t.t_reply_call is not None else self.end for t in lst]
             reach, mx = [], -1
-            for t in lst:
-                mx = max(mx, t.t_reply_call)
+            for e in ends:
+                mx = max(mx, e)
                 reach.append(mx)
-            v = cache[server] = (lst, [t.t_rx_exit for t in lst], reach)
+            v = cache[server] = (lst, [t.t_rx_exit for t in lst], reach, ends)
         return v
-
-    def _handled(self, server):
-        return self._handled_index(server)[0]
-
-    def handling_at(self, server, ts):
-        """The request the server thread was handling at ts (received, not yet replied); the latest
-        received one when several are open."""
-        lst, rx, reach = self._handled_index(server)
-        i = bisect.bisect_right(rx, ts) - 1
-        while i >= 0 and reach[i] > ts:
-            if ts < lst[i].t_reply_call:
-                return lst[i]
-            i -= 1
-        return None
 
     def open_at(self, server, ts):
         """All requests the server thread had received and not yet replied to at ts."""
-        lst, rx, reach = self._handled_index(server)
+        lst, rx, reach, ends = self._handled_index(server)
         out = []
         i = bisect.bisect_right(rx, ts) - 1
         while i >= 0 and reach[i] > ts:
-            if ts < lst[i].t_reply_call:
+            if ts < ends[i]:
                 out.append(lst[i])
             i -= 1
         return out
 
+    def handling_at(self, server, ts):
+        """The one request the server thread was handling at ts, or None (none, or several open)."""
+        o = self.open_at(server, ts)
+        return o[0] if len(o) == 1 else None
+
     def next_received_after(self, server, ts):
         """The first request the server thread received after ts, or None."""
-        lst, rx, _ = self._handled_index(server)
+        lst, rx, _, _ = self._handled_index(server)
         i = bisect.bisect_right(rx, ts)
         return lst[i] if i < len(lst) else None
 
@@ -203,36 +209,53 @@ class Timeline:
             return lst[i]
         return None
 
+    def sole_thread(self, key, t0, t1):
+        """True when `key` is provably the only live thread of its process during [t0, t1]."""
+        m = self.m
+        p = m.processes.get(key[0])
+        if p is None or (p.created_ts is None and key[0] not in m.injected_pids):
+            return False      # threads that existed before the trace may never show up
+        for other, t in m.threads.items():
+            if other[0] != key[0] or other == key or not t.states:
+                continue
+            if t.states[0][0] > t1:
+                continue
+            gone = [s[0] for s in t.states if s[1] in (ST_DEAD, ST_DESTROY)]
+            if gone and gone[0] <= t0:
+                continue
+            return False
+        return True
 
-def _channel(tx):
-    return (tx.server_pid, tx.info.get("chid")) if tx.info else (tx.server_pid, None)
+
+def thread_key(model, key, prio):
+    """Role of a client thread for comparisons: (process name, thread name, priority)."""
+    t = model.threads.get(key)
+    p = model.processes.get(key[0])
+    return (p.name if p else "pid%d" % key[0], t.name if t and t.name else "tid%d" % key[1], prio)
 
 
-def receivers_by_channel(model):
-    """{(server pid, chid or None): set of threads seen receiving there} from REC_MESSAGE."""
-    out = defaultdict(set)
-    for tx in model.txns:
-        if tx.server is not None:
-            out[_channel(tx)].add(tx.server)
-            out[(tx.server_pid, None)].add(tx.server)
-    return out
+def role_label(role):
+    return "%s/%s%s" % (role[0], role[1], "@%s" % role[2] if role[2] is not None else "")
 
 
 def ipc_latency(model):
+    """Rows per (client role, server process): trustworthy requests, excluded and unfinished counts."""
     groups = defaultdict(list)
-    excluded = defaultdict(int)
+    excluded, unfinished, keys = defaultdict(int), defaultdict(int), defaultdict(set)
     for t in model.txns:
+        g = (role_label(thread_key(model, t.client, t.client_prio)), model.server_name(t))
+        keys[g].add(t.client)
         if t.t_call is None or t.t_exit is None:
-            continue
-        g = (model.label(t.client), model.server_name(t))
-        if t.trustworthy:
+            unfinished[g] += 1
+        elif t.trustworthy:
             groups[g].append(us(model, t.t_exit - t.t_call))
         else:
             excluded[g] += 1
     out = []
-    for (c, s) in sorted(set(groups) | set(excluded)):
+    for (c, s) in sorted(set(groups) | set(excluded) | set(unfinished)):
         v = sorted(groups.get((c, s), []))
-        row = {"client": c, "server": s, "n": len(v), "excluded": excluded.get((c, s), 0)}
+        row = {"client": c, "server": s, "n": len(v), "excluded": excluded.get((c, s), 0),
+               "unfinished": unfinished.get((c, s), 0), "client_threads": len(keys[(c, s)])}
         if v:
             row.update({"min_us": round(v[0], 1), "p50_us": round(pct(v, 50), 1), "p90_us": round(pct(v, 90), 1),
                         "p99_us": round(pct(v, 99), 1), "max_us": round(v[-1], 1)})
@@ -241,13 +264,17 @@ def ipc_latency(model):
 
 
 def deadline_misses(model, thread_name, deadline_us):
-    """{server process: {requests, missed, max_us, excluded}} for client threads with this name."""
+    """{server process: {requests, missed, max_us, excluded, unfinished}} for client threads with this name."""
     out = {}
     for t in model.txns:
         th = model.threads.get(t.client)
-        if not th or th.name != thread_name or t.t_call is None or t.t_exit is None:
+        if not th or th.name != thread_name:
             continue
-        r = out.setdefault(model.server_name(t), {"requests": 0, "missed": 0, "max_us": 0.0, "excluded": 0})
+        r = out.setdefault(model.server_name(t), {"requests": 0, "missed": 0, "max_us": 0.0, "excluded": 0,
+                                                 "unfinished": 0})
+        if t.t_call is None or t.t_exit is None:
+            r["unfinished"] += 1
+            continue
         if not t.trustworthy:
             r["excluded"] += 1
             continue
@@ -258,21 +285,41 @@ def deadline_misses(model, thread_name, deadline_us):
     return out
 
 
+SEVERAL = "(several requests open)"
+
+
 def server_priority_while_handling(model, tl=None):
-    """{(server thread, client thread): {prio: us}}: the priority the server thread ran at while handling
-    each client's request (from receive to reply), time-weighted."""
+    """{(server thread, client thread): {prio: us}}: the priority each server thread ran at while it held
+    exactly one received request, credited to that request's client. Running time while it held several is
+    credited once, to (server, SEVERAL); time while the only open request is untrustworthy is left out."""
     tl = tl or Timeline(model)
     out = defaultdict(lambda: defaultdict(float))
-    for tx in model.txns:
-        if not tx.trustworthy:
+    for srv in {t.server for t in model.txns if t.server is not None and t.t_rx_exit is not None}:
+        lst, rx, _, ends = tl._handled_index(srv)
+        if not lst:
             continue
-        for a, b, code, prio in tl.segments(tx.server, tx.t_rx_exit, tx.t_reply_call):
-            if code == ST_RUNNING and prio is not None:
-                out[(model.label(tx.server), model.label(tx.client))][prio] += us(model, b - a)
+        cuts = sorted(set(rx) | set(ends))
+        for a, b in zip(cuts, cuts[1:]):
+            opened = tl.open_at(srv, a)
+            if not opened:
+                continue
+            if len(opened) > 1:
+                who = SEVERAL
+            elif opened[0].trustworthy:
+                who = model.label(opened[0].client)
+            else:
+                continue
+            for c, d, code, prio in tl.segments(srv, a, b):
+                if code == ST_RUNNING and prio is not None:
+                    out[(model.label(srv), who)][prio] += us(model, d - c)
     return {k: dict(v) for k, v in out.items()}
 
 
-def _inversion(tl, tx, receivers):
+def _channel(tx):
+    return (tx.server_pid, tx.info.get("chid", tx.rx_chid))
+
+
+def _inversion(tl, tx):
     """Evidence for one exchange: (inversion cycles, unexplained cycles, culprits, reasons, details)."""
     m = tl.m
     srv = tx.server
@@ -284,15 +331,8 @@ def _inversion(tl, tx, receivers):
     for a, b, ccode, _cp in tl.segments(tx.client, tx.t_call, tx.t_exit):
         if ccode not in (ST_SEND, ST_REPLY):
             continue
-        if ccode == ST_SEND and tx.t_rx_exit is not None:
-            rset = receivers.get(_channel(tx)) or {srv}
-            if len(rset) > 1:
-                # several threads receive on this channel: the eventual receiver is not the only dependency
-                lo_ready = sum(d - c for c, d, sc, sp in tl.segments(srv, a, b) if sc == ST_READY)
-                if lo_ready:
-                    unk += lo_ready
-                    reasons["%d threads receive on this channel" % len(rset)] += lo_ready
-                continue
+        send_phase = ccode == ST_SEND and (tx.t_rx_exit is None or a < tx.t_rx_exit)
+        sole = not send_phase or tl.sole_thread(srv, a, b)
         for c, d, scode, sprio in tl.segments(srv, a, b):
             if scode in (None, ST_UNKNOWN):
                 unk += d - c
@@ -307,6 +347,18 @@ def _inversion(tl, tx, receivers):
                 continue
             if sprio >= pc:
                 continue
+            if not sole:
+                unk += d - c
+                reasons["other threads of %s may receive on the channel" % m.server_name(tx)] += d - c
+                continue
+            if m.aps_seen:
+                unk += d - c
+                reasons["adaptive partitioning in use: budgets not evaluated"] += d - c
+                continue
+            if tl.policy_at(srv, c) == SCHED_SPORADIC:
+                unk += d - c
+                reasons["server uses sporadic scheduling"] += d - c
+                continue
             cuts = {c, d}
             for cpu in tl.cpus:
                 cuts.update(tl.switch_times(cpu, c, d))
@@ -314,7 +366,15 @@ def _inversion(tl, tx, receivers):
             cuts = sorted(cuts)
             for e, f in zip(cuts, cuts[1:]):
                 mask = tl.runmask_at(srv, e)
-                cpus = [x for x in tl.cpus if mask is None or (mask >> x) & 1]
+                if mask is None:
+                    unk += f - e
+                    reasons["run mask of %s not traced" % m.label(srv)] += f - e
+                    continue
+                cpus = mask_cpus(mask, tl.cpus)
+                if not cpus:
+                    unk += f - e
+                    reasons["run mask 0x%x names no CPU of the trace" % mask] += f - e
+                    continue
                 occ = [(x, tl.occupant(x, e)) for x in cpus]
                 missing = [x for x, o in occ if o is None or o == UNKNOWN]
                 if missing:
@@ -329,8 +389,7 @@ def _inversion(tl, tx, receivers):
                 low = [(x, o, p) for x, o, p in prios if p <= sprio]
                 if low:
                     x, o, p = low[0]
-                    reasons["CPU %d ran %s at prio %d, not above the server's %d%s" % (
-                        x, m.label(o), p, sprio, "" if mask is not None else " (no run mask traced)")] += f - e
+                    reasons["CPU %d ran %s at prio %d, not above the server's %d" % (x, m.label(o), p, sprio)] += f - e
                     unk += f - e
                     continue
                 blockers = [(x, o, p) for x, o, p in prios if p < pc]
@@ -353,7 +412,6 @@ def suspected_inversions(model, tl=None, min_us=100.0):
     """{"suspected": [...], "insufficient_evidence": [...], "checked": n, "excluded_untrustworthy": n}"""
     tl = tl or Timeline(model)
     m = model
-    receivers = receivers_by_channel(m)
     found, unclear = [], []
     checked = excluded = 0
     for tx in m.txns:
@@ -363,7 +421,7 @@ def suspected_inversions(model, tl=None, min_us=100.0):
             excluded += 1
             continue
         checked += 1
-        inv, unk, culprits, reasons, d = _inversion(tl, tx, receivers)
+        inv, unk, culprits, reasons, d = _inversion(tl, tx)
         inv_us, unk_us = us(m, inv), us(m, unk)
         if inv_us < min_us and unk_us < min_us:
             continue
@@ -371,14 +429,15 @@ def suspected_inversions(model, tl=None, min_us=100.0):
         row = {"txn": tx.idx, "client": m.label(tx.client), "client_prio": pc, "server": m.label(tx.server),
                "latency_us": round(us(m, tx.t_exit - tx.t_call), 1)}
         if inv_us >= min_us:
-            masks = sorted("0x%x" % x for x in d["masks"] if x is not None)
+            ms = sorted(d["masks"])
+            cpus = sorted({x for mk in ms for x in mask_cpus(mk, tl.cpus)})
             row.update({
                 "verdict": "suspected priority inversion",
                 "inversion_us": round(inv_us, 1),
                 "while": {k: round(us(m, v), 1) for k, v in d["phase"].items()},
                 "server_prio_while_ready": min(d["sprios"]),
-                "server_run_mask": masks[0] if len(masks) == 1 and None not in d["masks"] else (
-                    "not traced (all CPUs assumed)" if None in d["masks"] else masks),
+                "server_run_mask": ", ".join("0x%x" % x for x in ms),
+                "eligible_cpus": cpus,
                 "preempted_by": [{"thread": m.label(k), "prio": p, "cpu": cpu, "us": round(us(m, v), 1)}
                                  for (k, p, cpu), v in sorted(culprits.items(), key=lambda x: -x[1])],
                 "server_busy_with": [{"txn": h.idx, "client": m.label(h.client)} for h in d["busy"]],
@@ -387,12 +446,11 @@ def suspected_inversions(model, tl=None, min_us=100.0):
             top = row["preempted_by"][0]
             row["evidence"] = (
                 "%s (prio %s) waited %.1f us in MsgSend; for %.1f us of it (%s) %s was READY at prio %d while "
-                "every CPU it may run on (%s) ran threads above %d and below %s, most of all %s (prio %d) on CPU %d "
-                "for %.1f us%s." % (
+                "every CPU it may run on (CPU %s, run mask %s) ran a thread above prio %d, at least one of them "
+                "below the client's %s; most of the time %s (prio %d) on CPU %d, %.1f us%s." % (
                     row["client"], pc, row["latency_us"], row["inversion_us"],
                     ", ".join("%s-blocked %.1f us" % kv for kv in row["while"].items()), row["server"],
-                    row["server_prio_while_ready"], "run mask %s" % row["server_run_mask"]
-                    if isinstance(row["server_run_mask"], str) else row["server_run_mask"],
+                    row["server_prio_while_ready"], ",".join(map(str, cpus)), row["server_run_mask"],
                     row["server_prio_while_ready"], pc, top["thread"], top["prio"], top["cpu"], top["us"],
                     "; the server was busy with %s" % ", ".join("%s's request (txn %d)" % (b["client"], b["txn"])
                                                                for b in row["server_busy_with"])

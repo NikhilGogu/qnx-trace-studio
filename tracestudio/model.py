@@ -3,44 +3,55 @@
 """Reconstruct system state from decoded QNX kernel events.
 
 Produces processes and threads (names, state intervals, priorities, run
-masks), per-CPU context switches, proven wakeups, interrupts, pulses, and
-message-passing transactions (MsgSend -> MsgReceive -> MsgReply -> client
+masks), per-CPU context switches, wakeups with evidence, interrupts, pulses,
+and message-passing transactions (MsgSend -> MsgReceive -> MsgReply -> client
 unblock).
 
 Linking rules, all from kernel events, none from message payloads:
   * A kernel call or COMM event belongs to the thread running on its CPU (the
-    last non-injected THRUNNING there). This is an inference: after lost
-    events, a migration or at trace start the CPU's thread is UNKNOWN and its
-    events are counted as actorless and not linked. Partial combine events are
-    counted and not linked either.
+    last non-injected THRUNNING there). This is an inference: inside a loss
+    window of that CPU, after a migration or at trace start the CPU's thread
+    is UNKNOWN and its events are counted as actorless and not linked. Partial
+    combine events are counted and not linked; a partial thread event sets
+    the thread UNKNOWN and never restores a CPU's occupant.
   * SND_MESSAGE(rcvid, server pid) inside the sender's MsgSendv opens a
     transaction keyed by (server pid, rcvid). An rcvid names one pending
     message, so the key is unique while the client is blocked and is reused
     after. Every index (by client, by rcvid, received-not-replied per server
-    thread, replying) is cleaned by object identity, so a late or duplicate
-    completion can never remove a newer transaction that reuses a key.
+    thread, replying) is cleaned by object identity, and a REPLY_MESSAGE that
+    does not belong to the reply call in progress is quarantined before it can
+    touch any transaction.
   * REC_MESSAGE(rcvid, pid) names the receiving thread, MsgReceivev exit adds
     _msg_info (wide mode); an _msg_info that names another sender is kept
     aside and marks the transaction untrustworthy. MsgReplyv/MsgError entry
     with the rcvid and REPLY_MESSAGE/MSG_ERROR(tid, pid) close the server side;
     MsgSendv exit (or INT_CALL) on the client ends it.
   * A request sent by a thread that has exactly one received, unreplied
-    request is its child (nested request across servers). With several
-    outstanding requests the parent is ambiguous: the candidates are recorded,
-    no parent is set.
-  * Lost events (kev.Loss) close the CPU (its occupant becomes UNKNOWN), set
-    every thread that could have changed state there to UNKNOWN until its next
-    event, flag all open exchanges and make pulse matching uncertain.
-  * A READY is a proven wakeup only when it happens inside a kernel call of
-    the thread running on that CPU that addressed the woken thread: a message
-    or pulse sent to its process while it was RECEIVE-blocked, a reply or
-    error naming it, or a SyncMutexUnlock/CondvarSignal/SemPost releasing a
-    thread blocked in the matching state.
+    request is its child. With several the parent is ambiguous: candidates
+    are recorded, no parent is set, and the request carries a warning.
+  * Lost events (kev.Loss) define loss windows. Inside a window of its CPU no
+    event has a known actor and no switch is trusted; every thread that could
+    have changed state is UNKNOWN from the window's start until its first
+    event after the window ends (an event inside a window holds only at its
+    instant); open exchanges are flagged; run masks, coid paths, kernel calls
+    in progress and pulse queue synchronisation are dropped.
+  * A wakeup is attributed only with object evidence: the woken thread later
+    receives the very message or pulse sent in the waker's call, or the reply
+    in the waker's MsgReplyv/MsgError names it.
   * Pulses: a sender is known only for a pulse emitted inside the sending
     thread's MsgSendPulse (or MsgDeliverEvent, ConnectDetach for the kernel
     pulses those calls generate). A receive matches a send only when exactly
-    one pulse is queued for that (server pid, scoid) and nothing made the
-    queue uncertain; otherwise the candidates and a confidence are recorded.
+    one pulse is queued for that (server pid, scoid) and the queue is in sync:
+    queues start unsynchronised, lose sync at every loss and after every
+    ambiguous receive, and regain it when a receiving thread blocks in RECEIVE
+    on the channel the pulses arrive on (so nothing is pending there).
+  * Paths: a coid gets a path only when the PATHMGR event of the opening
+    thread is followed by a ConnectAttach within 10 ms and the first message on
+    the new coid is an _IO_CONNECT that the server answers without error.
+  * Message names: _IO_* names are given only for resource-manager
+    connections (procnto, a coid confirmed by an _IO_CONNECT, a channel that
+    answered an _IO_CONNECT, or the answered _IO_CONNECT itself); otherwise
+    the message is described by its type number.
 A transaction is complete when its whole path was seen, and trustworthy when
 it is complete and carries no warnings. Analyses use trustworthy ones only.
 """
@@ -57,22 +68,26 @@ from .kev import C_COMM, C_INT, C_KERCALL, C_PRTH, C_SYSTEM, KevFile
 
 ST_UNKNOWN = -1
 ST_DEAD, ST_RUNNING, ST_READY, ST_STOPPED, ST_SEND, ST_RECEIVE, ST_REPLY = range(7)
-ST_MUTEX, ST_CONDVAR, ST_SEM, ST_MUON_MUTEX = 13, 14, 17, 26
+ST_DESTROY = 25
 NOT_BLOCKED = (None, ST_UNKNOWN, ST_RUNNING, ST_READY)
 BLOCKED_IPC = {"SEND", "RECEIVE", "REPLY"}
 UNKNOWN = (-1, 0)          # pseudo thread: what ran on a CPU is not known
 PROCNTO_PID = 1
+INF = float("inf")
 _NTO_CHF_FIXED_PRIORITY = 0x1
+_NTO_CHF_INHERIT_RUNMASK = 0x4000
 _NTO_TCTL_RUNMASK = 4
 _RUNMASK_BY_POINTER = (6, 7, 10)   # _GET_AND_SET, _GET_AND_SET_64, _GET_AND_SET_INHERIT
+SCHED_SPORADIC = 4
 SEND_CALLS = ("MSG_SENDV", "MSG_SENDVNC")
 REPLY_CALLS = ("MSG_REPLYV", "MSG_ERROR")
+RECEIVE_CALLS = ("MSG_RECEIVEV", "MSG_RECEIVEPULSEV")
 PULSE_CALLS = ("MSG_SEND_PULSE", "MSG_SEND_PULSEPTR")
 # kernel call of the running thread that proves who sent a pulse of this kind
 PULSE_SENDER_CALLS = {COMM_SPULSE: PULSE_CALLS, COMM_SPULSE_EXE: ("MSG_DELIVER_EVENT",),
                       COMM_SPULSE_DIS: ("CONNECT_DETACH",)}
-SYNC_WAKE = {"SYNC_MUTEX_UNLOCK": (ST_MUTEX, ST_MUON_MUTEX), "SYNC_CONDVAR_SIGNAL": (ST_CONDVAR,),
-             "SYNC_SEM_POST": (ST_SEM,)}
+APS_SYSTEM_CODES = {3, 4, 5, 22, 23, 24, 25, 26, 27}
+IO_CONNECT = 0x100
 
 
 @dataclass
@@ -80,9 +95,9 @@ class Thread:
     pid: int
     tid: int
     name: str = ""
-    states: list = field(default_factory=list)    # (ts, state code, prio or None, cpu, injected)
+    states: list = field(default_factory=list)    # (ts, state code, prio or None, cpu, injected, policy or None)
     prios: list = field(default_factory=list)     # (ts, prio) on change
-    runmask: list = field(default_factory=list)   # (ts, mask or None) from ThreadCtl
+    runmask: list = field(default_factory=list)   # (ts, mask or None) from ThreadCtl; None: not known
 
     @property
     def key(self):
@@ -95,6 +110,7 @@ class Process:
     ppid: int = 0
     path: str = ""
     destroyed_ts: int | None = None
+    created_ts: int | None = None       # PROCCREATE seen in the trace: every thread of it is traced
 
     @property
     def name(self):
@@ -110,13 +126,18 @@ class Txn:
     t_smsg: int
     coid: int | None = None
     msg: tuple = ()
-    msg_type: str | None = None          # _IO_* or system message name from msg[0]
-    path: str | None = None              # path the client opened this coid with (PATHMGR + ConnectAttach)
+    msg_type: str | None = None          # _IO_* or system message name, when the protocol is established
+    msg_desc: str | None = None          # "type 0x...." when it is not
+    rm_conn: bool = False                # the coid was confirmed as a resource-manager connection
+    path: str | None = None              # path the coid was opened with (confirmed open)
+    path_candidate: str | None = None
     t_call: int | None = None
     client_block: str | None = None      # SEND or REPLY: first blocked state after the send
+    client_prio: int | None = None
     server: tuple | None = None
     t_rmsg: int | None = None
     t_rx_exit: int | None = None
+    rx_chid: int | None = None           # channel the receiving thread was receiving on
     info: dict = field(default_factory=dict)
     info_conflict: dict | None = None    # _msg_info that names another sender (quarantined)
     replier: tuple | None = None
@@ -157,9 +178,8 @@ class Pulse:
     t_recv: int | None = None
     receiver: tuple | None = None
     cpu: int | None = None          # CPU the send was emitted on
-    match: str | None = None        # unique, ambiguous, none (received, no traced send); None: not received
+    match: str | None = None        # unique, ambiguous, unsynced, none (no traced send), unseen; None: not received
     candidates: list = field(default_factory=list)
-    confidence: float | None = None
 
 
 @dataclass(eq=False)
@@ -168,10 +188,10 @@ class Call:
     ts: int
     cpu: int
     args: dict
-    sent_msg: set = field(default_factory=set)      # server pids messaged in this call
-    sent_pulse: set = field(default_factory=set)    # server pids pulsed in this call
-    replied: set = field(default_factory=set)       # client keys replied to in this call
-    deferred: list = field(default_factory=list)    # READYs from RECEIVE seen before this call's SND_PULSE*
+    sent: list = field(default_factory=list)        # (server pid, rcvid) of SND_MESSAGE in this call
+    pulses: list = field(default_factory=list)      # Pulse objects sent in this call (proven sender)
+    replied: set = field(default_factory=set)       # client keys named by REPLY_MESSAGE in this call
+    ready: list = field(default_factory=list)       # (ts, cpu, woken, prio) READY from RECEIVE in this call
 
 
 class Model:
@@ -180,17 +200,20 @@ class Model:
         self.processes: dict[int, Process] = {}
         self.threads: dict[tuple, Thread] = {}
         self.switches = []      # (ts, cpu, prev key|None|UNKNOWN, prev state, prev prio, next key|UNKNOWN, next prio)
-        self.wakeups = []       # (ts, cpu, waker key, woken key, prio, how)
+        self.wakeups = []       # (ts, cpu, waker key, woken key, prio, evidence)
         self.interrupts = []    # (ts, cpu, intr_id)
         self.txns: list[Txn] = []
         self.pulses: list[Pulse] = []
         self.channels = {}      # (pid, chid) -> dict(flags, tid, ts)
         self.connections = {}   # (pid, coid) -> (server pid, chid)
-        self.coid_paths = {}    # (pid, coid) -> path
+        self.coid_paths = {}    # (pid, coid) -> path, confirmed opens only
         self.signals = []
         self.gaps = []          # kev.Loss records applied, in time order
+        self.loss_windows = {}  # cpu -> [(t0, t1)]
         self.counters = defaultdict(int)
         self.wide = None        # True when thread events carry priorities
+        self.aps_seen = False   # adaptive partitioning events in the trace
+        self.injected_pids = set()
         evs = kev.events()
         self.start_ts = evs[0].ts if evs else 0
         self.end_ts = evs[-1].ts if evs else 0
@@ -204,8 +227,15 @@ class Model:
         self._handling = defaultdict(list)   # server thread -> [Txn] received, not yet replied
         self._replying = {}           # server thread -> Txn between MsgReplyv entry and exit
         self._pulse_q = defaultdict(deque)   # (server pid, scoid) -> sent, not yet received
-        self._pulse_uncertain = set()
+        self._pulse_synced = set()    # pulse queues known to be in step with the channel
+        self._scoid_chan = {}         # (server pid, scoid) -> chid the pulses are received on
         self._last_path = {}          # thread key -> (ts, path) from the latest PATHMGR event
+        self._coid_candidate = {}     # (pid, coid) -> path waiting for its _IO_CONNECT
+        self._rm_coids = set()        # (pid, coid) confirmed resource-manager connections
+        self._rm_channels = set()     # (server pid, chid) that answered an _IO_CONNECT
+        self._uncertain = {}          # thread key -> end of the loss window its state depends on
+        self._wake_msg = {}           # (server pid, rcvid) -> READY waiting for its REC_MESSAGE
+        self._wake_pulse = {}         # woken key -> (READY, Pulse) waiting for its REC_PULSE
         self._run(evs)
 
     # ---- helpers ----------------------------------------------------------
@@ -259,14 +289,34 @@ class Model:
         p = self.processes.get(tx.server_pid)
         return p.name if p else "pid%d" % tx.server_pid
 
+    def in_loss(self, cpu, ts):
+        for a, b in self.loss_windows.get(cpu, ()):
+            if a <= ts < b:
+                return True
+        return False
+
+    def loss_end_at(self, ts):
+        """Latest end of the loss windows (any CPU) that contain ts, or None."""
+        end = None
+        for lst in self.loss_windows.values():
+            for a, b in lst:
+                if a <= ts < b and (end is None or b > end):
+                    end = b
+        return end
+
     # ---- main pass --------------------------------------------------------
     def _run(self, evs):
-        gaps = sorted((l for l in self.kev.losses if l.t0 is not None), key=lambda l: l.t0)
+        gaps = []
+        for l in self.kev.losses:
+            t0 = l.t0 if l.t0 is not None else self.start_ts - 1
+            t1 = l.t1 if l.t1 is not None else INF
+            gaps.append((t0, t1, l))
+            self.loss_windows.setdefault(l.cpu, []).append((t0, t1))
+        gaps.sort(key=lambda g: g[0])
         gi = 0
-        c = self.counters
         for ev in evs:
-            while gi < len(gaps) and gaps[gi].t0 < ev.ts:
-                self._gap(gaps[gi])
+            while gi < len(gaps) and gaps[gi][0] < ev.ts:
+                self._gap(*gaps[gi])
                 gi += 1
             cls = ev.cls
             if cls == C_PRTH:
@@ -281,33 +331,76 @@ class Model:
             elif cls == C_INT:
                 if ev.code == INT_DELIVER and ev.words:
                     self.interrupts.append((ev.ts, ev.cpu, ev.words[0]))
-            elif cls == C_SYSTEM and ev.code & 0x1FF == 2 and not ev.partial:   # PATHMGR
-                a = unpack(ev.words, "pid:d tid:d path:s")
-                if "path" in a:
-                    self._last_path[(a["pid"], a["tid"])] = (ev.ts, a["path"])
+            elif cls == C_SYSTEM:
+                base = ev.code & 0x1FF
+                if base in APS_SYSTEM_CODES:
+                    self.aps_seen = True
+                elif base == 2 and not ev.partial:   # PATHMGR
+                    a = unpack(ev.words, "pid:d tid:d path:s")
+                    if "path" in a:
+                        self._last_path[(a["pid"], a["tid"])] = (ev.ts, a["path"])
         for g in gaps[gi:]:
-            self._gap(g)
+            self._gap(*g)
+        self._finish()
+
+    def _finish(self):
+        c = self.counters
         for tx in {id(t): t for t in list(self._by_client.values()) + list(self._by_rcvid.values())}.values():
             tx.warnings.append("still open at end of trace")
+        # an exchange whose lifetime overlaps any loss window may miss events on that CPU
+        for tx in self.txns:
+            a = tx.t_call if tx.t_call is not None else tx.t_smsg
+            b = tx.t_exit if tx.t_exit is not None else self.end_ts
+            for cpu, lst in self.loss_windows.items():
+                if any(w0 < b and a < w1 for w0, w1 in lst):
+                    note = "spans lost events on cpu %d" % cpu
+                    if note not in tx.warnings:
+                        tx.warnings.append(note)
+        for key in self._wake_msg:
+            c["wakeups_without_evidence"] += 1
+        c["wakeups_without_evidence"] += len(self._wake_pulse)
+        self._name_messages()
         c["txns"] = len(self.txns)
         c["txns_complete"] = sum(1 for t in self.txns if t.complete)
         c["txns_trustworthy"] = sum(1 for t in self.txns if t.trustworthy)
 
+    def _name_messages(self):
+        for tx in self.txns:
+            if not tx.msg:
+                continue
+            m0 = tx.msg[0]
+            t = m0 & 0xFFFF
+            name = msg_type_name(m0, True)
+            to_procnto = tx.server_pid == PROCNTO_PID
+            answered_connect = t == IO_CONNECT and tx.outcome == "replied" and (tx.status or 0) >= 0
+            rm = to_procnto or tx.rm_conn or answered_connect or \
+                (tx.server_pid, tx.info.get("chid")) in self._rm_channels
+            if name and (rm if t >= 0x100 else to_procnto):
+                tx.msg_type = name
+            else:
+                tx.msg_desc = "type 0x%04x" % t
+                if name and t >= 0x100:
+                    tx.msg_desc += " (%s on a resource-manager connection)" % name
+                    self.counters["io_names_not_qualified"] += 1
+
     def _actor(self, ev):
+        if ev.partial:
+            self.counters["partial_events_not_linked"] += 1
+            return None
+        if self.loss_windows and self.in_loss(ev.cpu, ev.ts):
+            self.counters["events_in_loss_window"] += 1
+            return None
         k = self._running.get(ev.cpu)
         if k is None or k == UNKNOWN:
             self.counters["events_without_actor"] += 1
-            return None
-        if ev.partial:
-            self.counters["partial_events_not_linked"] += 1
             return None
         if self.state_at(k) != ST_RUNNING:
             self.counters["actor_not_running"] += 1
         return k
 
     # ---- lost events ------------------------------------------------------
-    def _gap(self, loss):
-        cpu, t0 = loss.cpu, loss.t0
+    def _gap(self, t0, t1, loss):
+        cpu = loss.cpu
         self.gaps.append(loss)
         self.counters["lost_event_gaps"] += 1
         old = self._running.get(cpu)
@@ -315,8 +408,6 @@ class Model:
             self.switches.append((t0, cpu, old, self.state_at(old) if old else None,
                                   self.prio_of(old) if old else None, UNKNOWN, None))
             self._running[cpu] = UNKNOWN
-            if old is not None:
-                self._end_call(old)
         note = "spans lost events on cpu %d" % cpu
         open_txns = {id(t): t for t in list(self._by_client.values()) + list(self._by_rcvid.values())
                      + list(self._replying.values()) + [x for lst in self._handling.values() for x in lst]}
@@ -325,15 +416,24 @@ class Model:
                 tx.warnings.append(note)
         for ps in self._pend_send.values():
             ps[3] = True
-        self._pulse_uncertain.update(self._pulse_q.keys())
+        for key in list(self._in_call):     # the rest of any call in progress may be in the lost events
+            self._end_call(key)
+        self._pulse_synced.clear()
+        self.coid_paths.clear()
+        self._coid_candidate.clear()
+        self._rm_coids.clear()
+        self._last_path.clear()
+        self._wake_msg.clear()
+        self._wake_pulse.clear()
         for key, t in self.threads.items():
-            if not t.states or t.states[-1][1] == ST_UNKNOWN or self.is_idle(key):
+            if self.is_idle(key):
                 continue
-            oc = self._where.get(key)
-            # a thread running on another CPU, whose events are intact, keeps its state
-            if oc is not None and oc != cpu and self._running.get(oc) == key:
-                continue
-            t.states.append((t0, ST_UNKNOWN, None, cpu, False))
+            if t.runmask and t.runmask[-1][1] is not None:
+                t.runmask.append((t0, None))
+            if t.states and t.states[-1][1] != ST_UNKNOWN:
+                t.states.append((t0, ST_UNKNOWN, None, cpu, False, None))
+            if t.states:
+                self._uncertain[key] = max(self._uncertain.get(key, t1), t1)
 
     # ---- thread and process events ----------------------------------------
     def _state(self, ev):
@@ -343,20 +443,45 @@ class Model:
         if pid is None or tid is None:
             c["state_events_incomplete"] += 1
             return
-        if self.wide is None and not ev.partial:
-            self.wide = "priority" in a
-        prio = a.get("priority")
         key = (pid, tid)
         t = self.thread(pid, tid)
+        if ev.injected:
+            self.injected_pids.add(pid)
+        if ev.partial:   # slots missing: nothing beyond "some event happened" is known
+            c["partial_state_events"] += 1
+            if not t.states or t.states[-1][1] != ST_UNKNOWN:
+                t.states.append((ev.ts, ST_UNKNOWN, None, ev.cpu, ev.injected, None))
+            old = self._running.get(ev.cpu)
+            if not ev.injected and (ev.code == ST_RUNNING or old == key) and old != UNKNOWN:
+                self.switches.append((ev.ts, ev.cpu, old, self.state_at(old) if old else None,
+                                      self.prio_of(old) if old else None, UNKNOWN, None))
+                self._running[ev.cpu] = UNKNOWN
+            return
+        if self.wide is None:
+            self.wide = "priority" in a
+        prio, policy = a.get("priority"), a.get("policy")
         prev_state = t.states[-1][1] if t.states else None
         prio_before = self.prio_of(key)
         code = ev.code
-        t.states.append((ev.ts, code, prio, ev.cpu, ev.injected))
+        until = self._uncertain.get(key)
+        w = self.loss_end_at(ev.ts) if self.loss_windows else None
+        if w is not None:
+            until = max(until or w, w)
+            self._uncertain[key] = until
+        uncertain = until is not None and ev.ts < until
+        if until is not None and not uncertain:
+            del self._uncertain[key]
+        t.states.append((ev.ts, code, prio, ev.cpu, ev.injected, policy))
+        if uncertain:    # holds at this instant only: lost events may change it before the window ends
+            t.states.append((ev.ts, ST_UNKNOWN, None, ev.cpu, False, None))
         if prio is not None and (not t.prios or t.prios[-1][1] != prio):
             t.prios.append((ev.ts, prio))
         if ev.injected:
             return
         if code == ST_RUNNING:
+            if self.loss_windows and self.in_loss(ev.cpu, ev.ts):
+                c["switches_in_loss_window"] += 1
+                return
             prev = self._running.get(ev.cpu)
             oc = self._where.get(key)
             if oc is not None and oc != ev.cpu and self._running.get(oc) == key:
@@ -381,36 +506,41 @@ class Model:
                 tx.client_block = state_name(code)
             if code == ST_READY and tx.t_reply_msg is not None and tx.t_unblock is None:
                 tx.t_unblock = ev.ts
+        if code == ST_RECEIVE and not uncertain:
+            self._resync_pulses(key)
         if code == ST_DEAD:
             self._thread_gone(key, ev.ts, "died")
 
     def _wakeup(self, ev, woken, prev_state, prio):
         k = self._running.get(ev.cpu)
         call = self._in_call.get(k) if k not in (None, UNKNOWN) else None
-        how = None
-        if call is not None and k != woken:
-            if prev_state == ST_RECEIVE and woken[0] in call.sent_msg:
-                how = "message"
-            elif prev_state == ST_RECEIVE and woken[0] in call.sent_pulse:
-                how = "pulse"
-            elif prev_state in (ST_REPLY, ST_SEND) and woken in call.replied:
-                how = "reply"
-            elif prev_state in SYNC_WAKE.get(call.name, ()):
-                how = call.name.lower()
-        if how:
-            self.wakeups.append((ev.ts, ev.cpu, k, woken, prio, how))
-            self.counters["wakeups_proven"] += 1
-        elif call is not None and prev_state == ST_RECEIVE and \
-                any(call.name in names for names in PULSE_SENDER_CALLS.values()):
-            # inside MsgSendPulse the receiver's READY comes before SND_PULSE: decide at the pulse
-            call.deferred.append((ev.ts, ev.cpu, k, woken, prio))
+        if call is None or k == woken:
+            self.counters["wakeups_without_evidence"] += 1
+            return
+        if prev_state in (ST_REPLY, ST_SEND) and woken in call.replied:
+            self.wakeups.append((ev.ts, ev.cpu, k, woken, prio, "reply names it"))
+            self.counters["wakeups_with_evidence"] += 1
+        elif prev_state == ST_RECEIVE and call.name in SEND_CALLS:
+            sent = [x for x in call.sent if x[0] == woken[0]]
+            if len(sent) == 1:   # confirmed when this thread receives that very message
+                self._wake_msg[sent[0]] = (ev.ts, ev.cpu, k, woken, prio)
+            else:
+                self.counters["wakeups_without_evidence"] += 1
+        elif prev_state == ST_RECEIVE and any(call.name in names for names in PULSE_SENDER_CALLS.values()):
+            sent = [p for p in call.pulses if p.server_pid == woken[0]]
+            if len(sent) == 1:
+                self._wake_pulse[woken] = ((ev.ts, ev.cpu, k, woken, prio), sent[0])
+            elif not sent:   # inside MsgSendPulse the READY comes before SND_PULSE
+                call.ready.append((ev.ts, ev.cpu, k, woken, prio))
+            else:
+                self.counters["wakeups_without_evidence"] += 1
         else:
-            self.counters["wakeups_unproven"] += 1
+            self.counters["wakeups_without_evidence"] += 1
 
     def _end_call(self, key):
         call = self._in_call.pop(key, None)
-        if call is not None and call.deferred:
-            self.counters["wakeups_unproven"] += len(call.deferred)
+        if call is not None and call.ready:
+            self.counters["wakeups_without_evidence"] += len(call.ready)
         return call
 
     def _thread_gone(self, key, ts, why):
@@ -435,6 +565,8 @@ class Model:
                 p.ppid = a.get("ppid", 0)
                 if a.get("name"):
                     p.path = a["name"]
+                if p.created_ts is None and not ev.injected:
+                    p.created_ts = ev.ts
         elif ev.code == PR_PROCDESTROY:
             a = unpack(ev.words, "ppid:d pid:d")
             pid = a.get("pid")
@@ -466,7 +598,10 @@ class Model:
             elif name in REPLY_CALLS:
                 self._reply_entry(actor, name, a, ev.ts)
             elif name == "CONNECT_DETACH" and "coid" in a:
-                self.coid_paths.pop((actor[0], a["coid"]), None)
+                k = (actor[0], a["coid"])
+                self.coid_paths.pop(k, None)
+                self._coid_candidate.pop(k, None)
+                self._rm_coids.discard(k)
             return
         call = self._end_call(actor)
         if call is None or call.name != name:
@@ -476,9 +611,9 @@ class Model:
             c["interrupted_calls"] += 1
         if name in SEND_CALLS:
             self._send_exit(actor, a, ev.ts, intr)
-        elif name in ("MSG_RECEIVEV", "MSG_RECEIVEPULSEV"):
+        elif name in RECEIVE_CALLS:
             if not intr:
-                self._receive_exit(actor, a, ev.ts)
+                self._receive_exit(actor, a, ev.ts, call)
         elif name in REPLY_CALLS:
             tx = self._replying.pop(actor, None)
             if tx is not None:
@@ -488,24 +623,32 @@ class Model:
         elif name == "CONNECT_ATTACH":
             coid = a.get("coid")
             if coid is not None and coid != 0xFFFFFFFF:
-                self.connections[(actor[0], coid)] = (call.args.get("pid"), call.args.get("chid"))
+                k = (actor[0], coid)
+                self.connections[k] = (call.args.get("pid"), call.args.get("chid"))
+                self.coid_paths.pop(k, None)
+                self._rm_coids.discard(k)
                 lp = self._last_path.pop(actor, None)
                 if lp and ev.ts - lp[0] <= self._path_window:
-                    self.coid_paths[(actor[0], coid)] = lp[1]
+                    self._coid_candidate[k] = lp[1]
                 else:
-                    self.coid_paths.pop((actor[0], coid), None)
+                    self._coid_candidate.pop(k, None)
         elif name == "CHANNEL_CREATE":
             chid = a.get("chid", -1)
             if chid >= 0:
                 self.channels[(actor[0], chid)] = {"flags": call.args.get("flags", 0), "tid": actor[1], "ts": ev.ts}
-        elif name == "THREAD_CTL":
-            cmd = call.args.get("cmd")
+        elif name in ("THREAD_CTL", "THREAD_CTLEXT"):
             if a.get("ret_val", 0) != 0:
                 return
+            cmd = call.args.get("cmd")
+            target = actor
+            if name == "THREAD_CTLEXT":
+                if "pid" not in call.args:
+                    return
+                target = (call.args["pid"] or actor[0], call.args.get("tid") or actor[1])
             if cmd == _NTO_TCTL_RUNMASK and "data" in call.args:
-                self.thread(*actor).runmask.append((call.ts, call.args["data"]))
+                self.thread(*target).runmask.append((call.ts, call.args["data"]))
             elif cmd in _RUNMASK_BY_POINTER:
-                self.thread(*actor).runmask.append((call.ts, None))
+                self.thread(*target).runmask.append((call.ts, None))
 
     def _reply_entry(self, actor, name, a, ts):
         tx = self._by_rcvid.get((actor[0], a.get("rcvid")))
@@ -534,9 +677,16 @@ class Model:
         elif tx.t_reply_msg is None:
             tx.outcome = "cancelled"
             tx.warnings.append("client returned without REPLY_MESSAGE/MSG_ERROR")
+        if tx.path_candidate and tx.outcome == "replied" and (tx.status is None or tx.status >= 0):
+            # an answered _IO_CONNECT on a new coid: the open succeeded, the coid serves this path
+            k = (actor[0], tx.coid)
+            self.coid_paths[k] = tx.path = tx.path_candidate
+            self._rm_coids.add(k)
+        if tx.msg and tx.msg[0] & 0xFFFF == IO_CONNECT and tx.outcome == "replied" and tx.info.get("chid") is not None:
+            self._rm_channels.add((tx.server_pid, tx.info["chid"]))
         self._close(tx)
 
-    def _receive_exit(self, actor, a, ts):
+    def _receive_exit(self, actor, a, ts, call):
         rcvid = a.get("rcvid", 0)
         if not rcvid or rcvid == 0xFFFFFFFF:
             return
@@ -551,6 +701,8 @@ class Model:
         elif tx.server != actor:
             tx.warnings.append("MsgReceivev exit on %s, REC_MESSAGE on %s" % (actor, tx.server))
         tx.t_rx_exit = ts
+        if call is not None and call.args.get("chid") is not None:
+            tx.rx_chid = call.args["chid"]
         if a.get("pid"):   # a server that passes no _msg_info buffer gets zeros: nothing to compare
             info = {k: a[k] for k in ("pid", "tid", "chid", "scoid", "coid", "msglen", "priority") if k in a}
             if (a["pid"], a.get("tid")) != tx.client:
@@ -560,6 +712,14 @@ class Model:
             else:
                 tx.info = info
                 self.counters["info_sender_match"] += 1
+        chid = tx.info.get("chid", tx.rx_chid)
+        ch = self.channels.get((actor[0], chid)) if chid is not None else None
+        if ch is None or ch["flags"] & _NTO_CHF_INHERIT_RUNMASK:
+            # the receiver may have taken the client's run mask (_NTO_CHF_INHERIT_RUNMASK, or flags not traced)
+            t = self.threads.get(actor)
+            if t is not None and t.runmask and t.runmask[-1][1] is not None:
+                t.runmask.append((ts, None))
+                self.counters["run_masks_dropped_on_receive"] += 1
 
     # ---- COMM events ------------------------------------------------------
     def _comm(self, ev):
@@ -607,24 +767,31 @@ class Model:
             tx.t_call, tx.coid, tx.msg = ps[0], ps[1], ps[2]
             if ps[3]:
                 tx.warnings.append("MsgSendv entry before lost events")
-            call.sent_msg.add(spid)
+            call.sent.append(key)
+        tx.client_prio = self.prio_of(actor)
         cands = self._handling.get(actor) or []
         if len(cands) == 1:
             tx.parent = cands[0].idx
             cands[0].children.append(tx.idx)
         elif cands:
             tx.parent_candidates = [x.idx for x in cands]
+            tx.warnings.append("parent ambiguous: sender holds %d received requests" % len(cands))
             c["ambiguous_parents"] += 1
-        if tx.msg:
-            tx.msg_type = msg_type_name(tx.msg[0], spid == PROCNTO_PID)
         if tx.coid is not None:
-            tx.path = self.coid_paths.get((actor[0], tx.coid))
+            k = (actor[0], tx.coid)
+            cand = self._coid_candidate.pop(k, None)
+            if cand is not None and tx.msg and tx.msg[0] & 0xFFFF == IO_CONNECT:
+                tx.path_candidate = cand
+            tx.path = self.coid_paths.get(k)
+            tx.rm_conn = k in self._rm_coids
         self.txns.append(tx)
         self._by_rcvid[key] = tx
         self._by_client[actor] = tx
 
     def _rmsg(self, actor, rcvid, spid, ts):
-        tx = self._by_rcvid.get((spid, rcvid))
+        key = (spid, rcvid)
+        tx = self._by_rcvid.get(key)
+        w = self._wake_msg.pop(key, None)
         if tx is None:
             self.counters["rmsg_without_txn"] += 1
             return
@@ -632,6 +799,12 @@ class Model:
             tx.warnings.append("REC_MESSAGE actor %s is not in server pid %d" % (actor, spid))
             self.counters["rmsg_actor_not_server"] += 1
             return
+        if w is not None:
+            if w[3] == actor:
+                self.wakeups.append(w + ("received the message",))
+                self.counters["wakeups_with_evidence"] += 1
+            else:
+                self.counters["wakeups_without_evidence"] += 1
         if tx.server is not None and tx.server != actor:
             tx.warnings.append("received twice (%s, %s)" % (tx.server, actor))
         tx.server = actor
@@ -644,11 +817,16 @@ class Model:
             self.counters["reply_msg_without_txn"] += 1
             return
         if actor is None or self._replying.get(actor) is not tx:
-            tx.warnings.append("REPLY_MESSAGE outside the MsgReplyv/MsgError of this exchange")
-            self.counters["reply_msg_outside_reply_call"] += 1
+            # not the reply call in progress for this client's exchange (a stale or misattributed reply):
+            # leave the exchange as it is, only mark the contradiction
+            note = "REPLY_MESSAGE outside the reply call of this exchange (quarantined)"
+            if note not in tx.warnings:
+                tx.warnings.append(note)
+            self.counters["reply_msg_quarantined"] += 1
+            return
         tx.t_reply_msg = ts
         tx.outcome = "error" if code == COMM_ERROR else "replied"
-        call = self._in_call.get(actor) if actor is not None else None
+        call = self._in_call.get(actor)
         if call is not None:
             call.replied.add(ckey)
         self._unindex_server(tx)
@@ -659,15 +837,14 @@ class Model:
         call = self._in_call.get(actor) if actor is not None else None
         if call is not None and call.name in PULSE_SENDER_CALLS.get(code, ()):
             pl.sender = actor
-            call.sent_pulse.add(spid)
+            call.pulses.append(pl)
             keep = []
-            for w in call.deferred:
-                if w[3][0] == spid:
-                    self.wakeups.append(w + ("pulse",))
-                    self.counters["wakeups_proven"] += 1
+            for w in call.ready:     # READYs seen earlier in this call wait for their REC_PULSE
+                if w[2] != w[3] and w[3][0] == spid:
+                    self._wake_pulse[w[3]] = (w, pl)
                 else:
                     keep.append(w)
-            call.deferred = keep
+            call.ready = keep
             if call.name in PULSE_CALLS:
                 pl.code, pl.value, pl.prio = call.args.get("code"), call.args.get("value"), call.args.get("priority")
         else:
@@ -678,24 +855,47 @@ class Model:
 
     def _recv_pulse(self, actor, spid, scoid, ts):
         key = (spid, scoid)
+        call = self._in_call.get(actor) if actor is not None else None
+        if call is not None and call.name in RECEIVE_CALLS and call.args.get("chid") is not None:
+            self._scoid_chan[key] = call.args["chid"]
         q = self._pulse_q.get(key)
         if not q:
             pl = Pulse(len(self.pulses), None, None, "unknown", spid, scoid, match="none")
             self.pulses.append(pl)
             self.counters["pulse_recv_without_send"] += 1
-        elif len(q) == 1 and key not in self._pulse_uncertain:
+            self._pulse_synced.discard(key)
+        elif len(q) == 1 and key in self._pulse_synced:
             pl = q.popleft()
-            pl.match, pl.candidates, pl.confidence = "unique", [pl.idx], 1.0
+            pl.match, pl.candidates = "unique", [pl.idx]
         else:
             cands = list(q)
             pl = q.popleft()   # queue order is a guess: pulses are delivered by priority and may be compressed
-            pl.match, pl.candidates = "ambiguous", [x.idx for x in cands]
-            pl.confidence = None if key in self._pulse_uncertain else round(1 / len(cands), 3)
-            self._pulse_uncertain.add(key)
-            self.counters["pulse_recv_ambiguous"] += 1
-        if not q:
-            self._pulse_uncertain.discard(key)
+            pl.match, pl.candidates = ("ambiguous" if len(cands) > 1 else "unsynced"), [x.idx for x in cands]
+            self._pulse_synced.discard(key)
+            self.counters["pulse_recv_ambiguous" if len(cands) > 1 else "pulse_recv_unsynced"] += 1
         pl.t_recv, pl.receiver = ts, actor
+        wp = self._wake_pulse.pop(actor, None) if actor is not None else None
+        if wp is not None:
+            if wp[1] is pl and pl.match == "unique":
+                self.wakeups.append(wp[0] + ("received the pulse",))
+                self.counters["wakeups_with_evidence"] += 1
+            else:
+                self.counters["wakeups_without_evidence"] += 1
+
+    def _resync_pulses(self, key):
+        """The thread blocked in MsgReceive on a channel: nothing is pending there, so the queues of the
+        pulses known to arrive on that channel are empty and in sync again."""
+        call = self._in_call.get(key)
+        if call is None or call.name not in RECEIVE_CALLS or call.args.get("chid") is None:
+            return
+        chid = call.args["chid"]
+        for k, ch in self._scoid_chan.items():
+            if k[0] == key[0] and ch == chid:
+                q = self._pulse_q.get(k)
+                while q:
+                    q.popleft().match = "unseen"     # its receive is not in the trace (lost or merged)
+                    self.counters["pulse_receive_unseen"] += 1
+                self._pulse_synced.add(k)
 
     # ---- index maintenance (by identity) ----------------------------------
     def _unindex_server(self, tx):
@@ -721,12 +921,12 @@ class Model:
     def intervals(self, key, end_ts=None):
         """[(start, end, state code, prio)] for one thread."""
         end_ts = self.end_ts if end_ts is None else end_ts
-        t = self.threads[key]
+        sts = self.threads[key].states
         out = []
-        for i, (ts, code, prio, _cpu, _inj) in enumerate(t.states):
-            nxt = t.states[i + 1][0] if i + 1 < len(t.states) else end_ts
-            if nxt > ts:
-                out.append((ts, nxt, code, prio))
+        for i, s in enumerate(sts):
+            nxt = sts[i + 1][0] if i + 1 < len(sts) else end_ts
+            if nxt > s[0]:
+                out.append((s[0], nxt, s[1], s[2]))
         return out
 
     def fixed_priority_channels(self):

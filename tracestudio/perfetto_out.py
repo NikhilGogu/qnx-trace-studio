@@ -8,8 +8,9 @@ Mapping:
     become pid 0 (swapper). CPU time nobody can be credited with (after lost
     events, or on the old CPU of a thread that migrated before that CPU
     switched) goes to a pseudo thread "UNKNOWN" instead of idle.
-  * proven wakeups only (see model.py) -> sched_waking with the waker as the
-    emitting thread; other READY transitions get no waker.
+  * wakeups with object evidence only (see model.py) -> sched_waking with the
+    waker as the emitting thread and no target CPU; other READY transitions
+    get no waker.
   * priorities are QNX priorities (0-255, higher wins), never converted: they
     appear as "QNX priority" counter tracks, "qnx_prio" arguments, and in the
     priority column of Perfetto's sched table, which here holds the QNX value,
@@ -18,8 +19,9 @@ Mapping:
     the short process name (the path is left out). Perfetto tids are global, QNX tids
     are per process, so thread (pid, tid) becomes pid*100+tid when that fits
     in 31 bits (readable: 109365703 = pid 1093657 tid 3), else a counter.
-  * exact QNX thread states (SEND, RECEIVE, REPLY, MUTEX, ..., UNKNOWN for
-    lost data) -> slices on a "<thread> QNX state" child track of each thread.
+  * QNX thread states as the kernel reports them (SEND, RECEIVE, REPLY,
+    MUTEX, ..., plus UNKNOWN where data was lost) -> slices on a
+    "<thread> QNX state" child track of each thread.
   * message passing -> slices on the thread tracks: client "MsgSend <type> ->
     <server>", server "handle <client>", "MsgReply"/"MsgError", and a client
     "reply received" slice; flow arrows send->handle and reply->received carry
@@ -324,7 +326,7 @@ class Writer:
             wk = fe.sched_waking
             wk.comm, wk.pid = self.comm(woken), self.tid(woken)
             wk.prio = prio if prio is not None else 0
-            wk.success, wk.target_cpu = 1, cpu
+            wk.success = 1      # no target_cpu: where the thread will run is not known at this point
             per_cpu[cpu].append(fe)
         for cpu, lst in per_cpu.items():
             lst.sort(key=lambda fe: fe.timestamp)
@@ -363,7 +365,8 @@ class Writer:
             sname = m.server_name(tx)
             send_flow, reply_flow = 2 * tx.idx + 1, 2 * tx.idx + 2
             args = {"txn": tx.idx, "rcvid": "0x%08x" % tx.rcvid, "server_pid": tx.server_pid,
-                    "server": m.label(tx.server), "client": m.label(tx.client), "message": tx.msg_type,
+                    "server": m.label(tx.server), "client": m.label(tx.client),
+                    "message": tx.msg_type or tx.msg_desc,
                     "path": tx.path, "client_blocked": tx.client_block, "parent_txn": tx.parent,
                     "error": tx.error, "outcome": tx.outcome, "trustworthy": tx.trustworthy}
             if tx.coid is not None:
@@ -429,9 +432,10 @@ class Writer:
             fid += 1
             linked = pl.match == "unique" and pl.t_send is not None and pl.receiver is not None
             args = {"scoid": "0x%08x" % pl.scoid, "server_pid": pl.server_pid, "kind": pl.kind, "code": pl.code,
-                    "value": pl.value, "match": pl.match, "confidence": pl.confidence,
+                    "value": pl.value, "match": pl.match,
                     "sender": m.label(pl.sender) if pl.sender else "kernel or unknown"}
-            if pl.match == "ambiguous":
+            if pl.match in ("ambiguous", "unsynced"):
+                args["candidate_count"] = len(pl.candidates)
                 args["candidates"] = ", ".join(map(str, pl.candidates))
             if pl.context is not None:
                 args["cpu_thread_at_send"] = m.label(pl.context)

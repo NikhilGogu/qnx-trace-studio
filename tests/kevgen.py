@@ -14,6 +14,8 @@ C_CONTROL, C_KERCALL, C_INT, C_PRTH, C_SYSTEM, C_COMM = 1, 2, 3, 4, 5, 7
 S_SIMPLE, S_BEGIN, S_CONT, S_END = 0, 1, 2, 3
 RUNNING, READY, SEND, RECEIVE, REPLY, DEAD, NANOSLEEP = 1, 2, 4, 5, 6, 0, 12
 K_SENDV, K_ERROR, K_RECEIVEV, K_REPLYV, K_PULSE, K_THREAD_CTL, K_CHANNEL_CREATE = 11, 13, 14, 15, 20, 52, 35
+K_CONNECT_ATTACH, K_SEM_POST = 39, 84
+SEM = 17
 SMSG, SPULSE, RMSG, RPULSE, REPLYMSG, ERRMSG = 0, 1, 2, 3, 10, 11
 PROCCREATE_NAME, THREAD_NAME = 192, 320
 EXIT, INT = 0x80, 0x100
@@ -103,13 +105,30 @@ class Gen:
             for tid, name in threads.items():
                 self.event(cpu, ts, C_PRTH, THREAD_NAME, [pid, tid] + words_of(name))
 
+    def channel(self, cpu, ts, flags=0, chid=1):
+        self.kcall(cpu, ts, K_CHANNEL_CREATE, [flags])
+        self.kcall(cpu, ts + 1, K_CHANNEL_CREATE, [chid, 0], EXIT)
+
+    def pathmgr(self, cpu, ts, key, path):
+        self.event(cpu, ts, C_SYSTEM, 2, [key[0], key[1]] + words_of(path))
+
+    def connect_attach(self, cpu, ts, server_pid, coid, chid=1):
+        self.kcall(cpu, ts, K_CONNECT_ATTACH, [0, server_pid, chid, 0, 0])
+        self.kcall(cpu, ts + 1, K_CONNECT_ATTACH, [coid, 0], EXIT)
+
+    def pulse(self, cpu, ts, sender, spid, scoid, value=0):
+        self.kcall(cpu, ts, K_PULSE, [0x40000001, 10, 5, value])
+        self.comm(cpu, ts + 5, 1, scoid, spid)
+        self.kcall(cpu, ts + 10, K_PULSE, [0], EXIT)
+
     def runmask(self, cpu, ts, mask):
         self.kcall(cpu, ts, K_THREAD_CTL, [4, mask])
         self.kcall(cpu, ts + 1, K_THREAD_CTL, [0, 0], EXIT)
 
     # ---- one message exchange on one CPU, the way QNX 8.0 traces it ------------
-    def send(self, cpu, ts, client, spid, rcvid, msg=(0x7101, 1, 0), prio=None, block=REPLY, wide=True):
-        self.kcall(cpu, ts, K_SENDV, [0x40000001, 1, 1] + list(msg) if wide else [0x40000001, msg[0]])
+    def send(self, cpu, ts, client, spid, rcvid, msg=(0x7101, 1, 0), prio=None, block=REPLY, wide=True,
+             coid=0x40000001):
+        self.kcall(cpu, ts, K_SENDV, [coid, 1, 1] + list(msg) if wide else [coid, msg[0]])
         self.comm(cpu, ts + 10, SMSG, rcvid, spid)
         self.state(cpu, ts + 20, block, client, prio)
 

@@ -94,6 +94,8 @@ class KevStats:
     long_buffers: int = 0          # buffers with more slots than announced (counted only)
     dropped_events: int = 0        # from CONTROL/DROPPED events
     trailing_bytes: int = 0        # bytes after the last whole slot
+    tainted_combines: int = 0      # complete combine events inside a buffer with missing slots (kept as partial)
+    slots_before_first_buffer: int = 0
     rollovers: int = 0
     ts_adjusted: int = 0           # slots placed in the epoch before or after their anchor's
     unanchored_slots: int = 0      # slots seen before any TIME event of their CPU
@@ -170,16 +172,38 @@ class KevFile:
             self._events = self._build()
         return self._events
 
+    def _buffer_table(self):
+        """[(first slot, end slot, cpu, announced slots)] of every kernel buffer, in file order.
+        A buffer starts at its TIME slot when the slot before BUFFER is a TIME of the same CPU."""
+        heads, prev_time = [], None
+        for i, h, _d0, d1, d2 in self.slots():
+            if h >> 30 == S_SIMPLE and (h >> 10) & 0x1F == C_CONTROL:
+                cpu, code = (h >> 24) & 0x3F, h & 0x3FF
+                if code == CTRL_BUFFER:
+                    heads.append((i - 1 if prev_time == (cpu, i - 1) else i, cpu, d2))
+                prev_time = (cpu, i) if code == CTRL_TIME else None
+            else:
+                prev_time = None
+        return [(a, heads[n + 1][0] if n + 1 < len(heads) else self.stats.slots, cpu, want)
+                for n, (a, cpu, want) in enumerate(heads)]
+
     def _build(self):
         st = self.stats
+        table = self._buffer_table()
+        # a buffer whose slot count differs from its header may miss slots anywhere inside it; only a
+        # file cut inside its last slot is known to miss them at the end
+        bad = []
+        for n, (a, b, cpu, want) in enumerate(table):
+            tail_cut = n == len(table) - 1 and st.trailing_bytes and b - a < want
+            bad.append(b - a != want and not tail_cut)
         anchor = {}      # cpu -> full timestamp of the latest TIME event on that cpu
         last_any = None  # latest anchor of any cpu, for slots before their own cpu's first TIME
         latest = {}      # cpu -> latest timestamp seen on that cpu
         seqs = {}        # cpu -> last BUFFER sequence number
-        pending = {}     # (cpu, cls, code, lsb) -> [first index, ts, words, injected]
-        open_loss = {}   # cpu -> Loss whose end is the next TIME anchor of that cpu
-        cur = None       # [cpu, first slot index, announced slots] of the buffer being read
+        pending = {}     # (cpu, cls, code, lsb) -> [first index, ts, words, injected, tainted]
+        open_loss = {}   # cpu -> Loss whose end is the start of that cpu's next buffer
         out = []
+        bi = -1          # index in table of the buffer being read
         prev_time = None  # (cpu, index, latest timestamp of that cpu before it) if the previous slot was a TIME
 
         def close_partial(key):
@@ -192,22 +216,9 @@ class KevFile:
                 close_partial(key)
             loss = Loss(cpu, t0, t1, kind, count, detail, idx)
             self._losses.append(loss)
+            if t1 is None:
+                open_loss[cpu] = loss
             return loss
-
-        def close_buffer(end_index, t0, t1):
-            if cur is None:
-                return
-            cpu, start, want = cur
-            have = end_index - start
-            if have < want:
-                st.short_buffers += 1
-                kind = "truncated file" if end_index >= st.slots else "short buffer"
-                loss = lose(cpu, t0, kind, want - have, "buffer announced %d slots, file has %d" % (want, have),
-                            end_index, t1)
-                if t1 is None:
-                    open_loss[cpu] = loss
-            elif have > want:
-                st.long_buffers += 1
 
         def place(cpu, lsb):
             a = anchor.get(cpu)
@@ -222,7 +233,12 @@ class KevFile:
                 st.ts_adjusted += 1
             return ts
 
+        if table and table[0][0] > 0:
+            st.slots_before_first_buffer = table[0][0]
         for i, h, d0, d1, d2 in self.slots():
+            while bi + 1 < len(table) and table[bi + 1][0] <= i:
+                bi += 1
+            in_bad = bi < 0 or bad[bi]
             struct_ = h >> 30
             cpu = (h >> 24) & 0x3F
             cls = (h >> 10) & 0x1F
@@ -240,33 +256,25 @@ class KevFile:
                 for key in [k for k, p in pending.items() if k[0] == cpu and p[1] < ts - TOLERANCE]:
                     close_partial(key)
                     st.stale_combines += 1
-                if cpu in open_loss:
-                    open_loss.pop(cpu).t1 = ts
             elif struct_ in (S_SIMPLE, S_BEGIN):
                 ts = place(cpu, d0)
             else:
                 ts = None
             prev_latest = latest.get(cpu)
             if ts is not None:
-                prev = prev_latest
-                if prev is not None and ts < prev:
+                if prev_latest is not None and ts < prev_latest:
                     st.per_cpu_regressions += 1
-                    st.max_regression_cycles = max(st.max_regression_cycles, prev - ts)
+                    st.max_regression_cycles = max(st.max_regression_cycles, prev_latest - ts)
 
             if struct_ == S_SIMPLE:
                 ev = Event(ts, cpu, cls, code, (d1, d2), i, injected)
                 out.append(ev)
                 if cls == C_CONTROL and code == CTRL_BUFFER:
-                    # the TIME slot just before a BUFFER slot opens the new buffer; losses end at it and
-                    # start at the latest timestamp the cpu had before it
                     same = prev_time is not None and prev_time[0] == cpu and prev_time[1] == i - 1
-                    start = i - 1 if same else i
                     t_new = anchor[cpu] if same else ts
-                    t_before = prev_time[2] if same else latest.get(cpu)
-                    if cur is not None:
-                        old = cur[0]
-                        close_buffer(start, t_before if old == cpu else latest.get(old), t_new if old == cpu else None)
-                    cur = [cpu, start, d2]
+                    t_before = prev_time[2] if same else prev_latest
+                    if cpu in open_loss:
+                        open_loss.pop(cpu).t1 = t_new
                     st.buffers[cpu] = st.buffers.get(cpu, 0) + 1
                     p = seqs.get(cpu)
                     if p is None:
@@ -284,33 +292,49 @@ class KevFile:
                             st.sequence_resets += 1
                             lose(cpu, t_before, "sequence reset", None, "sequence %d after %d" % (d1, p), i, t_new)
                     seqs[cpu] = d1
+                    if bad[bi]:
+                        a, b, _, want = table[bi]
+                        kind = "short buffer" if b - a < want else "long buffer"
+                        st.short_buffers += kind == "short buffer"
+                        st.long_buffers += kind == "long buffer"
+                        lose(cpu, t_new, kind, abs(want - (b - a)),
+                             "buffer announced %d slots, file has %d; slots may be missing anywhere in it"
+                             % (want, b - a), i, None)
                 elif cls == C_CONTROL and code == CTRL_DROPPED:
                     st.dropped_events += d1
-                    lose(cpu, latest.get(cpu), "dropped", d1, "kernel dropped %d events" % d1, i, ts)
+                    lose(cpu, prev_latest, "dropped", d1, "kernel dropped %d events" % d1, i, ts)
             else:
                 key = (cpu, cls, code, d0)
                 if struct_ == S_BEGIN:
                     if key in pending:   # previous one never ended
                         close_partial(key)
-                    pending[key] = [i, ts, [d1, d2], injected]
+                    pending[key] = [i, ts, [d1, d2], injected, in_bad]
                 else:
                     p = pending.get(key)
                     if p is None:
                         st.orphan_slots += 1
                     else:
                         p[2].extend((d1, d2))
+                        p[4] = p[4] or in_bad
                         if struct_ == S_END:
                             del pending[key]
-                            out.append(Event(p[1], cpu, cls, code, tuple(p[2]), p[0], p[3]))
-                            st.combine_events += 1
+                            out.append(Event(p[1], cpu, cls, code, tuple(p[2]), p[0], p[3], p[4]))
+                            if p[4]:
+                                st.partial_combines += 1
+                                st.tainted_combines += 1
+                            else:
+                                st.combine_events += 1
             if ts is not None and (cpu not in latest or ts > latest[cpu]):
                 latest[cpu] = ts
             prev_time = (cpu, i, prev_latest) if is_time else None
 
-        if cur is not None:
-            close_buffer(st.slots, latest.get(cur[0]), None)
-        if st.trailing_bytes and not any(l.kind == "truncated file" for l in self._losses):
-            c = cur[0] if cur else 0
+        if table and not bad[-1] and table[-1][1] - table[-1][0] < table[-1][3]:   # cut inside the last slot
+            c = table[-1][2]
+            st.short_buffers += 1
+            lose(c, latest.get(c), "truncated file", table[-1][3] - (table[-1][1] - table[-1][0]),
+                 "file ends %d bytes into a slot of its last buffer" % st.trailing_bytes, st.slots, None)
+        elif st.trailing_bytes and not any(l.kind == "truncated file" for l in self._losses):
+            c = table[-1][2] if table else 0
             lose(c, latest.get(c), "truncated file", None, "%d bytes after the last whole slot" % st.trailing_bytes,
                  st.slots, None)
         for key in list(pending):
