@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 *.perfetto-trace
 /out/
+/build/
+*.egg-info/

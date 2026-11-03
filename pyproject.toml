@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-studio"
+version = "0.1.0"
+description = "Convert QNX OS 8.0 kernel event traces (.kev) to Perfetto and analyse message passing"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "The trace-studio authors" }]
+# tested with perfetto 0.59.1 and protobuf 7.36.2 (Python 3.10 and 3.12)
+dependencies = [
+    "perfetto>=0.59.1,<0.60",
+    "protobuf>=7.36.2,<8",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Operating System Kernels",
+]
+
+[project.scripts]
+tracestudio = "tracestudio.cli:main"
+
+[tool.setuptools]
+packages = ["tracestudio"]
