@@ -2,15 +2,15 @@
 
 Date: 3 November 2026. Each pass follows `find-priority-inversion.md` from the top in a new workspace on the build box (Ubuntu 22.04.5, QNX SDP 8.0 in `~/qnx800`, QEMU 6.2.0 with KVM, Python 3.10.12): a new `CODELAB` directory, a new venv with trace-studio installed from a fresh clone, and a new QEMU target built by the codelab's own `mkqnximage` command. Times are UTC.
 
-Method. A script (`dryrun.py`, kept on the box in `~/tcl-dryrun/`) extracts every `bash` block of the codelab in order, plus the commands written inline in the text (`python3 --version`, the `ssh-keygen` hint, the three fast-mode commands in the aside, the final `ls`), and runs them in one bash session, so that `export`, `source` and `cd` carry over as in the reader's terminal. It records the exit status and time of each block. Where the text says to retry (no address yet; QEMU still exiting), the script retries the block. A second script (`cmpout.py`) checks that every line of the codelab's `text` blocks occurs in the pass's log with digits masked, so that each output shown is the real shape of the output. Logs: `~/tcl-dryrun/pass<N>/log.txt` on the box.
+Method. A script (`dryrun.py`, kept on the box in `~/tcl-dryrun/`) extracts every `bash` block of the codelab in order, plus the commands written inline in the text (`python3 --version`, the `ssh-keygen` hint, the three fast-mode commands in the aside, the final `ls`), and runs them in one bash session, so that `export`, `source` and `cd` carry over as in the reader's terminal. It records the exit status and time of each block. Where the text says to retry (no address yet; QEMU still exiting), the script retries the block. A second script (`cmpout.py`) checks that every line of the codelab's `text` blocks occurs in the pass's log with digits masked. Logs: `~/tcl-dryrun/pass<N>/log.txt` on the box.
 
 Deviations from the text, the same in every pass:
 
-* `CODELAB` was `~/tcl-dryrun/pass<N>/trace-codelab` instead of `~/trace-codelab`, and the target directory was `~/targets/tcl1` instead of `$CODELAB/target` (the build box keeps targets there under names reserved per agent). The mkqnximage command itself ran as written.
-* `git clone https://github.com/NikhilGogu/qnx-trace-studio.git` was redirected (`url.<bundle>.insteadOf` in a private `GIT_CONFIG_GLOBAL`) to a git bundle of the local repository, because the codelab, the deadline line of `ts_pload` and the v0.1.1 output of `analyze` and `diff` are not pushed yet. The public repository answered (`git ls-remote`: `main` at c9161f6, v0.1.0). Passes 1 and 2 used the bundle at 39b5c1d, passes 3 and 4 at 4465ede (v0.1.1 from the trace-studio agent).
+* `CODELAB` was `~/tcl-dryrun/pass<N>/trace-codelab` (the text has `~/trace-codelab`), and the target directory was `~/targets/tcl1` (the text has `$CODELAB/target`; the build box keeps targets there under reserved names). The mkqnximage command itself ran as written.
+* `git clone https://github.com/NikhilGogu/qnx-trace-studio.git` was redirected (`url.<bundle>.insteadOf` in a private `GIT_CONFIG_GLOBAL`) to a git bundle of the local repository, because the codelab, the deadline line of `ts_pload` and the v0.1.1 output of `analyze` and `diff` are not pushed yet. The public repository answered (`git ls-remote`: `main` at c9161f6, v0.1.0). Passes 1 and 2 used the bundle at 39b5c1d, passes 3 and 4 at 4465ede (v0.1.1).
 * `sudo apt install ...` ran as `apt-get -s install ...` (simulated: the box is shared); every package was already installed. The two `sudo adduser` lines were replaced by a check that the user is in `kvm` and `libvirt` (it is). `ssh-keygen -q -t ed25519 -N '' -f ...` wrote to the pass directory, since the box already has `~/.ssh/id_ed25519`.
-* `ssh` and `scp` were wrappers adding `-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=<pass>/known_hosts`, standing in for the reader typing `yes` once and keeping the box's `~/.ssh/known_hosts` untouched; `ssh-keygen -R $TARGET` got `-f <pass>/known_hosts` for the same reason. The cleanup check greps for `targets/tcl1` instead of `trace-codelab`, the directory the target really ran in.
-* Perfetto: the text's clicks were not made by a person. The converted `fixed.perfetto-trace` of pass 2 was opened in ui.perfetto.dev in headless Chromium (Playwright 1.61.0): it loaded, the menu has **Open trace file**, and the `ts_pload` and `ts_psrv` process groups are listed just below the CPU tracks. Selecting a slice, following its arrow and the zoom keys were not exercised; the four screenshots are reused from `docs/img` (taken on 3 Nov 2026 from the `tests/data/run1` captures of the same scenario) and the text says their numbers differ.
+* `ssh` and `scp` were wrappers adding `-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=<pass>/known_hosts`, standing in for the reader typing `yes` once and keeping the box's `~/.ssh/known_hosts` untouched; `ssh-keygen -R $TARGET` got `-f <pass>/known_hosts` for the same reason. The cleanup check greps for `targets/tcl1`, the directory the target ran in.
+* Perfetto: the converted `fixed.perfetto-trace` of pass 2 was opened in ui.perfetto.dev in headless Chromium (Playwright 1.61.0): it loaded, the menu has **Open trace file**, and the `ts_pload` and `ts_psrv` process groups are listed just below the CPU tracks. Selecting a slice, following its arrow and the zoom keys were not exercised; the four screenshots are reused from `docs/img` (taken on 3 Nov 2026 from the `tests/data/run1` captures of the same scenario) and the text says their numbers differ.
 
 ## Pass 1: 20:10:08 to 20:10:46, harness error
 
@@ -37,7 +37,7 @@ Harness fixed (`mkdir -p $CODELAB` kept).
 | 10 Fix | 5.3 s | 0 of 20 missed (max 2790.8 us), inversions 20 to 0, server priority 10 to 30 while handling hi |
 | 12 Clean up | 3.1 s | target stopped, host key removed, workspace removed; QEMU check empty on the second try |
 
-The commands of the whole pass took 41.1 s. The `Duration` fields (42 minutes in total) are our estimate of reading, typing and Perfetto time, not a measurement with a reader.
+The commands of the whole pass took 41.1 s. The `Duration` fields (42 minutes in total) are our estimate of reading, typing and Perfetto time.
 
 Text fixed after pass 2:
 
@@ -56,7 +56,7 @@ Same commands as pass 3 (compared with digits masked), commands 43.2 s (target s
 
 ## Rendering
 
-`~/.local/bin/claat export` (QNX's fork) of the final file, served next to the QNX codelab site's own `js/` assets (downloaded from `qnx.github.io/codelabs/js/`), opened step by step in headless Chromium at 1280 px: 13 steps, 4 images loaded, the table and both asides render, no code block overflows, no console errors. At 412 px code blocks are wider than the screen and scroll. The site's highlighter colours `text` blocks too, so an apostrophe (`lo's request`) starts a string colour that runs to the next apostrophe; this is cosmetic and left as it is, since the outputs must stay real.
+`~/.local/bin/claat export` (QNX's fork) of the final file, served next to the QNX codelab site's own `js/` assets (downloaded from `qnx.github.io/codelabs/js/`), opened step by step in headless Chromium at 1280 px: 13 steps, 4 images loaded, the table and both asides render, no code block overflows, no console errors. At 412 px code blocks are wider than the screen and scroll. The site's highlighter colours `text` blocks too, so an apostrophe (`lo's request`) starts a string colour that runs to the next apostrophe; this is cosmetic and left as it is.
 
 ## Clean-up
 

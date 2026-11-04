@@ -6,7 +6,7 @@
  *   mrx    (prio 10, inherits hi's 30 from the message) receives it and locks M: MUTEX-blocked on holder,
  *            whose priority QNX's mutex priority inheritance raises; then it replies;
  *   hog    (prio 20, with -g) burns -b us of CPU from -h us after the period start;
- *   -N     initialises M with PTHREAD_PRIO_NONE instead of QNX's default priority inheritance.
+ *   -N     initialises M with PTHREAD_PRIO_NONE (QNX's default is priority inheritance).
  * Logged: holder LOCKED (a = &M, b = its TLS __owner, c = pid), MSEND/MSEND_DONE, UNLOCK; mrx RX, WAIT, ACQUIRED,
  * REPLY; hi SEND, SEND_DONE; hog BURN. */
 #include "common.h"

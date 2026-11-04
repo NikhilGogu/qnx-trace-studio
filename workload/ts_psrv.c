@@ -4,8 +4,8 @@
  *
  * ts_psrv: single-threaded server for the priority scenario. Pinned to CPU 0
  * at SCHED_FIFO priority 10. With -f the channel is created with
- * _NTO_CHF_FIXED_PRIORITY, so the receive thread keeps priority 10 instead of
- * inheriting the priority of its (possibly higher-priority) clients.
+ * _NTO_CHF_FIXED_PRIORITY, so the receive thread keeps priority 10 whatever the
+ * priority of its clients.
  *
  * usage: ts_psrv [-f]
  */

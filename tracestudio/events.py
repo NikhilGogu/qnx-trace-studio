@@ -8,7 +8,7 @@ E signed 64-bit, X hex 64-bit). Fast-mode events carry a two-word summary in
 one slot; wide-mode events carry the full argument list in a combine event.
 The layout is chosen from the payload length, so traces with a per-class mix
 of fast and wide events decode correctly. A kernel call that fails exits with
-its return code (-1) and errno instead of its data, and an interrupted call
+its return code (-1) and errno as its arguments, and an interrupted call
 (INT_CALL) has no arguments; traceprinter prints both that way.
 """
 from __future__ import annotations

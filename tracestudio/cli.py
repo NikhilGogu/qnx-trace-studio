@@ -482,7 +482,7 @@ def main(argv=None):
                             "(the trace records only masks set while tracing); used until the trace shows a mask "
                             "event for the thread or loses events, and named in every verdict that uses it")
         s.add_argument("--assume-unpinned", action="append", metavar="PROCESS",
-                       help="treat this process's threads as allowed on every CPU (your statement, not the trace's)")
+                       help="treat this process's threads as allowed on every CPU (your statement about the program)")
         s.add_argument("--top", type=_count, default=15, help="rows to print (default 15)")
         s.add_argument("--json", action="store_true")
         s.set_defaults(fn=fn)

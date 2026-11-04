@@ -7,7 +7,7 @@ Mapping:
     sched and thread_state tables work natively. procnto's idle threads
     become pid 0 (swapper). CPU time nobody can be credited with (after lost
     events, or on the old CPU of a thread that migrated before that CPU
-    switched) goes to a pseudo thread "UNKNOWN" instead of idle.
+    switched) goes to a pseudo thread "UNKNOWN".
   * wakeups with object evidence only (see model.py) -> sched_waking with the
     waker as the emitting thread and no target CPU; other READY transitions
     get no waker.
@@ -280,8 +280,8 @@ class Writer:
         p = pb.TracePacket()
         pt = p.process_tree
         for pid, pr in sorted(m.processes.items()):
-            # no cmdline: TraceProcessor would name the process after it (the full path) instead of
-            # the short name in the process track descriptor below
+            # no cmdline: TraceProcessor would name the process after it (the full path); the short name
+            # comes from the process track descriptor below
             x = pt.processes.add()
             x.pid = pid
             x.ppid = pr.ppid or 0
