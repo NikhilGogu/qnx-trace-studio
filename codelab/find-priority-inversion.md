@@ -60,7 +60,7 @@ You need:
     `virsh` should list `default` as `active`. `check-net` prints nothing when QEMU may already use `virbr0`; otherwise it asks once for your sudo password to make `qemu-bridge-helper` setuid root and add `allow virbr0` to QEMU's `bridge.conf`.
 3. **Python 3.10 or later** (`python3 --version`).
 4. **An SSH key without a passphrase** at `~/.ssh/id_ed25519`. mkqnximage installs its public half for root on the target. If you have none: `ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519`.
-5. **A web browser** for [ui.perfetto.dev](https://ui.perfetto.dev). Perfetto opens the trace inside the page; the file stays on your machine.
+5. **A web browser** for [ui.perfetto.dev](https://ui.perfetto.dev). Perfetto opens the trace inside the page.
 
 You do not need to know Perfetto. You should be able to read C.
 
