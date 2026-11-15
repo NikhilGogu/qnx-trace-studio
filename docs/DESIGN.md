@@ -197,7 +197,7 @@ Second review (v0.1). The third review rated item 4 fixed and items 1, 2, 3, 5, 
 | documentation overstatements ("every MsgSend", exact states, proven wakeups, never wrong links, fast-mode subtypes) | fixed in README and this document | |
 | one-level inversion, bounded nesting, unresolved handoffs | documented limits (handoffs are now unknown) | |
 
-Third review (v0.1b, commit 3fbc2c1):
+Third review (v0.1b):
 
 | item | status | tests |
 |---|---|---|
