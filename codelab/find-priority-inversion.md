@@ -31,7 +31,9 @@ In this codelab you run a small server and three clients on a QNX OS 8.0 virtual
 
 trace-studio is an open-source (Apache-2.0) command-line tool that reads the `.kev` files tracelogger writes, on your development host, without QNX libraries. It converts them to Perfetto traces and analyses the message passing in them.
 
-The outputs are from a run of this codelab on Ubuntu 22.04 with QNX SDP 8.0, trimmed: lines that do not matter here are replaced by `...`, long lines are wrapped and wide tables narrowed. Your process ids, transaction numbers and times will differ.
+The outputs are from a run of this codelab on Ubuntu 22.04 with QNX SDP 8.0, trimmed: lines that do not matter here are replaced by `...`, long lines are wrapped at 80 columns and the spaces between table columns narrowed, so a line can break here where it does not in your terminal. No value is changed. Your process ids, transaction numbers and times will differ.
+
+No QNX licence or target? You can follow this codelab on the traces in the repository. See the end of "Before you begin".
 
 ---
 
@@ -64,6 +66,25 @@ You need:
 
 You do not need to know Perfetto. You should be able to read C.
 
+### Optional: no QNX licence or target
+
+Items 1, 2 and 4 are only needed to run the workload on a QNX target. Without them you can still follow the codelab from "Capture a kernel trace" on, because the repository holds two traces captured from this workload on a QNX OS 8.0 target: `prio_fixed.kev.gz` (the server with a fixed-priority channel) and `prio_inherit.kev.gz` (the server after the fix). You still need Python 3.10 or later, git and a browser.
+
+Skip "Start a QNX target", the build and run steps and the two captures. Instead, set up the workspace and unpack the two traces under the names the captures would give them:
+
+```bash
+export CODELAB=$HOME/trace-codelab
+mkdir -p $CODELAB && cd $CODELAB
+git clone https://github.com/NikhilGogu/qnx-trace-studio.git
+python3 -m venv venv
+venv/bin/pip install --quiet ./qnx-trace-studio
+T=qnx-trace-studio/tests/data/run1
+gunzip -c $T/prio_fixed.kev.gz > fixed.kev
+gunzip -c $T/prio_inherit.kev.gz > inherit.kev
+```
+
+Now every `venv/bin/tracestudio` command in the steps from "Capture a kernel trace" on (`info`, `convert`, `analyze`, `diff`) works as written on `fixed.kev` and `inherit.kev`. Do not run the `scp`, `ssh` and `capture.sh` commands. The numbers in these traces come from another run, so they differ from the outputs shown here. The result is the same: hi misses 20 of 20 deadlines in `fixed.kev` and 0 of 20 in `inherit.kev`. "Clean up" is `rm -rf $CODELAB`.
+
 ---
 
 ## Start a QNX target
@@ -77,7 +98,8 @@ Create the directory, load the SDP environment and build and boot a QNX OS 8.0 i
 export CODELAB=$HOME/trace-codelab
 mkdir -p $CODELAB/target && cd $CODELAB/target
 source ~/qnx800/qnxsdp-env.sh
-mkqnximage --type=qemu --arch=x86_64 --ssh-ident=$HOME/.ssh/id_ed25519.pub --run=-h
+mkqnximage --type=qemu --arch=x86_64 \
+    --ssh-ident=$HOME/.ssh/id_ed25519.pub --run=-h
 ```
 
 mkqnximage is QNX's script for building development images. `--type=qemu --arch=x86_64` builds an x86_64 image for QEMU, `--ssh-ident` puts your public key on it so that root can log in with your key, and `--run=-h` boots it in the background. The last line it prints is the QEMU command, which shows the defaults: 2 CPUs (`-smp 2`), KVM and 1 GB of RAM:
@@ -121,7 +143,7 @@ venv/bin/tracestudio --help
 ```
 
 ```text
-usage: tracestudio [-h] {info,convert,analyze,diff,validate} ...
+usage: tracestudio [-h] {info,convert,analyze,diff,validate,open,check} ...
 
 QNX .kev kernel traces to Perfetto, with analyses
 ...
@@ -139,10 +161,12 @@ file ts_psrv ts_pload
 `-Vgcc_ntox86_64` selects GCC for QNX (`nto`) on x86_64. `-Wno-unused-function` is there because `common.h` holds helpers for all the workload programs and these two do not use all of them. `file` shows QNX executables, with QNX's dynamic linker as interpreter:
 
 ```text
-ts_psrv:  ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked,
-          interpreter /usr/lib/ldqnx-64.so.2, ..., with debug_info, not stripped
-ts_pload: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked,
-          interpreter /usr/lib/ldqnx-64.so.2, ..., with debug_info, not stripped
+ts_psrv:  ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
+          dynamically linked, interpreter /usr/lib/ldqnx-64.so.2, ...,
+          with debug_info, not stripped
+ts_pload: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
+          dynamically linked, interpreter /usr/lib/ldqnx-64.so.2, ...,
+          with debug_info, not stripped
 ```
 
 ### The server: ts_psrv
@@ -151,10 +175,12 @@ ts_pload: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically l
 
 ```c
 pthread_setname_np(pthread_self(), "psrv-rx");
-ts_pin_cpu0();                  /* ThreadCtl(_NTO_TCTL_RUNMASK, 0x1): CPU 0 only */
+/* ThreadCtl(_NTO_TCTL_RUNMASK, 0x1): CPU 0 only */
+ts_pin_cpu0();
 ts_set_prio(SCHED_FIFO, 10);
 
-int chid = ChannelCreate(fixed ? _NTO_CHF_FIXED_PRIORITY : 0);   /* fixed: option -f */
+/* fixed: option -f */
+int chid = ChannelCreate(fixed ? _NTO_CHF_FIXED_PRIORITY : 0);
 
 for (;;) {
     int rcvid = MsgReceive(chid, &m, sizeof m, &info);
@@ -189,7 +215,8 @@ Copy the programs to the target, then start the server with a fixed-priority cha
 
 ```bash
 scp ts_psrv ts_pload root@$TARGET:/tmp/
-ssh root@$TARGET 'mkdir -p /tmp/ts_logs; /tmp/ts_psrv -f & sleep 1; /tmp/ts_pload -n 20'
+ssh root@$TARGET \
+    'mkdir -p /tmp/ts_logs; /tmp/ts_psrv -f & sleep 1; /tmp/ts_pload -n 20'
 ```
 
 ts_pload finds the server through `/tmp/ts_psrv.addr`, which ts_psrv writes at start-up (hence the `sleep 1`), and tells it to exit at the end. A few seconds later it prints:
@@ -208,6 +235,10 @@ All 20 of hi's requests missed the deadline, although each needs only 0.5 ms of 
 
 ## Capture a kernel trace
 Duration: 5:00
+
+> aside positive
+>
+> **Without a QNX target:** skip to the `venv/bin/tracestudio info fixed.kev` command below and run it on the `fixed.kev` you unpacked in "Before you begin".
 
 tracelogger records the kernel's events (scheduling, thread states, kernel calls, messages) into a `.kev` file. Write a small capture script on your host:
 
@@ -301,11 +332,11 @@ venv/bin/tracestudio convert fixed.kev
 ```
 
 ```text
-wrote fixed.perfetto-trace: {"critical_paths": 630, "instants": 786, "interrupts": 317,
-  "ipc_txns": 691, ... "sched_switch": 3429, "sched_waking": 753, "slices": 16669,
-  "state_slices": 7885, ...}
-note: 9 of 691 message exchanges are incomplete or carry warnings (see their 'warnings'
-  argument)
+wrote fixed.perfetto-trace: {"critical_paths": 630, "instants": 786,
+  "interrupts": 317, "ipc_txns": 691, ... "sched_switch": 3429,
+  "sched_waking": 753, "slices": 16669, "state_slices": 7885, ...}
+note: 9 of 691 message exchanges are incomplete or carry warnings (see their
+  'warnings' argument)
 ```
 
 Open [ui.perfetto.dev](https://ui.perfetto.dev), click **Open trace file** in the menu on the left and choose `fixed.perfetto-trace` in `~/trace-codelab`. Keys you will use: `W` and `S` zoom in and out around the mouse pointer, `A` and `D` move left and right. The screenshots below come from an earlier capture of the same scenario, so their numbers differ from yours.
@@ -345,32 +376,36 @@ Duration: 4:00
 `tracestudio analyze` checks each of hi's requests:
 
 ```bash
-venv/bin/tracestudio analyze fixed.kev --deadline hi=5000 --client ts_pload/hi --top 3
+venv/bin/tracestudio analyze fixed.kev --deadline hi=5000 \
+    --client ts_pload/hi --top 3
 ```
 
 `--deadline hi=5000` counts requests of threads named `hi` slower than 5000 us, `--client ts_pload/hi` limits the report to hi's requests, and `--top 3` prints 3 inversions in full (`--json` gives all of them):
 
 ```text
-trace fixed.kev: 691 message exchanges, 682 trustworthy (analyses use only those)
-  10 of them have an ambiguous parent: kept in latency, left out of critical paths and
-    inversions
+trace fixed.kev: 691 message exchanges, 682 trustworthy (analyses use only
+  those)
+  10 of them have an ambiguous parent: kept in latency, left out of critical
+    paths and inversions
 
-MsgSend latency of trustworthy requests, 2 slowest client@priority -> server pairs (us):
-  client                  server               n       p50       p90       p99       max
-  ts_pload/hi@30          ts_psrv             20   10814.9   10913.1   10967.0   10967.0
-  ts_pload/hi@30          procnto-smp-instr    1      21.0      21.0      21.0      21.0
+MsgSend latency of trustworthy requests, 2 slowest client@priority -> server
+  pairs (us):
+  client          server             n      p50      p90      p99      max
+  ts_pload/hi@30  ts_psrv           20  10814.9  10913.1  10967.0  10967.0
+  ts_pload/hi@30  procnto-smp-instr  1     21.0     21.0     21.0     21.0
 
 deadline hi=5000 us on ts_psrv: 20 of 20 requests missed, max 10967.0 us
 
 deadline hi=5000 us on procnto-smp-instr: 0 of 1 requests missed, max 21.0 us
 
-suspected priority inversions: 20 (checked 21 exchanges, 0 excluded as untrustworthy,
-  0 with an ambiguous parent, threshold 100 us)
-  txn 482: ts_pload/hi (prio 30) waited 10875.6 us in MsgSend; for 8125.7 us of it
-    (SEND-blocked 8125.7 us) ts_psrv/psrv-rx was READY at prio 10 while every CPU it may
-    run on (CPU 0, run mask 0x1) ran a thread above prio 10, at least one of them below
-    the client's 30; most of the time ts_pload/hog (prio 20) on CPU 0, 8125.7 us; the
-    server was busy with ts_pload/lo's request (txn 481).
+suspected priority inversions: 20 (checked 21 exchanges, 0 excluded as
+  untrustworthy, 0 with an ambiguous parent, threshold 100 us)
+  txn 482: ts_pload/hi (prio 30) waited 10875.6 us in MsgSend; for 8125.7 us of
+    it (SEND-blocked 8125.7 us) ts_psrv/psrv-rx was READY at prio 10 while every
+    CPU it may run on (CPU 0, run mask 0x1) ran a thread above prio 10, at least
+    one of them below the client's 30; most of the time ts_pload/hog (prio 20)
+    on CPU 0, 8125.7 us; the server was busy with ts_pload/lo's request (txn
+    481).
   txn 484: ...
   txn 486: ...
   ... 17 more (use --json)
@@ -394,7 +429,8 @@ Duration: 3:00
 The critical path of the slowest request shows where its 11 ms went:
 
 ```bash
-venv/bin/tracestudio analyze fixed.kev --slowest 1 --client ts_pload/hi --top 3
+venv/bin/tracestudio analyze fixed.kev --slowest 1 \
+    --client ts_pload/hi --top 3
 ```
 
 After the same report as in the previous step, it prints:
@@ -403,24 +439,27 @@ After the same report as in the previous step, it prints:
 txn 572: ts_pload/hi -> ts_psrv, MsgSend latency 10967.0 us
    start us       us      %  what
       0.0      0.6    0.0  ts_pload/hi running
-      0.6   8180.6   74.6  ts_psrv/psrv-rx READY at prio 10, CPUs held by ts_pload/hog
-                           (prio 20) on CPU 0 8143.4 us, procnto-smp-instr/
-                           proc_pool_thread (prio 20) on CPU 0 37.1 us, ts_pload/hi
-                           (prio 30) on CPU 0 0.1 us
-   8181.3   1769.4   16.1  ts_psrv/psrv-rx running ts_pload/lo's request (txn 571)
+      0.6   8180.6   74.6  ts_psrv/psrv-rx READY at prio 10, CPUs held by
+                           ts_pload/hog (prio 20) on CPU 0 8143.4 us,
+                           procnto-smp-instr/proc_pool_thread (prio 20) on CPU 0
+                           37.1 us, ts_pload/hi (prio 30) on CPU 0 0.1 us
+   8181.3   1769.4   16.1  ts_psrv/psrv-rx running ts_pload/lo's request (txn
+                           571)
    9950.7     34.4    0.3  ts_psrv/psrv-rx READY at prio 10, CPUs held by
-                           procnto-smp-instr/clock_cpu_0 (prio 254) on CPU 0 18.7 us,
-                           the kernel on CPU 0 (switching) 15.7 us
-   9985.1    483.8    4.4  ts_psrv/psrv-rx running ts_pload/lo's request (txn 571)
+                           procnto-smp-instr/clock_cpu_0 (prio 254) on CPU 0
+                           18.7 us, the kernel on CPU 0 (switching) 15.7 us
+   9985.1    483.8    4.4  ts_psrv/psrv-rx running ts_pload/lo's request (txn
+                           571)
   10468.9      0.8    0.0  ts_psrv/psrv-rx running, not in a request
-  10469.6      0.4    0.0  ts_psrv/psrv-rx receiving this request (in MsgReceivev)
+  10469.6      0.4    0.0  ts_psrv/psrv-rx receiving this request (in
+                           MsgReceivev)
   10470.0    495.9    4.5  ts_psrv/psrv-rx running this request
   10965.9      0.2    0.0  ts_psrv/psrv-rx replying
-  10966.1      0.4    0.0  ts_pload/hi READY at prio 30, not explained by the trace:
-                           CPU 0 ran ts_psrv/psrv-rx (prio 10) 0.4 us
+  10966.1      0.4    0.0  ts_pload/hi READY at prio 30, not explained by the
+                           trace: CPU 0 ran ts_psrv/psrv-rx (prio 10) 0.4 us
   10966.5      0.5    0.0  ts_pload/hi running
-   by kind: server preempted 8215.0 us, server busy 2254.0 us, server running 496.4 us,
-   client running 1.1 us, unexplained ready 0.4 us
+   by kind: server preempted 8215.0 us, server busy 2254.0 us, server running
+      496.4 us, client running 1.1 us, unexplained ready 0.4 us
 ```
 
 The segments are consecutive and add up exactly to the latency. Read them top to bottom:
@@ -450,45 +489,59 @@ venv/bin/tracestudio convert inherit.kev
 ```text
 hi: 0 of 20 requests missed the 5000 us deadline, slowest 2806 us
 wrote inherit.perfetto-trace: {"critical_paths": 630, ...}
-note: 8 of 690 message exchanges are incomplete or carry warnings (see their 'warnings'
-  argument)
+note: 8 of 690 message exchanges are incomplete or carry warnings (see their
+  'warnings' argument)
 ```
 
 Compare the two traces:
 
 ```bash
-venv/bin/tracestudio diff fixed.kev inherit.kev --deadline hi=5000 --client ts_pload/hi
+venv/bin/tracestudio diff fixed.kev inherit.kev --deadline hi=5000 \
+    --client ts_pload/hi
 ```
 
 ```text
 before: fixed.kev
 after:  inherit.kev
 client filter: 'ts_pload/hi' (applies to every row below)
-message exchanges: before 691 (682 trustworthy, 0 loss records) | after 690
-  (682 trustworthy, 0 loss records)
-deadline hi=5000 us on procnto-smp-instr: before 0/1 missed, max 21.0 us | after 0/1
-  missed, max 38.6 us
-deadline hi=5000 us on ts_psrv: before 20/20 missed, max 10967.0 us | after 0/20 missed,
-  max 2790.8 us
+message exchanges: before 691 (682 trustworthy, 0 loss records) | after 690 (682
+  trustworthy, 0 loss records)
+deadline hi=5000 us on procnto-smp-instr: before 0/1 missed, max 21.0 us | after
+  0/1 missed, max 38.6 us
+deadline hi=5000 us on ts_psrv: before 20/20 missed, max 10967.0 us | after 0/20
+  missed, max 2790.8 us
 suspected priority inversions: before 20 | after 0 (checked 21 | 21 exchanges;
   insufficient evidence: 0 | 0; relying on supplied run masks: 0 | 0)
 fixed-priority channels: before ts_psrv chid 1 | after none
 
 MsgSend latency (us) by client@priority -> server: 2 pairs compared (trustworthy
-  requests on both sides), 0 without trustworthy requests on a side, 0 only before,
-  0 only after
+  requests on both sides), 0 without trustworthy requests on a side, 0 only
+  before, 0 only after
 largest p99 change:
-  client@priority   server                   n       p50       p90       p99       max
-  ts_pload/hi@30    ts_psrv          before  20   10814.9   10913.1   10967.0   10967.0
-  ts_pload/hi@30    ts_psrv          after   20    2735.8    2773.6    2790.8    2790.8
+  client@priority server            n      p50      p90      p99      max
+  ts_pload/hi@30  ts_psrv  before  20  10814.9  10913.1  10967.0  10967.0
+  ts_pload/hi@30  ts_psrv  after   20   2735.8   2773.6   2790.8   2790.8
   ...
 
-server priority while handling each client's request (share of the server's running
-  time, changes of 1 point or more):
+server priority while handling each client's request (share of the server's
+  running time, changes of 1 point or more):
   ts_psrv/psrv-rx for ts_pload/hi: before prio 10 100% | after prio 30 100%
 ```
 
 The deadline misses went from 20 of 20 to 0 of 20, the suspected inversions from 20 to 0, and the fixed-priority channel is gone. The rows are matched by role (client process, thread name and priority, server process), since process ids differ between the two runs. In the last line, psrv-rx ran hi's requests at priority 10 before and at priority 30 after.
+
+### The same proof as a test
+
+`tracestudio check` turns the same facts into assertions, with exit status 1 if any of them fails, so a CI job can run it on every build. This one asserts that the trace is intact, that all of hi's requests to ts_psrv meet the 5000 us deadline and that there are no suspected inversions:
+
+```bash
+venv/bin/tracestudio check fixed.kev --deadline hi@ts_psrv=5000 \
+    --no-inversions --client ts_pload/
+venv/bin/tracestudio check inherit.kev --deadline hi@ts_psrv=5000 \
+    --no-inversions --client ts_pload/
+```
+
+On the traces in the repository, the first command prints `PASS` for the trace integrity and `FAIL` for the deadline and the inversion assertions (`check: 3 assertions, 2 failed`) and exits with status 1. The second prints three `PASS` lines and exits with status 0.
 
 ### When the boost happens
 
@@ -501,7 +554,8 @@ The QNX System Architecture guide describes this for a client that outranks the 
 The critical path of hi's slowest request after the fix shows where the remaining time goes:
 
 ```bash
-venv/bin/tracestudio analyze inherit.kev --slowest 1 --client ts_pload/hi --top 3
+venv/bin/tracestudio analyze inherit.kev --slowest 1 \
+    --client ts_pload/hi --top 3
 ```
 
 ```text
@@ -509,18 +563,20 @@ venv/bin/tracestudio analyze inherit.kev --slowest 1 --client ts_pload/hi --top 
 txn 492: ts_pload/hi -> ts_psrv, MsgSend latency 2790.8 us
    start us       us      %  what
       0.0      1.1    0.0  ts_pload/hi running
-      1.1      0.1    0.0  ts_psrv/psrv-rx READY at prio 30, CPU held by ts_pload/hi
-                           (prio 30) on CPU 0
-      1.2   2257.6   80.9  ts_psrv/psrv-rx running ts_pload/lo's request (txn 491)
+      1.1      0.1    0.0  ts_psrv/psrv-rx READY at prio 30, CPU held by
+                           ts_pload/hi (prio 30) on CPU 0
+      1.2   2257.6   80.9  ts_psrv/psrv-rx running ts_pload/lo's request (txn
+                           491)
    2258.8      1.0    0.0  ts_psrv/psrv-rx running, not in a request
-   2259.8      0.7    0.0  ts_psrv/psrv-rx receiving this request (in MsgReceivev)
+   2259.8      0.7    0.0  ts_psrv/psrv-rx receiving this request (in
+                           MsgReceivev)
    2260.5    528.8   18.9  ts_psrv/psrv-rx running this request
    2789.3      0.2    0.0  ts_psrv/psrv-rx replying
-   2789.5      0.7    0.0  ts_pload/hi READY at prio 30, CPU held by ts_psrv/psrv-rx
-                           (prio 30) on CPU 0
+   2789.5      0.7    0.0  ts_pload/hi READY at prio 30, CPU held by
+                           ts_psrv/psrv-rx (prio 30) on CPU 0
    2790.2      0.6    0.0  ts_pload/hi running
-   by kind: server busy 2258.6 us, server running 529.7 us, client running 1.7 us,
-   client ready 0.7 us, server preempted 0.1 us
+   by kind: server busy 2258.6 us, server running 529.7 us, client running 1.7
+      us, client ready 0.7 us, server preempted 0.1 us
 ```
 
 psrv-rx was already at priority 30 1.1 us into hi's `MsgSend()`, before it received hi's message. The hog no longer appears. What remains is the server finishing lo's request at hi's priority: a single-threaded server handles one request at a time, so hi still waits for the request in progress. How long a request can wait behind another one depends on the server's design (shorter requests, or more receive threads).
