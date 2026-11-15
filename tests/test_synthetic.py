@@ -596,6 +596,110 @@ def test_send_phase_needs_a_sole_receiver():
     assert "other threads of server may receive on the channel" in r["insufficient_evidence"][0]["reasons"]
 
 
+def pool_scene(s2="held", mid_prio=20):
+    """A server process with two receive threads on chid 1 (fixed priority), both at 10 and pinned to CPU 0.
+    s1 handles b's request and is preempted; s2 is set up by `s2`; mid preempts both; hi (30) sends and stays
+    SEND-blocked until s1 replies to b and receives it. CPU 1 is idle throughout.
+    s2: "held" (handles c's request, READY behind mid), "reply_blocked" (inside its own MsgSend), "other_channel"
+    (RECEIVE on chid 2), "idle" (RECEIVE on chid 1), "nomask" (held, run mask never traced), "noprio" (held, its
+    READY event carries no priority), "free" (held, but may run on the idle CPU 1), "late" (first seen during hi's
+    wait), "loss" (held, events lost on CPU 1 after the threads were set up, so the thread list may be incomplete)."""
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(1, T + 5, RUNNING, IDLE1, 0)
+    g.state(0, T + 10, RUNNING, S, 10)
+    g.channel(0, T + 12, 0x1)
+    g.channel(0, T + 14, 0x1, chid=2)
+    g.runmask(0, T + 20, 0x1)
+    g.wait_receive(0, T + 30, S, 10)
+    if s2 != "late":
+        g.state(0, T + 50, RUNNING, S2, 10)
+        if s2 != "nomask":
+            g.runmask(0, T + 55, 0x2 if s2 == "free" else 0x1)
+        g.wait_receive(0, T + 60, S2, 10)                      # RECEIVE in MsgReceivev on chid 1
+    if s2 == "loss":
+        g.event(1, T + 500_000, C_CONTROL, 8, [1, 0])          # DROPPED on CPU 1: a thread could appear unseen
+    ms = 1_000_000
+    g.state(0, T + ms, RUNNING, B, 10)
+    g.send(0, T + ms + 10, B, S[0], 0x10001, prio=10)
+    g.receive(0, T + ms + 40, S, B, 0x10001, prio=10)           # s1 handles b's request
+    g.state(0, T + ms + 1000, READY, S, 10)
+    if s2 not in ("idle", "late"):
+        g.state(0, T + ms + 1010, RUNNING, C, 10)
+        g.send(0, T + ms + 1020, C, S[0], 0x10002, prio=10)
+        g.receive(0, T + ms + 1050, S2, C, 0x10002, prio=10)    # s2 handles c's request
+        if s2 == "other_channel":
+            g.kcall(0, T + ms + 2000, K_RECEIVEV, [2, 1])
+            g.state(0, T + ms + 2010, RECEIVE, S2, 10)
+        elif s2 == "reply_blocked":
+            g.send(0, T + ms + 2000, S2, M[0], 0x30001, prio=10)
+        else:
+            g.state(0, T + ms + 100_000, READY, S2, None if s2 == "noprio" else 10)
+    g.state(0, T + ms + 100_010, RUNNING, M, mid_prio)
+    g.state(0, T + ms + 200_000, READY, M, mid_prio)
+    g.state(0, T + ms + 200_010, RUNNING, H, 30)
+    g.send(0, T + ms + 200_020, H, S[0], 0x20003, prio=30, block=SEND)
+    g.state(0, T + ms + 200_100, RUNNING, M, mid_prio)
+    if s2 == "late":
+        g.state(0, T + ms + 300_000, READY, S2, 10)
+    g.state(0, T + 3 * ms, NANOSLEEP, M, mid_prio)
+    g.state(0, T + 3 * ms + 10, RUNNING, S, 10)
+    g.reply(0, T + 3 * ms + 100, S, B, 0x10001, 10)
+    g.receive(0, T + 3 * ms + 200, S, H, 0x20003, prio=10)
+    g.reply(0, T + 3 * ms + 600_000, S, H, 0x20003, 30)
+    g.send_exit(0, T + 3 * ms + 600_100, H, 30)
+    return model(g)
+
+
+def test_send_phase_inversion_in_a_thread_pool():
+    _, m = pool_scene("held")
+    r = suspected_inversions(m)
+    (x,) = r["suspected"]
+    assert r["insufficient_evidence"] == []
+    assert x["client"] == "high/h" and set(x["while"]) == {"SEND"} and 1799 < x["inversion_us"] < 1801
+    assert x["preempted_by"][0]["thread"] == "mid/m"
+    assert [(t["thread"], t["tid"]) for t in x["receivers"]] == [("server/s1", 1), ("server/s2", 2)]
+    assert [list(t["states"]) for t in x["receivers"]] == [["READY, held up"], ["READY, held up"]]
+    assert "rests on all 2 known receive-capable threads of server" in x["evidence"]
+    assert "server/s1 (tid 1): READY, held up" in x["evidence"] and "server/s2 (tid 2): READY, held up" in x["evidence"]
+    # a receiver that cannot take the message (inside its own MsgSend, or receiving on another channel)
+    for kind, state in (("reply_blocked", "REPLY-blocked"), ("other_channel", "RECEIVE-blocked on chid 2")):
+        _, m = pool_scene(kind)
+        r = suspected_inversions(m)
+        (x,) = r["suspected"]
+        assert r["insufficient_evidence"] == [] and 1799 < x["inversion_us"] < 1801, kind
+        assert dict((t["thread"], list(t["states"])) for t in x["receivers"]) == {
+            "server/s1": ["READY, held up"], "server/s2": [state]}, kind
+        assert "server/s2 (tid 2): %s" % state in x["evidence"], kind
+
+
+def test_send_phase_pool_with_an_idle_receiver_is_no_inversion():
+    _, m = pool_scene("idle")                                   # s2 waits in MsgReceivev on hi's channel
+    r = suspected_inversions(m)
+    assert r["checked"] == 1 and r["suspected"] == [] and r["insufficient_evidence"] == []
+
+
+def test_send_phase_pool_needs_every_receiver_accounted_for():
+    for kind, reason in (("nomask", "run mask of server/s2 not traced"),
+                         ("noprio", "priority of server/s2 unknown"),
+                         ("free", "CPU 1 ran procnto-smp-instr/idle_cpu_1 at prio 0, not above server/s2's 10"),
+                         ("late", "a thread of server started or ended during the wait"),
+                         ("loss", "other threads of server may receive on the channel")):
+        _, m = pool_scene(kind)
+        r = suspected_inversions(m)
+        assert r["suspected"] == [], kind
+        assert Timeline(m).inventory_complete(S[0], m.end_ts) == (kind != "loss"), kind
+        (x,) = r["insufficient_evidence"]
+        assert reason in x["reasons"], (kind, x["reasons"])
+
+
+def test_send_phase_pool_equal_priority_runner_is_no_inversion():
+    _, m = pool_scene("held", mid_prio=30)                      # the thread on CPU 0 is not below the client
+    r = suspected_inversions(m)
+    assert r["suspected"] == [] and r["insufficient_evidence"] == []
+
+
 def test_no_inversion_for_plain_blocking():
     g = Gen(ncpu=1)
     g.buffer(0, T)
