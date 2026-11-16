@@ -134,6 +134,32 @@ def test_perfetto_loads():
         tp.close()
 
 
+
+def test_every_checked_in_capture_converts_and_loads():
+    try:
+        from perfetto.trace_processor import TraceProcessor
+        from tracestudio.perfetto_out import write
+    except ImportError:
+        return skip("perfetto package not installed")
+    found = sorted(os.path.relpath(os.path.join(d, f), os.path.join(HERE, "data"))
+                   for d, _, fs in os.walk(os.path.join(HERE, "data")) for f in fs if f.endswith(".kev.gz"))
+    assert len(found) == 11, found                          # README and docs/VALIDATION.md name this count
+    for rel in found:
+        run, name = os.path.split(rel[:-len(".kev.gz")])
+        out = os.path.join(TMP, "%s_%s.perfetto-trace" % (run, name))
+        write(Model(KevFile(kev(name, os.path.join(HERE, "data", run)))), out)
+        tp = TraceProcessor(trace=out)
+        errs = [(r.name, r.value) for r in tp.query(
+            "SELECT name, value FROM stats WHERE value > 0 AND severity IN ('error', 'data_loss')")]
+        assert not errs, (rel, errs)
+        assert list(tp.query("SELECT COUNT(*) n FROM slice WHERE dur < 0"))[0].n == 0, rel
+        bad_flows = list(tp.query(
+            "SELECT COUNT(*) n FROM flow f JOIN slice a ON a.id = f.slice_out JOIN slice b ON b.id = f.slice_in "
+            "WHERE extract_arg(a.arg_set_id, 'debug.txn') IS NOT extract_arg(b.arg_set_id, 'debug.txn')"))[0].n
+        assert bad_flows == 0, rel
+        assert list(tp.query("SELECT COUNT(*) n FROM thread_state"))[0].n > 0, rel
+        tp.close()
+
 def test_inversion_after_receive_on_a_real_capture():
     # run 3: lo sends 0.5 ms of work at t+0, hi at t+4 ms, the hog wakes at t+4.2 ms, while
     # the server already handles hi's request
