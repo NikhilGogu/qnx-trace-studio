@@ -2,6 +2,7 @@
 
 ## 0.4.0
 
+- Fixed: the GitHub Action split `args` on spaces and expanded wildcards. It now splits it as a shell would, with quotes and without expansion.
 - Inversions: SEND-phase verdicts for multi-threaded servers. Every receive-capable thread of the server must be accounted for, or the result is "insufficient evidence".
 - Fixed: `analyze --min-us 0` and `check --min-us 0` crashed on a request with no inversion time.
 - `action.yml`: a GitHub Action that runs `tracestudio check` and writes a JUnit report.

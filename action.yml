@@ -8,7 +8,10 @@ inputs:
     description: Path to the .kev or .kev.gz trace, relative to the workspace
     required: true
   args:
-    description: Options for tracestudio check, for example "--deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/"
+    description: >-
+      Options for tracestudio check, for example "--deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/".
+      Split into words as a shell would: quote a word that holds spaces ("--client 'ts pload/'"). Wildcards
+      and $VARIABLES are passed on as written, never expanded.
     required: true
   junit:
     description: Where to write the JUnit XML report
@@ -38,6 +41,10 @@ runs:
         TS_ARGS: ${{ inputs.args }}
         TS_JUNIT: ${{ inputs.junit }}
       run: |
-        # TS_ARGS is split into words on purpose; it holds several options.
-        # shellcheck disable=SC2086
-        tracestudio check "$TS_TRACE" $TS_ARGS --junit "$TS_JUNIT"
+        # Split TS_ARGS as a POSIX shell would (quotes group words) but without expanding wildcards or
+        # variables; an unbalanced quote fails here, before check runs.
+        python -c 'import os, shlex, sys; sys.stdout.write("".join(a + "\0" for a in shlex.split(os.environ["TS_ARGS"])))' \
+          > "$RUNNER_TEMP/tracestudio-args"
+        args=()
+        while IFS= read -r -d '' a; do args+=("$a"); done < "$RUNNER_TEMP/tracestudio-args"
+        tracestudio check "$TS_TRACE" "${args[@]}" --junit "$TS_JUNIT"

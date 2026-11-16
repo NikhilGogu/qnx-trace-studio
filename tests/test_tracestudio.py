@@ -643,6 +643,38 @@ def test_aarch64le_capture():
         raise AssertionError("traceprinter not found")
 
 
+def test_action_args_split_like_a_shell():
+    """action.yml passes `args` to tracestudio check split as a shell would: quotes group words, wildcards stay
+    literal, and an unbalanced quote fails the step before check runs."""
+    import re
+    with open(os.path.join(HERE, "..", "action.yml")) as f:
+        text = f.read()
+    step = text[text.index("- name: tracestudio check"):]
+    head, body = re.search(r"\n( *)run: \|\n((?:\1  .*\n|\n)+)", step).groups()
+    script = "\n".join(ln[len(head) + 2:] for ln in body.splitlines())
+    work = tempfile.mkdtemp(prefix="ts-action-")
+    shim = os.path.join(work, "bin")
+    os.mkdir(shim)
+    with open(os.path.join(shim, "tracestudio"), "w") as f:
+        f.write("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n")
+    os.chmod(os.path.join(shim, "tracestudio"), 0o755)
+    open(os.path.join(work, "ts_x"), "w").close()                 # what an unquoted ts_* would expand to
+    os.symlink(sys.executable, os.path.join(shim, "python"))       # the action runs `python` from setup-python
+
+    def run(args):
+        env = dict(os.environ, PATH=os.pathsep.join([shim, os.environ.get("PATH", "")]), TS_TRACE="t.kev",
+                   TS_ARGS=args, TS_JUNIT="r.xml", RUNNER_TEMP=work)
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=work, env=env,
+                              capture_output=True, text=True)
+    r = run('--client "ts pload/" --no-inversions')
+    assert r.returncode == 0 and r.stdout.splitlines() == [
+        "check", "t.kev", "--client", "ts pload/", "--no-inversions", "--junit", "r.xml"], (r.stdout, r.stderr)
+    r = run("--client ts_*")
+    assert r.returncode == 0 and r.stdout.splitlines()[2:4] == ["--client", "ts_*"], r.stdout
+    r = run('--client "ts pload/')
+    assert r.returncode != 0 and r.stdout == "", (r.returncode, r.stdout)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
