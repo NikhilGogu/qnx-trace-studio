@@ -367,6 +367,10 @@ The JUnit report of the failing run starts like this:
 
 Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. The workload's own measurement (11112 us) is about 15 us longer than the traced MsgSend.
 
+## Use from a coding agent
+
+[skills/trace-studio/SKILL.md](skills/trace-studio/SKILL.md) is an agent skill: it tells a coding agent how to capture a trace, which command answers which question, how to read "insufficient evidence", and how to gate a build with `check`. [docs/JSON.md](docs/JSON.md) lists the keys of `analyze --json`. Tests parse every command in the skill and compare the JSON keys with that page.
+
 ## Support matrix
 
 | | status |
@@ -392,7 +396,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
 - 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 91 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 18 on the checked-in captures, among them one that runs the quickstart commands above.
+- `python3 tests/test_tracestudio.py` runs 92 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 19 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

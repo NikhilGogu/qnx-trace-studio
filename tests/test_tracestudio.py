@@ -312,6 +312,38 @@ def test_analyze_json_contract():
     assert set(d) == {"before", "after", "comparison"} and set(d["comparison"]) == {"latency", "server_priority"}
     assert set(d["before"]) == set(d["after"]) == doc["Top level"] - {"critical_paths"}
 
+
+def test_agent_skill_commands_parse():
+    """skills/trace-studio/SKILL.md names only real subcommands and options, covers every analysis command, and
+    quotes reasons the analysis really gives."""
+    import re
+    import shlex
+    from tracestudio import __version__
+    from tracestudio.cli import build_parser
+    with open(os.path.join(HERE, "..", "skills", "trace-studio", "SKILL.md")) as f:
+        text = f.read()
+    fm = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    assert fm, "SKILL.md must start with YAML frontmatter"
+    fields = dict((k.strip(), v.strip().strip('"')) for k, _, v in (ln.partition(":") for ln in fm.group(1).splitlines()))
+    assert fields["name"] == "trace-studio" and fields["license"] == "Apache-2.0"
+    assert 0 < len(fields["description"]) <= 1024
+    assert "trace-studio v%s" % __version__ in fields["description"]
+    cmds = re.findall(r"`(tracestudio [^`]+\.kev[^`]*)`", text)      # commands with a trace, not bare names
+    assert len(cmds) >= 12, cmds
+    parser = build_parser()
+    for c in cmds:
+        argv = shlex.split(c)[1:]
+        try:
+            parser.parse_args(argv)
+        except SystemExit:
+            raise AssertionError("does not parse: " + c)
+    used = {shlex.split(c)[1] for c in cmds}
+    assert used == {"info", "analyze", "diff", "convert", "open", "check"}, used
+    with open(os.path.join(HERE, "..", "tracestudio", "analyses.py")) as f:
+        src = f.read()
+    for reason in ("run mask of %s not traced", "request handed off: received by"):
+        assert reason in src, reason
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window
