@@ -449,7 +449,7 @@ def cmd_check(a):
     return 0 if all(r.ok for r in results) else 1
 
 
-def main(argv=None):
+def build_parser():
     p = argparse.ArgumentParser(prog="tracestudio", description="QNX .kev kernel traces to Perfetto, with analyses")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("info", help="header, counts, losses and decoder counters as JSON")
@@ -527,7 +527,11 @@ def main(argv=None):
     s.add_argument("--assume-unpinned", action="append", metavar="PROCESS", help="as for analyze")
     s.add_argument("--junit", metavar="FILE", help="also write a JUnit XML report")
     s.set_defaults(fn=cmd_check)
-    a = p.parse_args(argv)
+    return p
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
     try:
         return a.fn(a)
     except KevError as e:
