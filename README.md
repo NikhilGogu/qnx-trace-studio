@@ -1,6 +1,8 @@
 # trace-studio
 
-trace-studio explains missed deadlines on QNX OS 8.0 from a kernel trace. It reads the `.kev` file that `tracelogger` writes and tells you which server a client waited for, what that server was doing, who held the CPU it needed, and whether the cause was a priority inversion, with the evidence for each verdict. It converts the trace to a Perfetto timeline, and it runs as a command-line tool on a development host, so the same check can gate a CI build.
+trace-studio explains missed deadlines on QNX OS 8.0 from a kernel trace. It reads the `.kev` file that `tracelogger` writes and tells you which server a client waited for, what that server was doing, who held the CPU it needed, and whether the trace shows a suspected priority inversion, with the evidence for each verdict. It converts the trace to a Perfetto timeline. It runs as a command-line tool on a development host, so the same check can gate a CI build.
+
+It is for developers of QNX message-passing systems who need to know why a request was late. The quickstart below runs on traces in this repository, with no QNX target or licence.
 
 ![Perfetto timeline of a priority inversion: hi waits in SEND while hog holds CPU 0 and the server is READY](docs/img/critical_path.png)
 
@@ -62,7 +64,7 @@ The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload tu
 |---|---|
 | Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 98 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
 | Design | The quickstart above runs on the checked-in captures without QNX. `check` gives an exit status and JUnit XML, and [action.yml](action.yml) runs it as a GitHub Action. `open` loads a trace in Perfetto with the right tracks pinned. [tools/build_examples.py](tools/build_examples.py) builds a page with every capture. [docs/JSON.md](docs/JSON.md) documents the JSON output |
-| Potential impact | Timing budgets and "no suspected inversion" as a CI gate for QNX message passing. The mutex owner chain in quickstart step 5, the more common real-world case. Verdicts for multi-threaded servers |
+| Potential impact | Timing budgets and "no suspected inversion" as a CI gate for QNX message passing. The mutex owner chain in quickstart step 5, which is the more common case in real code. Verdicts for multi-threaded servers |
 | Innovation | Verdicts that carry their evidence, and "insufficient evidence" with reasons when the trace cannot support one. A critical path that crosses processes and follows mutex owners ([What trace-studio adds](#what-trace-studio-adds)). Perfetto SQL examples in [docs/sql](docs/sql). An agent skill in [skills/trace-studio](skills/trace-studio/SKILL.md) |
 
 Where QNX is used:
@@ -74,13 +76,13 @@ Where QNX is used:
 
 ## trace-studio and the System Profiler
 
-The System Profiler in the QNX Momentics IDE is the tool for exploring a `.kev` file by hand. trace-studio does not replace it. It covers the cases where a person at an IDE is the wrong shape:
+The System Profiler in the QNX Momentics IDE is the tool for exploring a `.kev` file by hand. trace-studio is for the cases where nobody sits at the IDE, such as a build machine or a CI job:
 
 | | trace-studio |
 |---|---|
 | Where it runs | A command line on the development host or a build machine. No IDE and no QNX libraries on the host. |
 | What it answers | A verdict in text: this request was late because of this thread on this CPU. When the trace cannot support a verdict it says "insufficient evidence". |
-| CI | `tracestudio check` turns deadlines and "no priority inversion" into assertions with an exit status and a JUnit report. |
+| CI | `tracestudio check` turns deadlines and "no suspected priority inversion" into assertions with an exit status and a JUnit report. |
 | Before and after | `tracestudio diff` compares two traces of the same workload. |
 | Viewer | Perfetto, in a browser, with every message exchange drawn from client to server and queryable with Perfetto SQL. |
 
@@ -452,7 +454,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 
 ## Validation evidence
 
-[docs/VALIDATION.md](docs/VALIDATION.md) has the details, the commands and the counts. In short:
+[docs/VALIDATION.md](docs/VALIDATION.md) has the details, the commands and the counts.
 
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.

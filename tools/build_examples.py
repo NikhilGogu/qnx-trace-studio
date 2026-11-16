@@ -15,9 +15,7 @@ not allow publishing performance results of QNX software without written approva
 thread names, priorities, states and counts stay. --with-timing keeps the times, for local use.
 """
 import argparse
-import contextlib
 import html
-import io
 import json
 import os
 import re
@@ -73,20 +71,17 @@ EXAMPLES = [
 ]
 
 
-def withhold(text, keep_timing):
-    return text if keep_timing else TIMING.sub(WITHHELD, text)
-
-
 def example(rel, analyze_opts, check_opts, out_dir, keep_timing):
     """The page section for one capture as a dict; writes <run>_<name>.perfetto-trace into out_dir."""
+    def text(lines):            # what a reader sees; the Perfetto URL and file names keep their digits
+        return list(lines) if keep_timing else [TIMING.sub(WITHHELD, t) for t in lines]
     path = os.path.join("tests", "data", rel + ".kev.gz")
     model = Model(KevFile(os.path.join(ROOT, path)))
     a = build_parser().parse_args(["analyze", path] + analyze_opts)
     tl = _timeline(model, a)
     res = _analysis(model, a, tl)
     fname = rel.replace("/", "_") + ".perfetto-trace"
-    with contextlib.redirect_stdout(io.StringIO()):
-        write(model, os.path.join(out_dir, fname))
+    write(model, os.path.join(out_dir, fname))
     inv = res["inversions"]
     lines = ["%d message exchanges, %d trustworthy" % (res["transactions"], res["trustworthy"])]
     for name, dl in res["deadlines"].items():
@@ -106,20 +101,20 @@ def example(rel, analyze_opts, check_opts, out_dir, keep_timing):
     paths = []
     for tx in slowest_requests(model, a.slowest, a.client):
         cp = to_json(model, tx, critical_path(model, tx, tl))
-        paths.append({"title": "txn %d: %s -> %s, MsgSend latency %.1f us" % (
-            cp["txn"], cp["client"], cp["server"], cp["latency_us"]),
-            "segments": ["%s: %.1f us" % (s["what"], s["us"]) for s in cp["segments"]]})
+        title = "txn %d: %s -> %s, MsgSend latency %.1f us" % (cp["txn"], cp["client"], cp["server"],
+                                                              cp["latency_us"])
+        paths.append({"title": text([title])[0],
+                      "segments": text("%s: %.1f us" % (s["what"], s["us"]) for s in cp["segments"])})
     gate = None
     if check_opts:
         c = build_parser().parse_args(["check", path] + check_opts)
         results = run_checks(model, _timeline(model, c), c)
         gate = {"command": "tracestudio check %s %s" % (path, " ".join(check_opts)),
-                "passed": all(r.ok for r in results), "lines": render(results)}
+                "passed": all(r.ok for r in results), "lines": text(render(results))}
     pins, _ = default_pins(model, a.deadline or ())
-    sect = {"id": rel.replace("/", "_"), "trace": fname, "ui": ui_url(pins),
-            "command": "tracestudio analyze %s %s" % (path, " ".join(analyze_opts)), "lines": lines,
-            "evidence": evidence, "paths": paths, "gate": gate}
-    return json.loads(withhold(json.dumps(sect), keep_timing))
+    return {"id": rel.replace("/", "_"), "trace": fname, "ui": ui_url(pins),
+            "command": "tracestudio analyze %s %s" % (path, " ".join(analyze_opts)), "lines": text(lines),
+            "evidence": text(evidence), "paths": paths, "gate": gate}
 
 
 # The hand-off follows https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui, as

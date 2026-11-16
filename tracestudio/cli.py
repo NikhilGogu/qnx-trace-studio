@@ -7,9 +7,11 @@
   tracestudio analyze  TRACE.kev [--deadline THREAD=US] [--request TXN] [--slowest N] [--json]
   tracestudio diff     BEFORE.kev AFTER.kev [--deadline THREAD=US] [--json]
   tracestudio validate TRACE.kev --logs DIR       (workload ground truth)
+  tracestudio open     TRACE.kev [--pin REGEX] [--no-browser]
+  tracestudio check    TRACE.kev [--deadline THREAD[@SERVER]=US] [--no-inversions] [--junit FILE]
 
-Exit status: 0 on success, 1 when validation fails or finds no logged requests,
-or when a trace has no events, 2 on usage errors.
+Exit status: 0 on success, 1 when validation or a check fails, when validate finds
+no logged requests, or when a trace has no events; 2 on usage errors.
 """
 from __future__ import annotations
 
