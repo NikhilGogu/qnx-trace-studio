@@ -1,0 +1,43 @@
+name: tracestudio check
+description: Check real-time budgets and priority inversions in a QNX kernel trace (.kev) and write a JUnit report
+branding:
+  icon: clock
+  color: blue
+inputs:
+  trace:
+    description: Path to the .kev or .kev.gz trace, relative to the workspace
+    required: true
+  args:
+    description: Options for tracestudio check, for example "--deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/"
+    required: true
+  junit:
+    description: Where to write the JUnit XML report
+    required: false
+    default: tracestudio-junit.xml
+  python-version:
+    description: Python version to run trace-studio with (3.10 or newer)
+    required: false
+    default: "3.12"
+outputs:
+  junit:
+    description: Path of the JUnit XML report
+    value: ${{ inputs.junit }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Install trace-studio
+      shell: bash
+      run: python -m pip install --quiet "$GITHUB_ACTION_PATH"
+    - name: tracestudio check
+      shell: bash
+      env:
+        TS_TRACE: ${{ inputs.trace }}
+        TS_ARGS: ${{ inputs.args }}
+        TS_JUNIT: ${{ inputs.junit }}
+      run: |
+        # TS_ARGS is split into words on purpose; it holds several options.
+        # shellcheck disable=SC2086
+        tracestudio check "$TS_TRACE" $TS_ARGS --junit "$TS_JUNIT"

@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The tag matches the package version
+        run: |
+          version=$(python -c "import tracestudio; print(tracestudio.__version__)")
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Build the wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Install the wheel in a fresh venv and run the quickstart gate from outside the checkout
+        run: |
+          python -m venv /tmp/ts-venv
+          /tmp/ts-venv/bin/pip install dist/*.whl
+          cd /tmp
+          if /tmp/ts-venv/bin/tracestudio check "$GITHUB_WORKSPACE/tests/data/run1/prio_fixed.kev.gz" --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/; then
+            echo "expected exit status 1 for prio_fixed"; exit 1
+          fi
+          /tmp/ts-venv/bin/tracestudio check "$GITHUB_WORKSPACE/tests/data/run1/prio_inherit.kev.gz" --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+      - name: Run the test suite
+        run: |
+          /tmp/ts-venv/bin/python tests/test_tracestudio.py
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v v="## ${GITHUB_REF_NAME#v}" '$0 == v {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
+          test -s notes.md
+      - name: Create the GitHub Release with the wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.whl --title "trace-studio $GITHUB_REF_NAME" --notes-file notes.md

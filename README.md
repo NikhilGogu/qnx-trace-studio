@@ -1,13 +1,16 @@
 # trace-studio
 
-trace-studio explains missed deadlines on QNX OS 8.0 from a kernel trace. It reads the `.kev` file that `tracelogger` writes and tells you which server a client waited for, what that server was doing, who held the CPU it needed, and whether the cause was a priority inversion, with the evidence for each verdict. It converts the trace to a Perfetto timeline, and it runs as a command-line tool on a development host, so the same check can gate a CI build.
+trace-studio explains missed deadlines on QNX OS 8.0 from a kernel trace. It reads the `.kev` file that `tracelogger` writes and tells you which server a client waited for, what that server was doing, who held the CPU it needed, and whether the trace shows a suspected priority inversion, with the evidence for each verdict. It converts the trace to a Perfetto timeline. It runs as a command-line tool on a development host, so the same check can gate a CI build.
+
+It is for developers of QNX message-passing systems who need to know why a request was late. The quickstart below runs on traces in this repository, with no QNX target or licence.
 
 ![Perfetto timeline of a priority inversion: hi waits in SEND while hog holds CPU 0 and the server is READY](docs/img/critical_path.png)
 
 A high-priority client (`hi`) waits in SEND while a medium-priority thread (`hog`) holds the only CPU the server may use. The critical-path track under `hi` names the cause.
 
 - Demo video (under 3 minutes): https://youtu.be/YeNumwjDXUk
-- Codelab, about 40 minutes: [Find a priority inversion in QNX message passing](https://nikhil-qnx-codelabs.pages.dev/find-priority-inversion/) (source in [codelab/](codelab/find-priority-inversion.md))
+- For judges: [where to find the evidence for each criterion](#for-judges)
+- Codelab: [Find a priority inversion in QNX message passing](https://nikhil-qnx-codelabs.pages.dev/find-priority-inversion/) (source in [codelab/](codelab/find-priority-inversion.md))
 
 ## Try it without a QNX target
 
@@ -29,6 +32,9 @@ venv/bin/tracestudio open tests/data/run1/prio_fixed.kev.gz
 # 4. The same question as a CI gate: exit status 1 for the first trace, 0 for the second
 venv/bin/tracestudio check tests/data/run1/prio_fixed.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
 venv/bin/tracestudio check tests/data/run1/prio_inherit.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+
+# 5. A mutex without priority inheritance: whose lock did hi's server wait on, and what was the owner doing?
+venv/bin/tracestudio analyze tests/data/run4/mutex_chain_nopi.kev.gz --slowest 1 --client ts_mutex/hi
 ```
 
 Step 1 reports that 20 of 20 `hi` requests missed the deadline and lists 20 suspected priority inversions. Each one comes with its evidence, for example:
@@ -41,33 +47,76 @@ txn 520: ts_pload/hi (prio 30) waited 10937.8 us in MsgSend; for 8151.9 us of it
 
 Step 2 shows 0 of 20 misses and no inversions once the channel inherits the client's priority.
 
-The repository also has a second, more common case: a mutex created with `PTHREAD_PRIO_NONE`, where the owner chain is followed from the waiter to what the owner was doing (`tests/data/run4/mutex_chain_nopi.kev.gz`, see [Mutex owner chains](#mutex-owner-chains)).
+To see every checked-in capture on one page, with a button that opens each in Perfetto:
+
+```
+venv/bin/python tools/build_examples.py --out site --with-timing
+python3 -m http.server -d site 8000        # then open http://127.0.0.1:8000
+```
+
+Without `--with-timing` the page replaces every measured time with "[timing withheld]". That is the version `.github/workflows/pages.yml` publishes, because the QNX licence does not allow publishing performance results without approval.
+
+The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload turns inheritance off on purpose. Step 5 is the more common case. A mutex created with `PTHREAD_PRIO_NONE` is held by a low-priority thread that waits on another server, and the critical path follows the chain from hi's server thread to the mutex owner and into the owner's own request, where a medium-priority hog holds the CPU (output under [Mutex owner chains](#mutex-owner-chains)). Thread-pool servers are covered by the inversion rule too, so far on synthetic traces only (see [Limitations](#limitations)).
+
+## For judges
+
+| criterion | where to look |
+|---|---|
+| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 98 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
+| Design | The quickstart above runs on the checked-in captures without QNX. `check` gives an exit status and JUnit XML, and [action.yml](action.yml) runs it as a GitHub Action. `open` loads a trace in Perfetto with the right tracks pinned. [tools/build_examples.py](tools/build_examples.py) builds a page with every capture. [docs/JSON.md](docs/JSON.md) documents the JSON output |
+| Potential impact | Timing budgets and "no suspected inversion" as a CI gate for QNX message passing. The mutex owner chain in quickstart step 5, which is the more common case in real code. Verdicts for multi-threaded servers |
+| Innovation | Verdicts that carry their evidence, and "insufficient evidence" with reasons when the trace cannot support one. A critical path that crosses processes and follows mutex owners ([What trace-studio adds](#what-trace-studio-adds)). Perfetto SQL examples in [docs/sql](docs/sql). An agent skill in [skills/trace-studio](skills/trace-studio/SKILL.md) |
+
+Where QNX is used:
+
+- The traces in `tests/data` were written by `tracelogger` on QNX OS 8.0 (x86_64 and aarch64le, under QEMU).
+- The workload in [workload/](workload) is QNX C code built with `qcc`: `ChannelCreate` with and without `_NTO_CHF_FIXED_PRIORITY`, `MsgSend`, `MsgReceive`, `MsgReply`, `MsgSendPulse`, `TimerTimeout`, `ThreadCtl(_NTO_TCTL_RUNMASK)` and a `PTHREAD_PRIO_NONE` mutex.
+- The kernel call numbers, thread states and message types in [tracestudio/qnx_tables.py](tracestudio/qnx_tables.py) are generated from the SDP 8.0 headers by [tools/gen_qnx_tables.py](tools/gen_qnx_tables.py).
+- [tools/ci_qemu_check.sh](tools/ci_qemu_check.sh) builds the workload with the SDP, boots a QNX target with `mkqnximage`, captures a scenario and runs `tracestudio check` on it.
 
 ## trace-studio and the System Profiler
 
-The System Profiler in the QNX Momentics IDE is the tool for exploring a `.kev` file by hand. trace-studio does not replace it. It covers the cases where a person at an IDE is the wrong shape:
+The System Profiler in the QNX Momentics IDE is the tool for exploring a `.kev` file by hand. trace-studio is for the cases where nobody sits at the IDE, such as a build machine or a CI job:
 
 | | trace-studio |
 |---|---|
 | Where it runs | A command line on the development host or a build machine. No IDE and no QNX libraries on the host. |
 | What it answers | A verdict in text: this request was late because of this thread on this CPU. When the trace cannot support a verdict it says "insufficient evidence". |
-| CI | `tracestudio check` turns deadlines and "no priority inversion" into assertions with an exit status and a JUnit report. |
+| CI | `tracestudio check` turns deadlines and "no suspected priority inversion" into assertions with an exit status and a JUnit report. |
 | Before and after | `tracestudio diff` compares two traces of the same workload. |
 | Viewer | Perfetto, in a browser, with every message exchange drawn from client to server and queryable with Perfetto SQL. |
 
 What it does:
 
-- Reads `.kev` files directly with its own parser, so no QNX libraries are needed on the host. On the 17 x86_64 and 3 aarch64le captures listed below every event matches the SDP's `traceprinter` (timestamp, CPU, class, event), and so does every argument value both print, sign included.
+- Reads `.kev` files directly with its own parser, so no QNX libraries are needed on the host. On the 20 build-box captures (17 x86_64, 3 aarch64le; 11 of them in `tests/data`) every event matches the SDP's `traceprinter` (timestamp, CPU, class, event), and every argument value of the event kinds trace-studio decodes matches too, sign included; [docs/VALIDATION.md](docs/VALIDATION.md) lists what was not compared.
 - Converts to a Perfetto trace: per-CPU scheduling tracks, QNX thread states as the kernel reports them (SEND, RECEIVE, REPLY, MUTEX, ...), QNX priorities, the message exchanges it can link, each with the server's handling and the reply (joined by arrows when the exchange is trustworthy), resource-manager message names, pulses, interrupts, and a critical-path track per client thread. Names and paths that rest on a heuristic are labelled as candidates (`MsgSend _IO_READ (candidate) -> devb-eide`, argument `path_candidate`).
 - `analyze`: latency per client and server, deadline misses, suspected priority inversions with the evidence, the critical path of a trustworthy request, and mutex waits with the owner and what it was doing, when the trace shows who the owner was.
 - `diff`: before and after comparison of two traces.
 - Keeps exchanges that cross lost events or carry contradictory kernel information, marks them `[not trustworthy]` and leaves them out of the analyses, with counts. A request with an ambiguous parent is kept in latency and left out of critical paths and inversions. Conclusions the trace cannot support are reported as "insufficient evidence", "not explained by the trace" or "unknown".
 
+## What trace-studio adds
+
+Each capability below names the code that implements it and a test that checks it.
+
+| capability | code | test |
+|---|---|---|
+| A critical path that crosses processes: it splits one request's latency into segments that add up exactly, follows nested requests to other servers, and follows a mutex into the owner's own request | `critical_path` in [tracestudio/critical.py](tracestudio/critical.py) | `test_critical_path_follows_a_mutex_owner_into_its_request`, `test_mutex_chain_captures` |
+| Mutex owner chains: the owner of a contended mutex is named only when the trace shows its successful unlock | `mutex_waits`, `blocking_chain` in [tracestudio/analyses.py](tracestudio/analyses.py) | `test_mutex_owner_needs_the_owners_successful_unlock` |
+| Inversion verdicts for multi-threaded servers in the SEND phase, with every receive-capable thread accounted for | `_pool`, `_pool_member` in [tracestudio/analyses.py](tracestudio/analyses.py) | `test_send_phase_inversion_in_a_thread_pool`, `test_send_phase_pool_needs_every_receiver_accounted_for` |
+| "Insufficient evidence" with its reasons when the trace cannot support a verdict (untraced run mask, lost events, other receivers, handoffs, sporadic scheduling) | `_inversion` in [tracestudio/analyses.py](tracestudio/analyses.py) | `test_unknown_run_mask_is_not_all_cpus`, `test_sporadic_server_is_insufficient_evidence` |
+| Exchanges that cross lost events are flagged, drawn without arrows and left out of every verdict | [tracestudio/model.py](tracestudio/model.py) | `test_fault_injection_never_links_wrong`, `test_untrustworthy_exchange_has_no_arrows_and_warns_on_every_slice` |
+| A check of the decoded exchanges against the workload's own logs | `validate` in [tracestudio/validate.py](tracestudio/validate.py) | `test_ground_truth_links` |
+| A CI gate with exit status and JUnit XML | `run_checks` in [tracestudio/check.py](tracestudio/check.py) | `test_check_fails_prio_fixed_and_passes_prio_inherit` |
+| An aarch64le capture as a regression fixture beside the x86_64 ones | `tests/data/run5/prio_fixed.kev.gz` | `test_aarch64le_capture` |
+| Perfetto SQL on the converted trace, with example queries | [docs/sql](docs/sql) | `test_sql_examples_run_on_converted_captures` |
+
 ## Install
 
 Python 3.10 or newer. The two install lines under [Try it without a QNX target](#try-it-without-a-qnx-target) are all it takes; `venv/bin/tracestudio --help` lists the commands. The examples below write `tracestudio` for `venv/bin/tracestudio` and use short file names such as `trace.kev` for your own captures.
 
-Dependencies: `perfetto` 0.59.x (its generated protobuf classes, and TraceProcessor for the tests) and `protobuf` 7.x. Only `convert` needs them at run time.
+[CHANGELOG.md](CHANGELOG.md) lists the changes per version. A `v*` tag runs `.github/workflows/release.yml`: it builds the wheel, installs it in a fresh venv, runs the `check` gate and the tests, and attaches the wheel to a GitHub Release.
+
+Dependencies: `perfetto` 0.59.x (its generated protobuf classes, and TraceProcessor for the tests) and `protobuf` 7.x. `pip install .` installs both. `convert` and `open` use them at run time; the other commands do not.
 
 ## Capture on QNX 8.0
 
@@ -106,7 +155,7 @@ tracestudio convert trace.kev                  # writes trace.perfetto-trace
 
 Every command also reads gzip-compressed traces (`trace.kev.gz`), such as the captures in `tests/data`.
 
-Open the output in https://ui.perfetto.dev ("Open trace file"). You can also query it with Perfetto SQL (`trace_processor_shell` or the `perfetto` Python package).
+Open the output in https://ui.perfetto.dev ("Open trace file"). You can also query it with Perfetto SQL (`trace_processor_shell` or the `perfetto` Python package). [docs/sql](docs/sql) has example queries: the slowest trustworthy requests, where each client's time went by critical-path segment kind, and the priority each server thread ran at for each client.
 
 Each thread has its slice track (MsgSend, handle, MsgReply, pulses) and three child tracks: `QNX state` (the kernel's thread states, `qnx_prio` argument, UNKNOWN where data was lost), `QNX priority` (when it changes) and `critical path`. Every slice of an exchange (MsgSend, handle, MsgReply or MsgError, reply received) carries `txn`, `trustworthy` and any `warnings`; the MsgSend slice also has `rcvid`, `coid`, `message`, `path_candidate`, `client_qnx_prio`, `outcome` and `latency_us`. Click a slice to see them and follow its arrows. Arrows join only trustworthy exchanges; the slices of the others end in `[not trustworthy]`. Messages to procnto are named from its protocols (`_PROC_*`, `_IO_*`, ...). For other servers an `_IO_*` name needs a connection or channel that answered an `_IO_CONNECT` (type 0x100) in the trace; since an application message can use that number too, such names are labelled `(candidate)`, and other messages show their number (`type 0x0101`).
 
@@ -185,7 +234,7 @@ insufficient evidence (the trace cannot show whether the server was held up): 2
 channels created with _NTO_CHF_FIXED_PRIORITY: ts_psrv chid 1
 ```
 
-A suspected inversion needs evidence for every instant it counts: the client SEND- or REPLY-blocked on the server thread; the server READY at a lower priority than the client (priorities as known at that instant); the server's run mask traced and not invalidated since; every CPU in that mask busy with threads above the server, at least one of them below the client. While the client is SEND-blocked another thread of the server process could receive the message, so every thread of the process must be accounted for: a complete thread inventory with lifetimes, no lost events, no thread started or ended during the wait, and every other thread blocked in another kernel call, RECEIVE-blocked on another channel, or READY below the client and held up the same way. The verdict then names all of them. A thread waiting in MsgReceive on the client's channel means no inversion; any other state of another thread gives insufficient evidence. When another thread replies, the REPLY phase is insufficient evidence too: the trace does not say which threads worked on the request. When the trace cannot show why a low-priority server was not running (untraced run mask, idle CPU, lost events, other possible receivers, a handoff, sporadic scheduling, adaptive partitioning), the request is reported as "insufficient evidence" with the reasons. `--json` prints all rows, including all inversions. `--deadline THREAD@SERVER=US` counts only the requests to that server process (`hi@ts_psrv=5000`); `THREAD=US` counts all of the thread's requests.
+A suspected inversion needs evidence for every instant it counts: the client SEND- or REPLY-blocked on the server thread; the server READY at a lower priority than the client (priorities as known at that instant); the server's run mask traced and not invalidated since; every CPU in that mask busy with threads above the server, at least one of them below the client. While the client is SEND-blocked another thread of the server process could receive the message, so every thread of the process must be accounted for: a complete thread inventory with lifetimes, no lost events, no thread started or ended during the wait, and every other thread blocked in another kernel call, RECEIVE-blocked on another channel, or READY below the client and held up the same way. The verdict then names all of them. A thread waiting in MsgReceive on the client's channel means no inversion; any other state of another thread gives insufficient evidence. When another thread replies, the REPLY phase is insufficient evidence too: the trace does not say which threads worked on the request. When the trace cannot show why a low-priority server was not running (untraced run mask, idle CPU, lost events, other possible receivers, a handoff, sporadic scheduling, adaptive partitioning), the request is reported as "insufficient evidence" with the reasons. `--json` prints all rows, including all inversions; [docs/JSON.md](docs/JSON.md) lists every key, and a test keeps that list and the output in step. `--deadline THREAD@SERVER=US` counts only the requests to that server process (`hi@ts_psrv=5000`); `THREAD=US` counts all of the thread's requests.
 
 Run masks set before the trace started are not in it. If you know one from the program's code or configuration, say so: `--runmask ts_psrv/psrv-rx=0x1` (repeatable, hex, thread name optional) or `--assume-unpinned ts_psrv` (every CPU). A supplied mask applies to a thread only until the trace shows a mask event for it and only before the first lost events; every verdict that uses one says so in its evidence ("Relies on run mask 0x1 supplied by --runmask."), and `analyze` and `diff` count those verdicts separately.
 
@@ -294,6 +343,23 @@ tracestudio check prio_fixed.kev --deadline hi@ts_psrv=5000 --no-inversions --cl
 
 `--runmask`, `--assume-unpinned` and `--min-us` work as for `analyze`. A trace that lost events fails its `trace integrity` assertion, and a latency assertion whose requests include excluded or unfinished ones fails, unless `--allow-loss` is given (they are still reported). `--junit FILE` also writes a JUnit XML report: a `testsuite` with one `testcase` per assertion and a `failure` element with the evidence for each one that failed; it is written atomically, characters XML cannot carry are replaced, and a trace that cannot be read gives a report with one `error` testcase.
 
+### As a GitHub Action
+
+`action.yml` at the repository root wraps `check`. It installs trace-studio from the action's own checkout and fails the step when an assertion fails:
+
+```
+- uses: actions/checkout@v4
+- uses: <owner>/qnx-trace-studio@<tag>     # the repository and release that host trace-studio
+  with:
+    trace: traces/prio_fixed.kev.gz
+    args: --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+    junit: tracestudio-junit.xml          # optional, this is the default
+```
+
+The `action-selftest` job in `.github/workflows/test.yml` runs the action on `prio_inherit` (it must pass) and on `prio_fixed` (it must fail) and checks both JUnit reports.
+
+### On a QEMU target with the SDP
+
 `tools/ci_qemu_check.sh SCENARIO [check options]` is a CI job for a runner with the SDP and KVM: it builds the workload with the SDP, boots a fresh QEMU target with mkqnximage, runs the scenario under tracelogger, fetches the `.kev` and runs `tracestudio check`. A trap stops the target on every way out (success, a failed step, SIGINT, SIGTERM) and keeps the exit status: check's, or that of the step that failed. These are the commands it ran on the build box (from its `set -x` trace; `$SSHO` holds the ssh options, `$IP` the target address):
 
 ```
@@ -364,15 +430,19 @@ The JUnit report of the failing run starts like this:
 
 Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. The workload's own measurement (11112 us) is about 15 us longer than the traced MsgSend.
 
+## Use from a coding agent
+
+[skills/trace-studio/SKILL.md](skills/trace-studio/SKILL.md) is an agent skill: it tells a coding agent how to capture a trace, which command answers which question, how to read "insufficient evidence", and how to gate a build with `check`. [docs/JSON.md](docs/JSON.md) lists the keys of `analyze --json`. Tests parse every command in the skill and compare the JSON keys with that page.
+
 ## Support matrix
 
 | | status |
 |---|---|
-| QNX SDP 8.0.0, x86_64, QEMU/KVM, 2 CPUs | verified on 17 captures |
+| QNX SDP 8.0.0, x86_64, QEMU/KVM, 2 CPUs | verified on 17 captures (10 of them in `tests/data`) |
 | tracelogger wide mode (`-w`) | verified |
 | fast mode | verified for message linking and message names (msg[0] keeps the `_IO_CONNECT` subtype); no priorities, so no inversion analysis |
 | per-class mix of fast and wide events | unit tests only |
-| aarch64le, QEMU virt (TCG), 2 CPUs | verified on 3 captures (`ipc_wide`, `prio_fixed`, `prio_inherit`, wide mode; Cortex-A57, ClockCycles at 62.5 MHz): events and arguments identical to traceprinter, all logged requests and pulses matched, the same priority results as on x86_64; real aarch64 hardware untested |
+| aarch64le, QEMU virt (TCG), 2 CPUs | verified on 3 captures (1 of them in `tests/data`; `ipc_wide`, `prio_fixed`, `prio_inherit`, wide mode; Cortex-A57, ClockCycles at 62.5 MHz): events and arguments identical to traceprinter, all logged requests and pulses matched, the same priority results as on x86_64; real aarch64 hardware untested |
 | more than 2 CPUs, real hardware | untested |
 | mutex owners (SyncMutexLock/SyncMutexUnlock) | verified on 3 captures (60 waits against the workload's logs); mutexes shared between processes give "owner unknown" |
 | big-endian traces | not supported (refused) |
@@ -384,19 +454,12 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 
 ## Validation evidence
 
-The measurements were made on the build box (Ubuntu 22.04, QNX SDP 8.0) against the 17 x86_64 and 3 aarch64le captures from the QEMU targets described above. Eleven of them are in the repository under `tests/data` (ten x86_64, one aarch64le) and are what the test suite runs on; the larger ones, such as `rm_traffic`, are not checked in, so the totals below cannot be reproduced from the repository alone.
+[docs/VALIDATION.md](docs/VALIDATION.md) has the details, the commands and the counts.
 
-- Parser against `traceprinter` (`tools/compare_traceprinter.py`, exact values), 17 captures: 739,841 events identical in timestamp, CPU, class and event; 2,428,184 argument values compared, 0 mismatches, sign included. They are the arguments of 70 event kinds (235 event and field pairs): thread states (pid, tid, priority, policy), process creation, destruction and names, PATHMGR and TIMER system events, interrupts, CONTROL/TIME, the COMM events, the entries and exits of MsgSendv, MsgSendvnc, MsgReceivev, MsgReceivePulsev, MsgReplyv, MsgError, MsgSendPulse, ChannelCreate, ConnectAttach, ConnectDetach, ThreadCtl, ThreadCtlExt, SchedSet, SyncMutexLock, SyncMutexUnlock and SyncTypeCreate, and the return code and errno of every failed kernel call. Not compared: 388,758 values of 304 kinds that traceprinter prints and trace-studio does not decode (the arguments of the other kernel calls, such as the other SYNC_*, TIMER_* and CONNECT_*_INFO calls and MsgReadv/MsgWritev, `_msg_info` fields it skips, and MMAP events; 69,108 of these events have no decoded argument at all), and 9,085 decoded values traceprinter does not print in a comparable form (CONTROL/BUFFER counts, MsgSendvnc exit status, COMM SIGNAL, a few message words). The largest capture (`rm_traffic`, 12.4 MB) has 306,436 events. The layouts of failed exits, INT_CALL, the signed 64-bit counts, MsgSendPulsePtr and the mutex calls were also checked against traceprinter on a synthetic trace (a unit test does this when traceprinter is installed).
-- aarch64le (QEMU virt under TCG, 2 CPUs, ClockCycles at 62.5 MHz; 3 captures): 158,352 events identical to traceprinter and 487,334 argument values compared, 0 mismatches; 280 of 280 logged requests matched (200 in `ipc_wide` with 4 of 4 client pulses and 425 of 425 timer pulses, 40 in each `prio_*`); `prio_fixed` has 20 suspected inversions (SEND-blocked, median 9.9 ms of evidence, run mask 0x1, hog at 20 on CPU 0) and 20 of 20 deadline misses at 5 ms (max 14816.9 us), `prio_inherit` none and 0 of 20 (max 4116.2 us); `tracestudio check --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/` exits 1 and 0; TraceProcessor imports all three without errors.
-- Message linking against the workload's own logs (`tracestudio validate`): 1,100 of 1,100 logged requests matched to the right client thread, server thread, rcvid, coid and MsgSend outcome (480 in run 1, 480 in run 2, 80 in run 3, 60 in the mutex captures), every SEND and DONE record paired, including all 160 forwarded requests of runs 1 and 2 linked to their parent, with rcvids reused up to 186 times; the pulse counts of the 4 `ipc_*` captures agree with the logs. Mutexes: all 60 of mrx's waits in the three mutex captures match the logs (mutex address, owner thread, owner value as the holder's TLS `__owner`, release between the holder's UNLOCK and mrx's ACQUIRED logs, and the holder's decoded request to ts_mslow).
-- Inversions: 20 of 20 hi requests flagged with a fixed-priority channel and 0 with inheritance, both when the hog strikes before the receive (`prio_fixed`, median 8.2 ms of evidence each, SEND-blocked) and after it (`prio_fixed_rx`, median 10.0 ms, REPLY-blocked); 0 in the wide-mode IPC capture. Requests that procnto received on one thread and replied to on another are reported as insufficient evidence: 2 in `prio_fixed`, 2 in `prio_inherit`, 1 in `prio_inherit_rx`, 2 in `ipc_wide`. Fast mode records no priorities, so `ipc_fast` has no inversions and 15 requests with insufficient evidence (12 for the missing priorities, 3 handoffs). Deadline misses at 5 ms: 20/20 versus 0/20 in both pairs.
-- Cancellation (`cancel`, checked by the regression test `test_cancellation_matches_the_workload_log`; validate does not cover this workload): all 15 logged sends decoded with the logged outcome (5 replied, 10 cancelled with return code -1 and the logged errno, ETIMEDOUT or EINTR), and the 10 late MsgReply calls that failed in the log are exactly the 10 replies the decoder could not attach to any exchange.
-- Resource managers: summing the bytes of `cat`'s `_IO_READ` replies per candidate path gives 26 paths in `rm_traffic`: 25 equal the file size (`wc -c` on the target) and `librcheck.so.1` has twice its size, because `cat` also read it through the symlink `librcheck.so`; both files in `rm_small` match. In `rm_traffic` 7,293 `_IO_*` names are candidates (servers other than procnto), and 90 messages with an `_IO_*` number on connections with no `_IO_CONNECT` evidence are left unnamed.
-- Fault injection (`tools/drop_buffer.py`): removing 4 of the 15 kernel buffers inside the workload window of `ipc_wide` leaves 108 of 200 requests matched, 62 without a candidate, no wrong link in that test (server, rcvid, coid, request id, parent); 2 outcomes contradict the log, both on exchanges flagged untrustworthy, and the pulse counts differ, so validation fails.
-- Perfetto import: TraceProcessor 0.59.1 loads all 14 converted captures with no error or data-loss stats; every flow joins slices of one transaction; no slice has a negative duration.
-- Tests: `python3 tests/test_tracestudio.py` (or pytest) runs 82 tests: 68 on synthetic slot streams (one checks that gzip-compressed traces read like plain ones), including a counterexample for each defect found in code review (among them: deleted middle slots, a partial final slot, losses at trace start, unanchored timestamps, READY inside a loss window, untraced and supplied run masks, inheriting channels, stale channel identities after a loss, other possible receivers, reused thread ids, sporadic scheduling, clipped attribution, untrustworthy children, receive attribution, cross-thread replies, stale replies, ambiguous parents, wakeups across a re-block, pulse queues out of sync, candidate paths and names, untrustworthy exchanges without arrows, failed kernel-call exits, INT_CALL, signed 64-bit and `_msg_info` fields, MsgSendPulsePtr, unpaired and shared log records, wrong coid, outcome and pulse counts, diff rows without samples and changed priority shares, non-finite or negative numbers, unreadable input and short CSV records, `open`'s page, protocol, Host, token and Origin checks and private cache, `check` on lost events, empty assertions, inversion coverage, server-scoped deadlines and JUnit edge cases), and 14 on the captures in `tests/data` (including the two mutex captures with a tampered-log counterexample, an aarch64le capture, CLI exit codes, `check` on `prio_fixed` and `prio_inherit` with their JUnit reports, and `open`'s cache and default pins). With `TS_REQUIRE_ALL=1` a missing `traceprinter` or perfetto package fails the run; all 82 pass that way on the build box.
-- Packaging: a wheel and an sdist built with `python -m build` install in fresh venvs and run on Python 3.10 (build box) and 3.12 (development host). The sdist carries the test files but not `tests/kevgen.py` or the fixtures; run the tests from the repository.
-- Speed on the build box: `ipc_wide` (1.7 MB, 44,807 events) converts in 0.87 s with 103 MB peak memory; `rm_traffic` in 7.5 s with 734 MB; `analyze` takes 0.37 s and 2.8 s.
+- The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
+- `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
+- 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
+- `python3 tests/test_tracestudio.py` runs 98 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 25 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

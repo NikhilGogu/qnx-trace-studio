@@ -7,9 +7,11 @@
   tracestudio analyze  TRACE.kev [--deadline THREAD=US] [--request TXN] [--slowest N] [--json]
   tracestudio diff     BEFORE.kev AFTER.kev [--deadline THREAD=US] [--json]
   tracestudio validate TRACE.kev --logs DIR       (workload ground truth)
+  tracestudio open     TRACE.kev [--pin REGEX] [--no-browser]
+  tracestudio check    TRACE.kev [--deadline THREAD[@SERVER]=US] [--no-inversions] [--junit FILE]
 
-Exit status: 0 on success, 1 when validation fails or finds no logged requests,
-or when a trace has no events, 2 on usage errors.
+Exit status: 0 on success, 1 when validation or a check fails, when validate finds
+no logged requests, or when a trace has no events; 2 on usage errors.
 """
 from __future__ import annotations
 
@@ -148,6 +150,14 @@ def _analysis(model, a, tl):
     return out
 
 
+def slowest_requests(model, n, client=None):
+    """The n slowest top-level requests with an unambiguous parent, of clients whose label contains `client`."""
+    top = sorted((t for t in model.txns if t.causal and t.parent is None
+                  and (client is None or client in model.label(t.client))),
+                 key=lambda t: t.t_exit - t.t_call, reverse=True)
+    return top[:n]
+
+
 def cmd_analyze(a):
     from .analyses import Timeline, us
     from .critical import critical_path, render, to_json
@@ -163,10 +173,7 @@ def cmd_analyze(a):
             print("error: no transaction %d (trace has 0..%d)" % (i, len(model.txns) - 1), file=sys.stderr)
             return 2
         picks.append(model.txns[i])
-    if a.slowest:
-        top = sorted((t for t in model.txns if t.causal and t.parent is None),
-                     key=lambda t: t.t_exit - t.t_call, reverse=True)
-        picks += [t for t in top if a.client is None or a.client in model.label(t.client)][:a.slowest]
+    picks += slowest_requests(model, a.slowest, a.client)
     cps = []
     for tx in picks:
         if tx.t_call is None or tx.t_exit is None:
@@ -449,7 +456,7 @@ def cmd_check(a):
     return 0 if all(r.ok for r in results) else 1
 
 
-def main(argv=None):
+def build_parser():
     p = argparse.ArgumentParser(prog="tracestudio", description="QNX .kev kernel traces to Perfetto, with analyses")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("info", help="header, counts, losses and decoder counters as JSON")
@@ -527,7 +534,11 @@ def main(argv=None):
     s.add_argument("--assume-unpinned", action="append", metavar="PROCESS", help="as for analyze")
     s.add_argument("--junit", metavar="FILE", help="also write a JUnit XML report")
     s.set_defaults(fn=cmd_check)
-    a = p.parse_args(argv)
+    return p
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
     try:
         return a.fn(a)
     except KevError as e:

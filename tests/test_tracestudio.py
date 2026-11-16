@@ -134,6 +134,112 @@ def test_perfetto_loads():
         tp.close()
 
 
+
+def test_every_checked_in_capture_converts_and_loads():
+    try:
+        from perfetto.trace_processor import TraceProcessor
+        from tracestudio.perfetto_out import write
+    except ImportError:
+        return skip("perfetto package not installed")
+    found = sorted(os.path.relpath(os.path.join(d, f), os.path.join(HERE, "data"))
+                   for d, _, fs in os.walk(os.path.join(HERE, "data")) for f in fs if f.endswith(".kev.gz"))
+    assert len(found) == 11, found                          # README and docs/VALIDATION.md name this count
+    for rel in found:
+        run, name = os.path.split(rel[:-len(".kev.gz")])
+        out = os.path.join(TMP, "%s_%s.perfetto-trace" % (run, name))
+        write(Model(KevFile(kev(name, os.path.join(HERE, "data", run)))), out)
+        tp = TraceProcessor(trace=out)
+        errs = [(r.name, r.value) for r in tp.query(
+            "SELECT name, value FROM stats WHERE value > 0 AND severity IN ('error', 'data_loss')")]
+        assert not errs, (rel, errs)
+        assert list(tp.query("SELECT COUNT(*) n FROM slice WHERE dur < 0"))[0].n == 0, rel
+        bad_flows = list(tp.query(
+            "SELECT COUNT(*) n FROM flow f JOIN slice a ON a.id = f.slice_out JOIN slice b ON b.id = f.slice_in "
+            "WHERE extract_arg(a.arg_set_id, 'debug.txn') IS NOT extract_arg(b.arg_set_id, 'debug.txn')"))[0].n
+        assert bad_flows == 0, rel
+        assert list(tp.query("SELECT COUNT(*) n FROM thread_state"))[0].n > 0, rel
+        tp.close()
+
+
+def test_sql_examples_run_on_converted_captures():
+    try:
+        from perfetto.trace_processor import TraceProcessor
+        from tracestudio.perfetto_out import write
+    except ImportError:
+        return skip("perfetto package not installed")
+    sql_dir = os.path.join(HERE, "..", "docs", "sql")
+    queries = {f[:-4]: open(os.path.join(sql_dir, f)).read() for f in sorted(os.listdir(sql_dir)) if f.endswith(".sql")}
+    assert set(queries) == {"slowest_requests", "critical_path_by_kind", "server_priority_while_handling"}, queries
+    for name, hi_prio, preempted_first in (("prio_fixed", 10, True), ("prio_inherit", 30, False)):
+        m = Model(KevFile(kev(name)))
+        out = os.path.join(TMP, name + "_sql.perfetto-trace")
+        write(m, out)
+        tp = TraceProcessor(trace=out)
+        res = {q: list(tp.query(text)) for q, text in queries.items()}
+        tp.close()
+        slowest = max((t for t in m.txns if t.trustworthy), key=lambda t: t.t_exit - t.t_call)
+        assert len(res["slowest_requests"]) == 20 and res["slowest_requests"][0].txn == slowest.idx, name
+        kinds = [r.kind for r in res["critical_path_by_kind"] if r.client_thread == "hi"]
+        assert (kinds[0] == "server preempted") == preempted_first, (name, kinds)
+        prios = {r.server_prio for r in res["server_priority_while_handling"]
+                 if r.client_thread == "hi" and r.server_thread == "psrv-rx"}
+        assert prios == {hi_prio}, (name, prios)
+
+
+def test_readme_capabilities_point_at_real_code():
+    import re
+    with open(os.path.join(HERE, "..", "README.md")) as f:
+        text = f.read()
+    sec = text.split("## What trace-studio adds", 1)[1].split("\n## ", 1)[0]
+    root = os.path.join(HERE, "..")
+    for path in re.findall(r"\]\(([^)#]+)\)", sec) + re.findall(r"`(tests/data/[^`]+)`", sec):
+        assert os.path.exists(os.path.join(root, path)), path
+    src = "".join(open(os.path.join(root, "tracestudio", f)).read() for f in os.listdir(os.path.join(root, "tracestudio"))
+                  if f.endswith(".py"))
+    tests = open(os.path.join(HERE, "test_synthetic.py")).read() + open(os.path.join(HERE, "test_tracestudio.py")).read()
+    names = re.findall(r"`(\w+)`", sec)
+    assert len(names) > 15, names
+    for n in names:
+        if n.startswith("test_"):
+            assert re.search(r"^def %s\(" % n, tests, re.M), n
+        else:
+            assert re.search(r"^def %s\(" % n, src, re.M), n
+
+
+def test_examples_page_withholds_timing():
+    import contextlib
+    import io
+    import re
+    try:
+        import perfetto  # noqa: F401
+    except ImportError:
+        return skip("perfetto package not installed")
+    from build_examples import TIMING, main as build
+    only = ["--only", "run1/prio_fixed", "--only", "run1/prio_inherit"]
+    pages = {}
+    for mode in ("withheld", "with-timing"):
+        out = os.path.join(TMP, "site-" + mode)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert build(["--out", out] + only + (["--with-timing"] if mode == "with-timing" else [])) == 0
+        assert sorted(os.listdir(out)) == ["index.html", "run1_prio_fixed.perfetto-trace",
+                                           "run1_prio_inherit.perfetto-trace"]
+        with open(os.path.join(out, "index.html")) as f:
+            pages[mode] = f.read()
+    text = pages["withheld"]
+    assert not TIMING.search(text.split("<script>")[0]), TIMING.search(text).group(0)
+    assert text.count("<section ") == 2 and "[timing withheld]" in text
+    assert "suspected priority inversions: 20" in text and "suspected priority inversions: 0;" in text
+    assert "ts_pload/hog (prio 20) on CPU 0" in text and "fails (exit 1)" in text and "passes (exit 0)" in text
+    assert "startupCommands=" in text and "PinTracksByRegex" in text
+    assert re.search(r"MsgSend latency \d+\.\d us", pages["with-timing"])
+    assert pages["with-timing"].replace("[timing withheld]", "") == pages["with-timing"]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            build(["--out", os.path.join(TMP, "site-x"), "--only", "run9/nothing"])
+        raise AssertionError("an unknown example was accepted")
+    except SystemExit as e:
+        assert e.code == 2
+
 def test_inversion_after_receive_on_a_real_capture():
     # run 3: lo sends 0.5 ms of work at t+0, hi at t+4 ms, the hog wakes at t+4.2 ms, while
     # the server already handles hi's request
@@ -203,6 +309,180 @@ def test_cli_exit_codes():
         f.write("not a trace")
     assert main(["info", junk]) == 1 and main(["analyze", junk]) == 1
 
+
+
+def test_min_us_zero_from_the_command_line():
+    import contextlib
+    import io
+    from tracestudio.cli import main
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["analyze", kev("ipc_wide"), "--min-us", "0"]) == 0
+        assert main(["check", kev("prio_inherit"), "--no-inversions", "--client", "ts_pload/", "--min-us", "0"]) == 0
+    assert "suspected priority inversions: 0" in out.getvalue(), out.getvalue()
+
+
+def test_readme_quickstart_commands():
+    """Every tracestudio command in the README's no-QNX quickstart runs on the checked-in captures with the exit
+    status the README promises (open needs a browser and is covered by its own test)."""
+    import contextlib
+    import io
+    import shlex
+    from tracestudio.cli import main
+    with open(os.path.join(HERE, "..", "README.md")) as f:
+        text = f.read()
+    block = text.split("## Try it without a QNX target", 1)[1].split("```", 2)[1]
+    cmds = [shlex.split(ln.split("#", 1)[0])[1:] for ln in block.splitlines() if ln.startswith("venv/bin/tracestudio ")]
+    assert [c[0] for c in cmds] == ["analyze", "diff", "open", "check", "check", "analyze"], cmds
+    for c in cmds:
+        if c[0] == "open":
+            continue
+        args = [os.path.join(HERE, "..", a) if a.startswith("tests/data/") else a for a in c]
+        want = 1 if c[0] == "check" and "prio_fixed" in c[1] else 0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main(args) == want, (c, out.getvalue()[-2000:])
+        if c[0] == "analyze" and "mutex_chain_nopi" in c[1]:
+            assert "MUTEX-blocked on mutex" in out.getvalue() and "owned by ts_mutex/holder" in out.getvalue()
+            assert "held by ts_mutex/hog (prio 20)" in out.getvalue()
+
+
+def _json_doc_keys():
+    """{section heading: set of keys} from the tables of docs/JSON.md (first column, in backticks)."""
+    import re
+    keys, head = {}, None
+    with open(os.path.join(HERE, "..", "docs", "JSON.md")) as f:
+        for ln in f:
+            if ln.startswith("### "):
+                head = ln[4:].strip()
+                keys[head] = set()
+            m = re.match(r"\| `(\w+)` \|", ln)
+            if m and head:
+                keys[head].add(m.group(1))
+    return keys
+
+
+def test_analyze_json_contract():
+    import contextlib
+    import io
+    import json
+    from tracestudio.cli import main
+
+    def run(*args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main(list(args)) == 0
+        return json.loads(out.getvalue())
+    doc = _json_doc_keys()
+    a = run("analyze", kev("prio_fixed"), "--json", "--deadline", "hi=5000", "--slowest", "1")
+    m = run("analyze", kev("mutex_chain_nopi", DATA4), "--json", "--slowest", "1")
+    assert set(a) == set(m) == doc["Top level"], set(a) ^ doc["Top level"]
+    assert set(a["ipc_latency"][0]) == doc["ipc_latency[]"]
+    assert set(a["inversions"]) == doc["inversions"]
+    assert set(a["inversions"]["suspected"][0]) == doc["inversions.suspected[]"]
+    assert set(a["inversions"]["insufficient_evidence"][0]) == doc["inversions.insufficient_evidence[]"]
+    assert set(a["deadlines"]["hi"]["by_server"]["ts_psrv"]) == doc["deadlines.NAME.by_server.SERVER"]
+    known = [w for w in m["mutex_waits"] if w["owner"]]
+    assert known and all(set(w) == doc["mutex_waits[]"] - {"owner_unknown"} for w in known)
+    cp = a["critical_paths"][0]
+    assert set(cp) == doc["critical_paths[]"]
+    seen = set().union(*(set(sg) for c in (cp, m["critical_paths"][0]) for sg in c["segments"]))
+    assert seen <= doc["critical_paths[].segments[]"] and {"start_us", "us", "kind", "what", "txn"} <= seen, seen
+    d = run("diff", kev("prio_fixed"), kev("prio_inherit"), "--json", "--deadline", "hi=5000")
+    assert set(d) == {"before", "after", "comparison"} and set(d["comparison"]) == {"latency", "server_priority"}
+    assert set(d["before"]) == set(d["after"]) == doc["Top level"] - {"critical_paths"}
+
+
+def test_agent_skill_commands_parse():
+    """skills/trace-studio/SKILL.md names only real subcommands and options, covers every analysis command, and
+    quotes reasons the analysis really gives."""
+    import re
+    import shlex
+    from tracestudio import __version__
+    from tracestudio.cli import build_parser
+    with open(os.path.join(HERE, "..", "skills", "trace-studio", "SKILL.md")) as f:
+        text = f.read()
+    fm = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    assert fm, "SKILL.md must start with YAML frontmatter"
+    fields = dict((k.strip(), v.strip().strip('"')) for k, _, v in (ln.partition(":") for ln in fm.group(1).splitlines()))
+    assert fields["name"] == "trace-studio" and fields["license"] == "Apache-2.0"
+    assert 0 < len(fields["description"]) <= 1024
+    assert "trace-studio v%s" % __version__ in fields["description"]
+    cmds = re.findall(r"`(tracestudio [^`]+\.kev[^`]*)`", text)      # commands with a trace, not bare names
+    assert len(cmds) >= 12, cmds
+    parser = build_parser()
+    for c in cmds:
+        argv = shlex.split(c)[1:]
+        try:
+            parser.parse_args(argv)
+        except SystemExit:
+            raise AssertionError("does not parse: " + c)
+    used = {shlex.split(c)[1] for c in cmds}
+    assert used == {"info", "analyze", "diff", "convert", "open", "check"}, used
+    with open(os.path.join(HERE, "..", "tracestudio", "analyses.py")) as f:
+        src = f.read()
+    for reason in ("run mask of %s not traced", "request handed off: received by"):
+        assert reason in src, reason
+
+
+def test_version_agrees_everywhere():
+    import re
+    from tracestudio import __version__
+    root = os.path.join(HERE, "..")
+    with open(os.path.join(root, "pyproject.toml")) as f:
+        project = re.search(r'^version = "([^"]+)"', f.read(), re.M).group(1)
+    with open(os.path.join(root, "CHANGELOG.md")) as f:
+        latest = re.search(r"^## (\S+)", f.read(), re.M).group(1)
+    assert __version__ == project == latest, (__version__, project, latest)
+
+
+def test_docs_links_resolve_and_test_counts_match():
+    """Relative links and #anchors in the README and docs/ point at files and headings that exist, and every
+    statement of the suite's size names the real number of tests."""
+    import re
+    root = os.path.join(HERE, "..")
+    suites = {"test_synthetic.py": 0, "test_tracestudio.py": 0}
+    for name in suites:
+        with open(os.path.join(HERE, name)) as f:
+            suites[name] = len(re.findall(r"^def test_", f.read(), re.M))
+    total, captures = sum(suites.values()), suites["test_tracestudio.py"]
+
+    def slug(heading):
+        return re.sub(r"[^a-z0-9 _-]", "", heading.lower()).replace(" ", "-")
+    for doc in ("README.md", "docs/DESIGN.md", "docs/VALIDATION.md", "docs/JSON.md", "CHANGELOG.md"):
+        with open(os.path.join(root, doc)) as f:
+            text = f.read()
+        anchors = {slug(h) for h in re.findall(r"^#+ (.+)$", text, re.M)}
+        for target in re.findall(r"\]\(([^)\s]+)\)", text):
+            if target.startswith(("http://", "https://")):
+                continue
+            path, _, anchor = target.partition("#")
+            if path:
+                assert os.path.exists(os.path.join(root, os.path.dirname(doc), path)), (doc, target)
+            elif anchor:
+                assert anchor in anchors, (doc, target)
+        for n in re.findall(r"(?:runs|has) (\d+) tests", text) + re.findall(r"(\d+) tests in \[tests", text):
+            assert int(n) == total, (doc, n, total)
+        for n in re.findall(r"(\d+) on (?:the checked-in captures|the captures in)", text):
+            assert int(n) == captures, (doc, n, captures)
+
+
+def test_validate_all_summarises_every_capture():
+    import contextlib
+    import io
+    from validate_all import main as validate_all
+    out_file = os.path.join(TMP, "validation-summary.txt")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert validate_all([DATA, DATA3, "--skip-traceprinter", "--out", out_file]) == 0
+    lines = open(out_file).read().splitlines()
+    assert lines == out.getvalue().splitlines()
+    assert len([ln for ln in lines if ln.startswith("PASS validate ")]) == 6, lines     # cancel and rm_small: no
+    assert "logged requests 200, matched 200" in lines[0] and lines[-1] == "8 captures, all checks passed"
+    if not shutil.which("traceprinter"):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert validate_all([DATA]) == 1
+        assert out.getvalue().startswith("error: traceprinter not on PATH")
 
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))

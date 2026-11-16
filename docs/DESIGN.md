@@ -2,7 +2,7 @@
 
 trace-studio converts QNX OS 8.0 kernel event traces (`.kev` files written by `tracelogger`) into Perfetto traces offline and analyses QNX message passing in them. It takes a `.kev` captured on a QNX 8.0 system, converts it on the host, links the MsgSend/MsgReceive/MsgReply exchanges it can establish, and reports latency, critical paths and suspected priority inversions with their evidence; conclusions the trace does not support are reported as "insufficient evidence" or "unknown".
 
-Status on 3 Nov 2026 (v0.3.1: aarch64le captures verified; v0.3.0: mutex owner chains; v0.2.0 added `open` and `check` to v0.1.1, which followed the fourth review). Measurements were made on the build box against 14 traces captured on QNX 8.0.0 x86_64 under QEMU/KVM: runs 1 and 2 from stage one, run 3 from target ta. The raw traces are on the box under `~/work/ts-data/run1`, `run2` and `run3`; the small ones the tests need are in `tests/data`.
+Status on 3 Nov 2026 (v0.3.1: aarch64le captures verified; v0.3.0: mutex owner chains; v0.2.0: `open` and `check`). Measurements were made on the build box against 20 captures on QNX 8.0.0 under QEMU: 17 x86_64 under KVM (runs 1 to 3, the 14 captures of v0.1.1, and run 4, the mutex captures) and 3 aarch64le under TCG (run 5). The raw traces are on the box under `~/work/ts-data`; 11 of them are in `tests/data` ([VALIDATION.md](VALIDATION.md) lists them).
 
 ## 1. Architecture
 
@@ -65,7 +65,7 @@ Reader rules (`kev.py`):
 
 Thread ids: Perfetto tids are global and QNX tids are per process, so (pid, tid) becomes pid*100+tid when that fits below 2^31-2^20, a counter otherwise. Timestamps: ns = cycles x 10^9 / TRACE_CYCLES_PER_SEC. Slices are written per track in nesting order (parents begin first, a zero-length slice ends right after it begins) after a lane assignment that keeps every track properly nested, so rounding cannot make a slice end before it begins.
 
-Checked in ui.perfetto.dev with headless Chromium on 3 Nov 2026 (screenshots in `docs/img`, taken from this version). Measured with TraceProcessor 0.59.1 on all 14 captures: no error or data-loss stats, no flow joining slices of two transactions, no negative duration.
+Checked in ui.perfetto.dev with headless Chromium on 3 Nov 2026 (screenshots in `docs/img`, taken from this version). Measured with TraceProcessor 0.59.1 on the 14 captures of runs 1 to 3: no error or data-loss stats, no flow joining slices of two transactions, no negative duration. The test suite checks the same on the 11 checked-in captures (`test_every_checked_in_capture_converts_and_loads`).
 
 ## 4. Message-passing reconstruction (`model.py`)
 
@@ -104,14 +104,14 @@ Measured (`tracestudio analyze` and the rerun script, deadline 5 ms):
 
 ## 6. Validation (measured)
 
-Commands: `tools/compare_traceprinter.py`, `tracestudio validate`, `tracestudio analyze`, the regression and unit tests, and a rerun script over all 14 captures; its log is `~/work/ts-data/run3/evidence_phase1d.log` on the box (with `evidence_tests_phase1d.log` for the test suite and a fresh `pip install .`), run on 3 Nov 2026 after the third review.
+Commands: `tools/compare_traceprinter.py`, `tracestudio validate`, `tracestudio analyze`, the regression and unit tests, and a rerun script over the 14 captures of runs 1 to 3; its log is `~/work/ts-data/run3/evidence_phase1d.log` on the box (with `evidence_tests_phase1d.log` for the test suite and a fresh `pip install .`), run on 3 Nov 2026.
 
 1. Against the host `traceprinter` (`tools/compare_traceprinter.py`; labels normalised because names differ; argument values exact, so a value that agrees only modulo 2^32 or 2^64 is a mismatch): 739,841 events identical in (64-bit timestamp, CPU, class, event) over 17 captures (run 1 139,421, run 2 135,749, run 3 396,873, run 4 (mutex) 67,798), 0 per-CPU order differences, 2,428,184 argument values compared (235 event and field pairs of 70 event kinds, SyncMutexLock, SyncMutexUnlock and SyncTypeCreate included), 0 mismatches. Not compared: 388,758 values of 304 kinds that traceprinter prints and trace-studio does not decode (69,108 events of 75 kinds without any decoded argument), and 9,085 decoded values traceprinter prints in another form or not at all. Log: `~/work/ts-data/run4/evidence_v030.log` (v0.1.1's 14-capture run: `run3/evidence_v011.log`).
 2. Against workload ground truth (`tracestudio validate`, exit status 1 on any failure): every SEND or DONE record must have its partner; each logged request must contain exactly one decoded transaction from the same client thread that no other logged request claims, naming the same server pid, thread, rcvid and coid, received before the server's post-receive log, replied after its pre-reply log, ending with the logged MsgSend outcome, complete and trustworthy; in wide mode msg[1] must equal the request id; forwarded requests must be children of the client request; pulse receives must match the log. Run 1 480/480 and run 2 480/480 (each with 80/80 parent links), run 3 prio scenarios 80/80, run 4 mutex scenarios 60/60; coid and outcome 1,100/1,100; all 13 log sets paired. Mutex waits (ts_mutex): each logged WAIT..ACQUIRED of mrx contains exactly one decoded wait on the logged address whose owner is the thread that logged LOCKED, with its logged TLS `__owner`, released between its UNLOCK log and mrx's ACQUIRED log, and the holder's request to ts_mslow is a trustworthy decoded exchange: 60/60. Client pulses: 4 logged, 4 matched with their value in wide mode; back-end timer pulses: 413 logged, 413 received.
 3. Cancellation (unit test on `tests/data/run3/cancel`; `validate` does not cover this workload): the 15 sends decode with their logged outcome (5 replied, 5 ETIMEDOUT and 5 EINTR as cancelled with return code -1 and the logged errno), and the 10 failed late MsgReply calls are the 10 replies the decoder could not attach.
 4. Resource managers: bytes returned by `cat`'s `_IO_READ` per candidate path equal `wc -c` of the file for 25 of the 26 paths of `rm_traffic`; `librcheck.so.1` has twice its size because `cat` also read it through the symlink `librcheck.so`. Both files of `rm_small` match (132,400 and 65,536 bytes).
 5. Fault injection (`tools/drop_buffer.py`, buffers 79, 80, 83, 84 of `ipc_wide`): 4 losses reported, 108 of 200 requests matched, 62 without a candidate, no wrong link (server, rcvid, coid, request id, parent) in this test; 2 outcomes contradict the log, both on exchanges flagged untrustworthy, the pulse counts differ, and validation fails.
-6. Tests: 68 unit tests on synthetic slot streams (`tests/kevgen.py`, `tests/test_synthetic.py`) and 14 regression tests on real captures (`tests/test_tracestudio.py`): all 82 pass on Python 3.10 on the build box with `TS_REQUIRE_ALL=1` (traceprinter and TraceProcessor required; log `run4/evidence_tests_v030.log`; v0.2.0's 78 in `run3/evidence_tests_v020.log`; v0.1.1's 72 in `evidence_tests_v011.log`) and on Python 3.12 on the development host. The counterexample tests for the third and fourth reviews fail on the code before their fixes. A wheel and an sdist built with `python -m build` install in fresh venvs on Python 3.10 and 3.12 and run `analyze` and `convert`.
+6. Tests: the suite now has 98 tests, 73 on synthetic slot streams (`tests/kevgen.py`, `tests/test_synthetic.py`) and 25 on the checked-in captures (`tests/test_tracestudio.py`). At v0.3.1 it had 82 (68 and 14), and all 82 pass on Python 3.10 on the build box with `TS_REQUIRE_ALL=1` (traceprinter and TraceProcessor required; log `run4/evidence_tests_v030.log`; v0.2.0's 78 in `run3/evidence_tests_v020.log`; v0.1.1's 72 in `evidence_tests_v011.log`) and on Python 3.12 on the development host. Most counterexample tests in section 10 were checked to fail on the code before their fix. A wheel and an sdist built with `python -m build` install in fresh venvs on Python 3.10 and 3.12 and run `analyze` and `convert`.
 7. Performance on the build box (`/usr/bin/time`): `ipc_wide` (1.7 MB, 44,807 events) converts in 0.87 s, 103 MB peak RSS; `rm_traffic` (12.4 MB, 306,436 events) in 7.5 s, 734 MB; `analyze` 0.37 s and 2.8 s.
 
 ## 7. Capture (exact commands used)
@@ -146,11 +146,11 @@ Exit status 0 on success; 1 for failed validation, missing, unreadable or short 
 
 ## 9. Limits
 
-- Verified on x86_64 QEMU/KVM with 2 CPUs (17 captures) and aarch64le QEMU virt under TCG with 2 CPUs (3 captures, section 14), one SDP 8.0 build, little-endian. Real hardware, more CPUs, adaptive partitioning and QVM are untested; big-endian traces are refused.
+- Verified on x86_64 QEMU/KVM with 2 CPUs (17 captures) and aarch64le QEMU virt under TCG with 2 CPUs (3 captures, section 13), one SDP 8.0 build, little-endian. Real hardware, more CPUs, adaptive partitioning and QVM are untested; big-endian traces are refused.
 - Loss handling is tested with synthetic streams and removed buffers; no capture lost data.
 - INT_CALL decoding is checked only against traceprinter on a synthetic event.
 - Fast mode has no priorities, `_msg_info`, message payload beyond msg[0] or pulse values.
-- The actor rule (section 4) is an inference that held for all 1,040 logged requests.
+- The actor rule (section 4) is an inference that held for all 1,100 logged requests.
 - Inversion evidence needs a traced (or user-supplied) run mask and, while SEND-blocked, a complete inventory of the server process with every other thread accounted for (blocked in another call, receiving on another channel, or READY and held up the same way); otherwise SEND-phase verdicts for multi-threaded servers are insufficient evidence. No capture with a multi-threaded server reaches this rule yet: it is tested on synthetic traces only. Requests replied to by another thread give insufficient evidence after the receive. It is one level deep (no chains through blocked servers or mutexes).
 - The critical path follows mutex owners only when known (section 4). It does not follow condvars, semaphores, rwlocks or handoffs to other threads; that time is unknown.
 - Paths and `_IO_*` names of servers other than procnto are candidates (section 4): there is no independent confirmation in the trace.
@@ -159,107 +159,47 @@ Exit status 0 on success; 1 for failed validation, missing, unreadable or short 
 - Timestamps assume ClockCycles() synchronised across CPUs, as tracelogger itself requires.
 - In pinned priority runs the client's ClockCycles() is about 15 us before its MsgSendv entry event; the disassembly of our own ts_pload shows only register moves and the MsgSend call between the two, so the time is spent before the event is written. The cause is not known.
 
-## 10. Review findings
+## 10. Defects found and fixed
 
-Status: fixed (with the tests that would fail without the fix), partly fixed (what remains), labelled (the output now says the result is uncertain), documented (a limit we keep), open.
+Each defect below was found in code review and has a counterexample test.
 
-First review (stage-one code):
+| area | defect | fix | tests |
+|---|---|---|---|
+| loss | gaps handled in time order, `range()` over gaps, combines joined across gaps, states continued through a gap | losses tracked per CPU in file order as ranges; combines closed as partial | test_lost_buffer_never_joins_combine_slots, test_short_buffer_is_a_loss, test_sequence_wrap_reset_and_huge_gap, test_dropped_events_make_state_unknown_and_exchanges_untrustworthy, test_truncated_file, test_fault_injection_never_links_wrong |
+| loss | completed combines in a short buffer trusted; initial losses ignored; masks, paths and calls kept across a loss; UNKNOWN ended by another CPU's READY inside the gap; partial thread events restored actors | all of these taken as uncertain | test_deleted_middle_slot_taints_combine_and_exchange, test_loss_at_trace_start_flags_overlapping_exchange, test_loss_drops_run_mask_path_and_calls, test_ready_inside_a_loss_window_does_not_end_unknown, test_partial_thread_event_does_not_restore_actor |
+| loss | a loss before a CPU's first buffer had no start, and the writer raised TypeError | missing bounds become the trace start or end | test_initial_buffer_loss_converts |
+| loss | a partial final slot exempted the whole short buffer | only a last buffer that lacks exactly the slot the file ends inside is exempt | test_partial_final_slot_keeps_whole_buffer_uncertain |
+| loss | channel flags, resource-manager channels and scoid maps survived losses | forgotten at losses, ChannelDestroy and process exit | test_loss_forgets_channel_identities |
+| timestamps | the neighbour rule overrode TIME after long silence; stale combines | TIME anchors are authoritative | test_time_anchor_is_authoritative_after_long_silence, test_interlaced_slots_around_a_rollover, test_interlaced_combine_takes_the_begin_timestamp, test_combine_across_consecutive_buffers |
+| timestamps | slots before their CPU's first TIME placed by guess | such events are not trusted | test_slots_before_their_cpus_first_time_are_not_trusted |
+| transactions | one-index cleanup, actorless and partial events, KER_INT, `_msg_info` conflicts, complete taken as trustworthy | cleanup by object identity; complete and trustworthy kept apart | test_rcvid_reuse_and_late_completion_keep_the_new_exchange, test_thread_death_and_id_reuse, test_interrupted_send_and_late_reply, test_cancelled_send_is_complete_but_untrustworthy, test_injected_only_start, test_cancellation_matches_the_workload_log |
+| transactions | a stale reply selected and unindexed a replacement; ambiguous parents without warning | stale replies quarantined; ambiguous parents leave only the causal analyses | test_stale_reply_is_quarantined, test_ambiguous_parent_counts_for_latency_only |
+| inversion | backfilled priorities, unrelated CPUs, receive window only | priorities as known at each instant, only CPUs in the run mask, both phases | test_inversion_positive_after_receive, test_inversion_before_receive_is_found_too, test_no_inversion_from_an_unrelated_cpu, test_no_inversion_for_plain_blocking, test_inversion_after_receive_on_a_real_capture, test_priority_story |
+| inversion | unknown mask taken as all CPUs; masks kept after a loss and on inheriting channels; one observed receiver taken as exclusive; sporadic scheduling | each of these gives insufficient evidence | test_unknown_run_mask_is_not_all_cpus, test_run_mask_dropped_after_loss_and_inheriting_channel, test_send_phase_needs_a_sole_receiver, test_sole_thread_tracks_lifetimes_and_inventory, test_sporadic_server_is_insufficient_evidence, test_supplied_run_mask_is_labelled |
+| inversion | sole-thread exclusivity ignored reused thread ids and incomplete inventories | lifetimes per tid; any loss since the inventory start gives insufficient evidence | test_sole_thread_tracks_lifetimes_and_inventory |
+| inversion | `min_us=0` crashed on a request with no inversion time | a row needs time of its own kind | test_min_us_zero_does_not_crash, test_min_us_zero_from_the_command_line |
+| critical path | clipping kept the full attribution; untrustworthy children followed; unreplied requests missing from the handler index; READY beside idle or unknown CPUs called preempted; empty masks crashed | fixed | test_clip_recomputes_attribution, test_untrustworthy_child_is_not_followed, test_unreplied_request_keeps_the_server_ambiguous, test_ready_beside_an_idle_cpu_is_unexplained, test_empty_run_mask_does_not_crash |
+| critical path | "receiving this request" covered unrelated running time; cross-thread replies analysed the original receiver | bounded by the MsgReceivev call that returned the request; after a cross-thread reply the path is unknown and the inversion evidence insufficient | test_receive_attribution_and_handoffs |
+| Perfetto slices | END closed the latest BEGIN; rounding; flows | slices written per track in nesting order | test_cross_thread_and_deferred_replies, test_perfetto_exact_slices_threads_and_flows, test_zero_length_and_rounded_slices_nest, test_perfetto_loads |
+| Perfetto slices | untrustworthy exchanges had arrows; handle and reply slices had no warnings | no arrows, `[not trustworthy]` and warnings on every slice | test_untrustworthy_exchange_has_no_arrows_and_warns_on_every_slice |
+| scheduler | migration shown as idle; inferred wakeups; wakeup evidence kept across a re-block | the old CPU becomes UNKNOWN; wakeups need object evidence bound to one READY stretch | test_migration_marks_old_cpu_unknown_not_idle, test_wakeup_needs_object_evidence, test_wakeup_evidence_needs_the_same_wake |
+| pulses | FIFO pairing; uncertainty cleared by guessed exhaustion; loss tainted only existing queues | pairing only on a synchronised queue | test_pulse_matching_needs_a_synchronised_queue, test_pulse_queue_loses_sync_at_a_loss, test_loss_forgets_channel_identities |
+| paths and names | PATHMGR plus an unrelated ConnectAttach gave a path; `_IO_*` numbers named without protocol evidence | labelled as candidates (`path_candidate`, `(candidate)`) | test_paths_need_an_answered_open_and_stay_candidates, test_paths_and_protocols_are_labelled_candidates, test_resource_manager_names_and_paths |
+| decoding | failed kernel-call exits decoded with the success layout; INT_CALL payload taken as arguments | return code and errno for any exit whose first word is -1; INT_CALL has no arguments | test_kernel_call_layouts_follow_the_sat_guide, test_failed_send_keeps_status_and_errno |
+| decoding | signed 64-bit fields and `_msg_info` fields decoded unsigned; MsgSendPulsePtr layouts missing | types from the SAT tables and `<sys/neutrino.h>` | test_kernel_call_layouts_follow_the_sat_guide, test_traceprinter_event_by_event |
+| validate | unpaired SEND/DONE records dropped; coid and outcomes not compared; pulse differences could not fail; one exchange could satisfy two log records | all compared, each a failure | test_validation_fails_on_unpaired_shared_wrong_coid_outcome_and_pulses, test_ground_truth_links |
+| diff | rows without samples dropped and missing sides ranked against zero; priority shares compared by key and from rounded values; zero totals crashed | fixed | test_diff_keeps_rows_without_samples_and_compares_shares, test_latency_rows_are_roles_with_unfinished_and_excluded, test_server_time_is_credited_once |
+| CLI | malformed, NaN, infinite or negative numbers accepted; `--client` ignored by JSON; short CSV rows and I/O errors gave tracebacks | argparse checks (exit status 2); `--client` filters every per-client part; exit status 1 with a message | test_cli_rejects_bad_numbers_and_reports_io_errors, test_cli_exit_codes |
+| open | Host header not checked (DNS rebinding); unauthenticated completion endpoint | Host must be 127.0.0.1 or localhost on the port; random per-run token; Origin checked | test_open_serves_only_its_page_to_its_origin_with_a_token |
+| open | predictable shared temporary cache, reuse by mtime only | private `~/.cache/tracestudio`, key with path, size, mtime and version, atomic write, framing check | test_open_cache_is_private_atomic_and_checked_for_completeness, test_open_converts_once_and_pins_the_slowest_clients |
+| check | inversion assertion passed with nothing checked; inconclusive requests allowed; one request was enough for a latency assertion | `--min-checked`, `--max-insufficient` (default 0), `--min-requests`, matched roles reported | test_check_inversions_need_coverage_and_count_inconclusive, test_check_fails_prio_fixed_and_passes_prio_inherit, test_check_fails_on_lost_events_and_on_nothing_checked |
+| mutex owners | an unlock entry confirmed the owner, even a failed unlock by a non-owner; zero and marker owner words accepted | only a successful SyncMutexUnlock exit by a thread alive through the wait confirms; 0 and markers rejected | test_mutex_owner_needs_the_owners_successful_unlock |
+| mutex owners | the owner named across the whole wait; READY time before the lock returned mixed with MUTEX time | slices and rows split at the release and at the wake | test_critical_path_follows_a_mutex_owner_into_its_request |
+| mutex owners | address reuse, owner death, recursive mutexes, loss windows found later | unknown with the reason; checked again at the end of the pass | test_mutex_owner_needs_the_owners_successful_unlock |
 
-| item | status | tests |
-|---|---|---|
-| A loss: gaps in time order, `range()` over gaps, combines joined across gaps, states continued | fixed; its remaining defects were items 1 of the second and 2 of the third review | test_lost_buffer_never_joins_combine_slots, test_short_buffer_is_a_loss, test_sequence_wrap_reset_and_huge_gap, test_dropped_events_make_state_unknown_and_exchanges_untrustworthy, test_truncated_file, test_fault_injection_never_links_wrong |
-| B timestamps: neighbour rule overrode TIME after long silence, stale combines | fixed | test_time_anchor_is_authoritative_after_long_silence, test_interlaced_slots_around_a_rollover, test_interlaced_combine_takes_the_begin_timestamp, test_combine_across_consecutive_buffers |
-| C transactions: one-index cleanup, actorless and partial events, KER_INT, `_msg_info` conflicts, complete vs trustworthy, ambiguous parents | fixed | test_rcvid_reuse_and_late_completion_keep_the_new_exchange, test_thread_death_and_id_reuse, test_interrupted_send_and_late_reply, test_cancelled_send_is_complete_but_untrustworthy, test_injected_only_start, test_ambiguous_parent_counts_for_latency_only, test_cancellation_matches_the_workload_log |
-| D inversion: backfilled priorities, unrelated CPUs, receive window only | fixed; transitive chains open | test_inversion_positive_after_receive, test_inversion_before_receive_is_found_too, test_no_inversion_from_an_unrelated_cpu, test_no_inversion_for_plain_blocking, test_inversion_after_receive_on_a_real_capture, test_priority_story |
-| E slices: END closed the latest BEGIN, rounding, flows | fixed (the second review agreed) | test_cross_thread_and_deferred_replies, test_perfetto_exact_slices_threads_and_flows, test_zero_length_and_rounded_slices_nest, test_perfetto_loads |
-| F scheduler: migration idle, inferred wakeups, Linux priority semantics, blocked time label | fixed; QNX priorities kept in the sched priority column by decision, labelled | test_migration_marks_old_cpu_unknown_not_idle, test_wakeup_needs_object_evidence, test_wakeup_evidence_needs_the_same_wake |
-| G pulses: FIFO pairing, kernel senders | fixed | test_pulse_matching_needs_a_synchronised_queue, test_pulse_queue_loses_sync_at_a_loss, test_loss_forgets_channel_identities |
-| validate.py and cli.py: parent links, empty logs, exit codes | fixed | test_ground_truth_links, test_cli_exit_codes |
-| 2 design: fix or disable unsafe deductions, inspect the UI, pin dependencies, fixtures, build instructions, walkthrough, support matrix, visible loss and coverage | done | screenshots in docs/img, pyproject.toml, tests/data, README, sections 7 and 12 |
-| 3 scope for v0.1: critical-path track, `_IO_*` naming, diff, packaging | done (names now labelled candidates, see third review 6) | test_clip_recomputes_attribution, test_resource_manager_names_and_paths, test_latency_rows_are_roles_with_unfinished_and_excluded |
-| 3 later work: mutex owner chains, deeper path decoding, aarch64le fixtures, interrupt-to-IST latency, SSH capture, HTML report, upstream `.kev` importer | open | |
-| 4 demo: 165 s inversion story, budget labelled as MsgSend latency | storyline written (section 11); video not recorded | |
-| 5 tests to add (rollover, interlacing, missing slots, wrap, DROPPED, truncation, mixed modes, injected start, migration, KER_INT, cancellation, id reuse, cross-thread replies, ambiguous parents, reordered pulses, exact Perfetto checks) | done | the tests above, test_mixed_fast_and_wide_events |
+Known limits that stay open: transitive inversion chains (section 9); `open` reads the whole trace into memory; mutexes shared between processes and robust-mutex recovery give "owner unknown".
 
-Second review (v0.1). The third review rated item 4 fixed and items 1, 2, 3, 5, 6, 7 and 8 partly fixed; the remaining defects are listed under the third review.
-
-| item | status | tests |
-|---|---|---|
-| 1 loss: completed combines in a short buffer trusted; initial losses ignored; masks, paths, calls kept; UNKNOWN ended by an intact CPU's READY inside the gap; partial thread events restored actors | fixed (with third review 1, 2, 4) | test_deleted_middle_slot_taints_combine_and_exchange, test_loss_at_trace_start_flags_overlapping_exchange, test_loss_drops_run_mask_path_and_calls, test_ready_inside_a_loss_window_does_not_end_unknown, test_partial_thread_event_does_not_restore_actor |
-| B unanchored epochs are guesses | fixed (such events are not trusted) | test_slots_before_their_cpus_first_time_are_not_trusted |
-| 2 inversion: unknown mask taken as all CPUs; masks after loss and inheriting channels; one observed receiver taken as exclusive; policy evidence; wording | fixed (with third review 3, 4); SEND-phase verdicts for multi-threaded servers documented as unavailable | test_unknown_run_mask_is_not_all_cpus, test_run_mask_dropped_after_loss_and_inheriting_channel, test_send_phase_needs_a_sole_receiver, test_sole_thread_tracks_lifetimes_and_inventory, test_sporadic_server_is_insufficient_evidence, test_supplied_run_mask_is_labelled |
-| 3 critical path: clipping kept full attribution; untrustworthy children followed; unreplied requests missing from the handler index; READY beside idle or unknown CPUs called preempted; empty masks crashed | fixed (with third review 5) | test_clip_recomputes_attribution, test_untrustworthy_child_is_not_followed, test_unreplied_request_keeps_the_server_ambiguous, test_ready_beside_an_idle_cpu_is_unexplained, test_empty_run_mask_does_not_crash, test_receive_attribution_and_handoffs |
-| 4 transactions: stale reply selected and unindexed a replacement; ambiguous parents without warning | fixed; ambiguous parents now leave only the causal analyses | test_stale_reply_is_quarantined, test_ambiguous_parent_counts_for_latency_only |
-| 5 wakeups attributed by process or state type only; destination CPU inferred | fixed (with third review 7) | test_wakeup_needs_object_evidence, test_wakeup_evidence_needs_the_same_wake |
-| 6 pulses: uncertainty cleared by guessed exhaustion, loss tainted only existing queues, 1/n called confidence | fixed (with third review 4) | test_pulse_matching_needs_a_synchronised_queue, test_pulse_queue_loses_sync_at_a_loss, test_loss_forgets_channel_identities |
-| 7 paths and names: PATHMGR plus unrelated ConnectAttach gave a path; `_IO_*` numbers named without protocol evidence | labelled: paths and non-procnto `_IO_*` names are candidates (third review 6) | test_paths_need_an_answered_open_and_stay_candidates, test_paths_and_protocols_are_labelled_candidates, test_resource_manager_names_and_paths |
-| 8 diff inputs: equal names merged, unfinished requests dropped, overlapping handling counted twice | fixed for the inputs; the `diff` command itself has not been reviewed | test_latency_rows_are_roles_with_unfinished_and_excluded, test_server_time_is_credited_once |
-| documentation overstatements ("every MsgSend", exact states, proven wakeups, never wrong links, fast-mode subtypes) | fixed in README and this document | |
-| one-level inversion, bounded nesting, unresolved handoffs | documented limits (handoffs are now unknown) | |
-
-Third review (v0.1b):
-
-| item | status | tests |
-|---|---|---|
-| 1 crash: a loss before a CPU's first buffer has no start; the writer raised TypeError | fixed: missing bounds become the trace start or end | test_initial_buffer_loss_converts |
-| 2 a partial final slot exempted the whole short buffer from taint | fixed: only a last buffer that lacks exactly the one slot the file ends inside is exempt | test_partial_final_slot_keeps_whole_buffer_uncertain |
-| 3 sole-thread exclusivity ignored reused thread ids and incomplete inventories | fixed: lifetimes per tid; any loss window since the inventory start gives insufficient evidence | test_sole_thread_tracks_lifetimes_and_inventory |
-| 4 channel flags, resource-manager channels and scoid maps survived losses | fixed: forgotten at losses, ChannelDestroy and process exit; the report of created channels is kept | test_loss_forgets_channel_identities |
-| 5 "receiving this request" covered unrelated running time; cross-thread replies analysed the original receiver | fixed: bounded by the MsgReceivev call that returned the request; after a cross-thread reply the path is unknown and the inversion evidence insufficient; the receiver back in RECEIVE is unknown | test_receive_attribution_and_handoffs |
-| 6 paths and protocols without independent confirmation (unrelated open within 10 ms; application message 0x100) | labelled: `path_candidate`, `(candidate)` in names, slices and analyze output; procnto's protocols are the only names without the label | test_paths_and_protocols_are_labelled_candidates |
-| 7 wakeup evidence survived a re-block before the receive | fixed: bound to the transaction and to one READY/RUNNING stretch | test_wakeup_evidence_needs_the_same_wake |
-| 8 untrustworthy transactions had ordinary arrows; handle and reply slices had no warnings | fixed: no arrows, `[not trustworthy]` on every slice, warnings on all of them | test_untrustworthy_exchange_has_no_arrows_and_warns_on_every_slice |
-| documentation: confirmed paths, universally annotated slices, blanket "fixed" statuses, Toolkit and Perfetto comparisons without a source | fixed: paths are candidates, the slice arguments are listed per slice, statuses are per item, the comparisons are removed | |
-| CLI, packaging, tables and diff not reviewed | open: covered only by test_cli_exit_codes, test_resource_manager_names_and_paths and the fresh `pip install .` runs | |
-
-Fourth review (v0.1.0: CLI, validation, decoding, tables):
-
-| item | status | tests |
-|---|---|---|
-| failed kernel-call exits decoded with the success layout (errno lost or taken as rmsg0); INT_CALL payload taken as arguments | fixed: return code and errno for any exit whose first word is -1; INT_CALL has no arguments; both checked against traceprinter on a synthetic trace | test_kernel_call_layouts_follow_the_sat_guide, test_failed_send_keeps_status_and_errno, test_cancellation_matches_the_workload_log |
-| signed 64-bit sparts, rparts and status decoded unsigned; MsgSendPulsePtr layouts missing | fixed from the SAT tables; the strict comparison then found `_msg_info` fields decoded unsigned, fixed from `<sys/neutrino.h>` | test_kernel_call_layouts_follow_the_sat_guide, test_traceprinter_event_by_event |
-| validate: unpaired SEND/DONE records dropped, coid and outcomes not compared, pulse discrepancies could not fail, one transaction could satisfy two log intervals | fixed | test_validation_fails_on_unpaired_shared_wrong_coid_outcome_and_pulses, test_fault_injection_never_links_wrong, test_ground_truth_links |
-| diff dropped rows without samples and ranked missing sides against zero; priority shares compared by key only, from rounded values, zero totals crashed | fixed | test_diff_keeps_rows_without_samples_and_compares_shares |
-| malformed, NaN, infinite or negative numbers accepted or crashing; `--client` ignored by JSON and partly by text | fixed: argparse checks (exit status 2); `--client` filters every per-client part | test_cli_rejects_bad_numbers_and_reports_io_errors |
-| short CSV rows raised TypeError; I/O errors other than a missing file gave tracebacks | fixed: exit status 1 with a message | test_validation_fails_on_unpaired_shared_wrong_coid_outcome_and_pulses, test_cli_rejects_bad_numbers_and_reports_io_errors |
-| README: exit status wording, INT_CALL support, cancellation outcomes, which traceprinter fields are compared | fixed in README and this document (the compared and skipped arguments are listed in README, Validation evidence) | |
-| message tables and clean install | no blocker found by the reviewer; wheel and sdist install in fresh venvs | |
-
-Fifth review (`open` and `check` in v0.2.0):
-
-| item | status | tests |
-|---|---|---|
-| open: Host header not checked (DNS rebinding), unauthenticated completion endpoint | fixed: Host must be 127.0.0.1 or localhost on the port; random per-run token on every path; Origin checked on the completion report | test_open_serves_only_its_page_to_its_origin_with_a_token |
-| open: predictable shared temporary cache, mtime-only reuse | fixed: private `~/.cache/tracestudio` (0700, checked), key with path, size, mtime and version, atomic write, framing check | test_open_cache_is_private_atomic_and_checked_for_completeness, test_open_converts_once_and_pins_the_slowest_clients |
-| open: PONG origin, claimed loading, no error handling or handshake timeout, structured clone | fixed: e.origin checked, "handed" wording, HTTP and promise errors with Retry, closed-window and 60 s timeout, buffer transferred | test_open_serves_only_its_page_to_its_origin_with_a_token, headless Chromium run |
-| open: whole-file loading | open: the trace is read into memory once (streaming later) | |
-| check: inversion assertions passed with nothing checked; inconclusive requests allowed | fixed: --min-checked, --max-insufficient (default 0) inside --no-inversions, counts reported, --client scoping | test_check_inversions_need_coverage_and_count_inconclusive, test_check_fails_prio_fixed_and_passes_prio_inherit |
-| check: one request enough, selectors masking a missing client | fixed: --min-requests, matched roles reported, THREAD@SERVER | test_check_fails_on_lost_events_and_on_nothing_checked |
-| check: JUnit control characters, non-atomic writes, no report for unreadable traces | fixed | test_check_inversions_need_coverage_and_count_inconclusive |
-| CI script not reviewed | reviewed here: trap set before the target boots, cleanup on every exit path, status kept, clear errors for a missing address or ssh | stub runs (section 13) and the CI run |
-
-Sixth review (mutex owner chains in v0.3.0):
-
-| item | status | tests |
-|---|---|---|
-| owner confirmed from an unlock entry; a failed unlock by a non-owner that read the owner word would confirm it; zero and marker owner words accepted | fixed: only a successful SyncMutexUnlock exit confirms, by a thread alive throughout the wait; 0 and markers rejected | test_mutex_owner_needs_the_owners_successful_unlock |
-| the owner named across the whole wait, also after the handover; READY time before the lock returned mixed with MUTEX time | fixed: Perfetto slices and analyze rows split at the release and at the wake | test_critical_path_follows_a_mutex_owner_into_its_request |
-| address reuse and owner death (no generations); EOWNERDEAD called a failure | fixed: SyncDestroy and SyncTypeCreate of the address and a reused or dead unlocking thread give unknown; EOWNERDEAD is an acquisition; remapping is not decoded (owners are never carried across waits) | test_mutex_owner_needs_the_owners_successful_unlock |
-| recursive mutexes (count ignored); ceiling priorities read as inheritance | recursive mutexes unsupported (unknown); priorities reported as observations, ceiling mutexes marked | test_mutex_owner_needs_the_owners_successful_unlock |
-| loss windows found later | fixed: checked again at the end of the pass | test_mutex_owner_needs_the_owners_successful_unlock (early_loss) |
-| duration conservation, cycles in nested critical paths | tests: every leaf counted once and tiling the latency; cycle detection on the nesting path | test_critical_path_follows_a_mutex_owner_into_its_request |
-| shared-object identity across processes, robust-mutex recovery intervals | open: reported as owner unknown | |
-
-## 11. Demo storyline (165 s)
-
-1. Problem (15 s): hi (priority 30) asks ts_psrv for 0.5 ms of work every 25 ms with a 5 ms budget for its MsgSend; hog (20) and lo (10) share CPU 0. The log says 20 of 20 missed.
-2. Capture (20 s): `run_scenarios.sh /tmp/ts/bin /tmp/ts/out prio_fixed`, `scp`, `tracestudio convert`.
-3. Diagnosis (55 s): in ui.perfetto.dev, CPU 0 shows hog holding the CPU while psrv-rx is preempted; hi's MsgSend arrow lands on psrv-rx only after lo's request; hi's critical path says 71% "psrv-rx READY (10), CPU: hog (20)". `tracestudio analyze --deadline hi=5000` lists 20 suspected inversions with the evidence (psrv-rx's traced run mask, hog on CPU 0) and the channel created with `_NTO_CHF_FIXED_PRIORITY`.
-4. Fix and comparison (40 s): drop `-f`, recapture, `tracestudio diff`: 0 of 20 missed, max 2.7 ms, psrv-rx runs hi's requests at 30; the QNX priority track shows the boost arriving while psrv-rx still handles lo.
-5. Trust (20 s): 672,043 events and 2.2 million argument values identical to traceprinter on 14 captures, 1,040/1,040 logged requests linked; in the fault-injection test, dropped buffers gave flagged exchanges and no wrong link.
-6. Value (15 s): the same view of a resource manager, for example `MsgSend _IO_READ (candidate) -> devb-eide` with its candidate path.
-
-## 12. Build and run
+## 11. Build and run
 
 ```
 source ~/qnx800/qnxsdp-env.sh && make -C workload          # workload/build/x86_64/ts_*
@@ -271,11 +211,11 @@ venv/bin/tracestudio analyze /path/prio_fixed.kev --deadline hi=5000
 TS_REQUIRE_ALL=1 venv/bin/python tests/test_tracestudio.py  # with the SDK env sourced for traceprinter
 ```
 
-## 13. One command to Perfetto, and real-time checks in CI (v0.2.0)
+## 12. One command to Perfetto, and real-time checks in CI (v0.2.0)
 
 `tracestudio open` (`tracestudio/serve.py`) follows Perfetto's deep-linking documentation (perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui, read on 3 Nov 2026): the opener is a page served over HTTP from 127.0.0.1 (the protocol does not work from `file://`), sent without `Cross-Origin-Opener-Policy: same-origin`; it opens `https://ui.perfetto.dev/#!/?startupCommands=<URL-encoded JSON>`, posts `PING` every 250 ms until a `PONG` arrives from that window and origin (`e.source` and `e.origin` checked), then posts `{perfetto: {buffer, title, fileName}}` to the UI's origin with the buffer transferred, and reports the hand-off to the local server, which then stops. postMessage does not confirm that the UI loaded the trace; the command reports "trace handed to Perfetto". Each pin is a `{"id": "dev.perfetto.PinTracksByRegex", "args": [regex]}` command; regexes escape only regular-expression metacharacters so that JavaScript reads them as Python does. Default pins: the clients that missed `--deadline` (most misses first), else the two with the slowest trustworthy MsgSend to a server other than procnto; for each, `^<thread name> (critical path|QNX state)`.
 
-Local exposure (fifth review): the server answers only requests whose Host is `127.0.0.1:PORT` or `localhost:PORT` (421 otherwise, so a DNS-rebinding page cannot read it), serves the page, the trace and the completion endpoint only under a random 32-character token, and accepts the completion report only from the page's own origin (403 otherwise). The page shows HTTP and promise errors, a closed Perfetto window and a missing answer after 60 s, each with a Retry button. Conversions go to `~/.cache/tracestudio` (or `$XDG_CACHE_HOME/tracestudio`), created with mode 0700 and refused when it is a symlink, someone else's or open to group or others; the file is named after the input's absolute path, size, mtime and the tracestudio version, written to a temporary file in that directory and renamed into place, and reused only when its whole length parses as `Trace.packet` frames. The whole trace is still read into memory and copied once into the page (streaming is not done).
+Local exposure: the server answers only requests whose Host is `127.0.0.1:PORT` or `localhost:PORT` (421 otherwise, so a DNS-rebinding page cannot read it), serves the page, the trace and the completion endpoint only under a random 32-character token, and accepts the completion report only from the page's own origin (403 otherwise). The page shows HTTP and promise errors, a closed Perfetto window and a missing answer after 60 s, each with a Retry button. Conversions go to `~/.cache/tracestudio` (or `$XDG_CACHE_HOME/tracestudio`), created with mode 0700 and refused when it is a symlink, someone else's or open to group or others; the file is named after the input's absolute path, size, mtime and the tracestudio version, written to a temporary file in that directory and renamed into place, and reused only when its whole length parses as `Trace.packet` frames. The whole trace is still read into memory and copied once into the page (streaming is not done).
 
 Checked end to end on 3 Nov 2026 in headless Chromium (Playwright) against ui.perfetto.dev v59.1 with `tracestudio open prio_fixed.kev --no-browser --timeout 150`, before and after these changes: the opener reported handing over 2,733,245 bytes, the UI's pinned-track tree held exactly `lo QNX state`, `lo critical path`, `hi QNX state` and `hi critical path` (the UI shows them with the tid in parentheses; the regex matched the track names), and the command exited 0 (screenshot `docs/img/open_pinned.png`). Unit tests: `test_open_serves_only_its_page_to_its_origin_with_a_token` (Host, token, Origin, page contents, no COOP, stop on the report), `test_open_cache_is_private_atomic_and_checked_for_completeness`, `test_open_converts_once_and_pins_the_slowest_clients` (conversion, reuse, a truncated cache file converted again, default pins).
 
@@ -283,7 +223,7 @@ Checked end to end on 3 Nov 2026 in headless Chromium (Playwright) against ui.pe
 
 CI example (`tools/ci_qemu_check.sh`, run on the build box on 3 Nov 2026, logs under `~/work/ts-ci/` there): each run built the workload with the SDP, installed this version with pip into a fresh venv, booted its own QEMU target with mkqnximage in a new directory, captured the scenario under tracelogger, fetched the `.kev`, ran `tracestudio check --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/` and stopped the target from its exit trap. `prio_fixed` exited 1 (20 of 20 over 5000 us, max 11096.0 us; 20 suspected inversions, 119 exchanges checked), `prio_inherit` exited 0 (max 2779.0 us; none suspected, none inconclusive). The script's cleanup and exit status were checked with a stub run for a failing step, success, a failing pipeline and SIGTERM (status 3, 0, 1 and 143 kept, cleanup run each time). Without `--client`, an earlier capture of `prio_inherit` failed `--no-inversions` on one inconclusive request from ts_psrv to procnto.
 
-## 14. Mutex owner chains (v0.3.0)
+## 13. Mutex owner chains (v0.3.0)
 
 Decoding: SyncMutexLock and SyncMutexUnlock entries use the SAT guide's layouts (`sync_p, count, owner`; the 64-bit variant has a 64-bit `sync_p`) and exits `ret_val, empty` (or `ret_val, errno` when the call failed); traceprinter prints the same values on all 17 captures (439 SyncMutexLock and 1,588 SyncMutexUnlock entries compared, each with sync_p, count and owner, and 633 SyncTypeCreate entries with all eight fields; 0 mismatches; no SyncDestroy occurred in the captures) and on a synthetic trace in the unit tests.
 
