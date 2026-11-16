@@ -435,6 +435,37 @@ def test_version_agrees_everywhere():
         latest = re.search(r"^## (\S+)", f.read(), re.M).group(1)
     assert __version__ == project == latest, (__version__, project, latest)
 
+
+def test_docs_links_resolve_and_test_counts_match():
+    """Relative links and #anchors in the README and docs/ point at files and headings that exist, and every
+    statement of the suite's size names the real number of tests."""
+    import re
+    root = os.path.join(HERE, "..")
+    suites = {"test_synthetic.py": 0, "test_tracestudio.py": 0}
+    for name in suites:
+        with open(os.path.join(HERE, name)) as f:
+            suites[name] = len(re.findall(r"^def test_", f.read(), re.M))
+    total, captures = sum(suites.values()), suites["test_tracestudio.py"]
+
+    def slug(heading):
+        return re.sub(r"[^a-z0-9 _-]", "", heading.lower()).replace(" ", "-")
+    for doc in ("README.md", "docs/DESIGN.md", "docs/VALIDATION.md", "docs/JSON.md", "CHANGELOG.md"):
+        with open(os.path.join(root, doc)) as f:
+            text = f.read()
+        anchors = {slug(h) for h in re.findall(r"^#+ (.+)$", text, re.M)}
+        for target in re.findall(r"\]\(([^)\s]+)\)", text):
+            if target.startswith(("http://", "https://")):
+                continue
+            path, _, anchor = target.partition("#")
+            if path:
+                assert os.path.exists(os.path.join(root, os.path.dirname(doc), path)), (doc, target)
+            elif anchor:
+                assert anchor in anchors, (doc, target)
+        for n in re.findall(r"(?:runs|has) (\d+) tests", text) + re.findall(r"(\d+) tests in \[tests", text):
+            assert int(n) == total, (doc, n, total)
+        for n in re.findall(r"(\d+) on (?:the checked-in captures|the captures in)", text):
+            assert int(n) == captures, (doc, n, captures)
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window
