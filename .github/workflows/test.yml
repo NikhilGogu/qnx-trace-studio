@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install .
+      # The traceprinter comparison needs the QNX SDP host tools, which a hosted
+      # runner does not have; those checks are skipped here and run on a machine
+      # with the SDP (TS_REQUIRE_ALL=1).
+      - name: Unit and regression tests on the checked-in QNX 8.0 captures
+        run: python tests/test_tracestudio.py
+      - name: The CI gate on a failing and a passing capture
+        run: |
+          if tracestudio check tests/data/run1/prio_fixed.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/; then
+            echo "expected exit status 1 for prio_fixed"; exit 1
+          fi
+          tracestudio check tests/data/run1/prio_inherit.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
