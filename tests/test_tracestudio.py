@@ -389,6 +389,17 @@ def test_agent_skill_commands_parse():
     for reason in ("run mask of %s not traced", "request handed off: received by"):
         assert reason in src, reason
 
+
+def test_version_agrees_everywhere():
+    import re
+    from tracestudio import __version__
+    root = os.path.join(HERE, "..")
+    with open(os.path.join(root, "pyproject.toml")) as f:
+        project = re.search(r'^version = "([^"]+)"', f.read(), re.M).group(1)
+    with open(os.path.join(root, "CHANGELOG.md")) as f:
+        latest = re.search(r"^## (\S+)", f.read(), re.M).group(1)
+    assert __version__ == project == latest, (__version__, project, latest)
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window

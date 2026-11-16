@@ -86,6 +86,8 @@ Each capability below names the code that implements it and a test that checks i
 
 Python 3.10 or newer. The two install lines under [Try it without a QNX target](#try-it-without-a-qnx-target) are all it takes; `venv/bin/tracestudio --help` lists the commands. The examples below write `tracestudio` for `venv/bin/tracestudio` and use short file names such as `trace.kev` for your own captures.
 
+[CHANGELOG.md](CHANGELOG.md) lists the changes per version. A `v*` tag runs `.github/workflows/release.yml`: it builds the wheel, installs it in a fresh venv, runs the `check` gate and the tests, and attaches the wheel to a GitHub Release.
+
 Dependencies: `perfetto` 0.59.x (its generated protobuf classes, and TraceProcessor for the tests) and `protobuf` 7.x. `pip install .` installs both. `convert` and `open` use them at run time; the other commands do not.
 
 ## Capture on QNX 8.0
@@ -429,7 +431,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
 - 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 94 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 21 on the checked-in captures, among them one that runs the quickstart commands above.
+- `python3 tests/test_tracestudio.py` runs 95 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 22 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

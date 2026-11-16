@@ -1,6 +1,6 @@
 ---
 name: trace-studio
-description: "How to find out why a request was late on QNX OS 8.0 from a kernel trace (.kev from tracelogger) with the tracestudio command: capture the trace, get latency per client and server, deadline misses, suspected priority inversions with their evidence, the critical path of one request, mutex owner chains, a before and after comparison, and a CI gate with exit status and JUnit XML. Read this before you capture or analyse a .kev file, before you claim a priority inversion, and when a user asks why a QNX client missed its deadline. Written for trace-studio v0.3.1."
+description: "How to find out why a request was late on QNX OS 8.0 from a kernel trace (.kev from tracelogger) with the tracestudio command: capture the trace, get latency per client and server, deadline misses, suspected priority inversions with their evidence, the critical path of one request, mutex owner chains, a before and after comparison, and a CI gate with exit status and JUnit XML. Read this before you capture or analyse a .kev file, before you claim a priority inversion, and when a user asks why a QNX client missed its deadline. Written for trace-studio v0.4.0."
 license: Apache-2.0
 ---
 
