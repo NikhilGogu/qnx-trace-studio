@@ -2,6 +2,7 @@
 
 ## 0.4.0
 
+- Workflows: the release job is split into a read-only build-and-test job and a publish job that alone may write and runs no project code; Pages permissions sit on the deploy job only; checkouts do not keep the token.
 - Inversions: SEND-phase verdicts for multi-threaded servers. Every receive-capable thread of the server must be accounted for, or the result is "insufficient evidence".
 - Fixed: `analyze --min-us 0` and `check --min-us 0` crashed on a request with no inversion time.
 - `action.yml`: a GitHub Action that runs `tracestudio check` and writes a JUnit report.
