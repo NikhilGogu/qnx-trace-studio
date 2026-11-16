@@ -148,6 +148,14 @@ def _analysis(model, a, tl):
     return out
 
 
+def slowest_requests(model, n, client=None):
+    """The n slowest top-level requests with an unambiguous parent, of clients whose label contains `client`."""
+    top = sorted((t for t in model.txns if t.causal and t.parent is None
+                  and (client is None or client in model.label(t.client))),
+                 key=lambda t: t.t_exit - t.t_call, reverse=True)
+    return top[:n]
+
+
 def cmd_analyze(a):
     from .analyses import Timeline, us
     from .critical import critical_path, render, to_json
@@ -163,10 +171,7 @@ def cmd_analyze(a):
             print("error: no transaction %d (trace has 0..%d)" % (i, len(model.txns) - 1), file=sys.stderr)
             return 2
         picks.append(model.txns[i])
-    if a.slowest:
-        top = sorted((t for t in model.txns if t.causal and t.parent is None),
-                     key=lambda t: t.t_exit - t.t_call, reverse=True)
-        picks += [t for t in top if a.client is None or a.client in model.label(t.client)][:a.slowest]
+    picks += slowest_requests(model, a.slowest, a.client)
     cps = []
     for tx in picks:
         if tx.t_call is None or tx.t_exit is None:
