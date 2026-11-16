@@ -1987,3 +1987,52 @@ def test_owner_at_or_above_the_client_is_no_inversion():
     _, m = chain_scene(owner_prio=30)                            # e.g. raised by priority inheritance
     r = suspected_inversions(m)
     assert r["suspected"] == [] and r["insufficient_evidence"] == []
+
+
+def test_malformed_traces_fail_check_with_a_trace_error():
+    """Every malformed header field, a bad system page length and corrupt, truncated or oversized gzip data give
+    exit status 1 and a JUnit report with a TraceError naming the problem, replacing any older report."""
+    import gzip
+    import re
+    import xml.etree.ElementTree as ET
+    from tracestudio.cli import main
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.state(0, T + 10, RUNNING, C, 10)
+    good = g.bytes()
+
+    def field(key, value):
+        return re.sub(rb"TRACE_%s::[^T]*" % key.encode(), b"TRACE_%s::%s" % (key.encode(), value.encode()), good)
+    big = gzip.compress(good + bytes(1 << 20))
+    cases = [("CYCLES_PER_SEC", field("CYCLES_PER_SEC", "abc"), {}), ("CPU_NUM", field("CPU_NUM", "x"), {}),
+             ("CPU_NUM", field("CPU_NUM", "0"), {}), ("VER_MAJOR", field("VER_MAJOR", "?"), {}),
+             ("SYSPAGE_LEN", field("SYSPAGE_LEN", "-32"), {}), ("SYSPAGE_LEN", field("SYSPAGE_LEN", "99999"), {}),
+             ("corrupt gzip", gzip.compress(good)[:10] + b"\xff" * 40, {}),
+             ("corrupt gzip", gzip.compress(good)[:-20], {}),
+             ("TRACESTUDIO_MAX_KEV_BYTES", big, {"TRACESTUDIO_MAX_KEV_BYTES": str(1 << 20)}),
+             ("TRACESTUDIO_MAX_KEV_BYTES", big, {"TRACESTUDIO_MAX_KEV_BYTES": "lots"})]
+    report = os.path.join(TMP, "malformed.xml")
+    for i, (what, data, env) in enumerate(cases):
+        path = os.path.join(TMP, "malformed%d.kev" % i)
+        with open(path, "wb") as f:
+            f.write(data)
+        with open(report, "w") as f:
+            f.write("stale")
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = main(["check", path, "--no-inversions", "--junit", report])
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k)
+                else:
+                    os.environ[k] = v
+        assert code == 1, (what, code)
+        (e,) = ET.parse(report).getroot().iter("error")
+        assert e.get("type") == "TraceError" and what in e.get("message"), (what, e.get("message"))
+        assert what in err.getvalue(), (what, err.getvalue())
+    k = KevFile("ok.kev", gzip.compress(good))                      # a well-formed gzip still reads
+    assert k.data == good and k.events_offset == good.index(b"TRACE_HEADER_END::") + len(b"TRACE_HEADER_END::")
