@@ -35,3 +35,29 @@ jobs:
           tracestudio check tests/data/run1/prio_inherit.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
       - name: The mutex owner chain from the quickstart
         run: tracestudio analyze tests/data/run4/mutex_chain_nopi.kev.gz --slowest 1 --client ts_mutex/hi
+
+  action-selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The action passes on prio_inherit
+        uses: ./
+        with:
+          trace: tests/data/run1/prio_inherit.kev.gz
+          args: --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+          junit: pass.xml
+      - name: The action fails on prio_fixed
+        id: fixed
+        uses: ./
+        continue-on-error: true
+        with:
+          trace: tests/data/run1/prio_fixed.kev.gz
+          args: --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+          junit: fail.xml
+      - name: Check both outcomes and reports
+        env:
+          OUTCOME: ${{ steps.fixed.outcome }}
+        run: |
+          test "$OUTCOME" = failure
+          grep -q 'failures="0"' pass.xml
+          grep -q 'type="PriorityInversion"' fail.xml

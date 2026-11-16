@@ -313,6 +313,23 @@ tracestudio check prio_fixed.kev --deadline hi@ts_psrv=5000 --no-inversions --cl
 
 `--runmask`, `--assume-unpinned` and `--min-us` work as for `analyze`. A trace that lost events fails its `trace integrity` assertion, and a latency assertion whose requests include excluded or unfinished ones fails, unless `--allow-loss` is given (they are still reported). `--junit FILE` also writes a JUnit XML report: a `testsuite` with one `testcase` per assertion and a `failure` element with the evidence for each one that failed; it is written atomically, characters XML cannot carry are replaced, and a trace that cannot be read gives a report with one `error` testcase.
 
+### As a GitHub Action
+
+`action.yml` at the repository root wraps `check`. It installs trace-studio from the action's own checkout and fails the step when an assertion fails:
+
+```
+- uses: actions/checkout@v4
+- uses: <owner>/qnx-trace-studio@<tag>     # the repository and release that host trace-studio
+  with:
+    trace: traces/prio_fixed.kev.gz
+    args: --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+    junit: tracestudio-junit.xml          # optional, this is the default
+```
+
+The `action-selftest` job in `.github/workflows/test.yml` runs the action on `prio_inherit` (it must pass) and on `prio_fixed` (it must fail) and checks both JUnit reports.
+
+### On a QEMU target with the SDP
+
 `tools/ci_qemu_check.sh SCENARIO [check options]` is a CI job for a runner with the SDP and KVM: it builds the workload with the SDP, boots a fresh QEMU target with mkqnximage, runs the scenario under tracelogger, fetches the `.kev` and runs `tracestudio check`. A trap stops the target on every way out (success, a failed step, SIGINT, SIGTERM) and keeps the exit status: check's, or that of the step that failed. These are the commands it ran on the build box (from its `set -x` trace; `$SSHO` holds the ssh options, `$IP` the target address):
 
 ```
