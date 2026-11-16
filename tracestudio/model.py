@@ -188,6 +188,12 @@ class Txn:
         return self.complete and not self.warnings
 
     @property
+    def unfinished(self):
+        """MsgSendv had not returned when the trace ended. A request that returned but whose MsgSendv entry is not
+        in the trace is incomplete, so it counts as untrustworthy instead."""
+        return self.t_exit is None
+
+    @property
     def causal(self):
         """Usable for causal analyses (critical paths, inversion attribution): trustworthy, parent not ambiguous."""
         return self.trustworthy and not self.parent_candidates

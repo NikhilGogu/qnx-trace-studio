@@ -643,6 +643,67 @@ def test_aarch64le_capture():
         raise AssertionError("traceprinter not found")
 
 
+def test_inversion_gate_follows_the_mutex_chain():
+    """mutex_chain_nopi: hi (30) waits on mrx, MUTEX-blocked on holder (10, no inheritance), REPLY-blocked on
+    slow-rx (10), READY while the hog (20) holds CPU 0: the gate fails and names the chain. mutex_chain_hog:
+    inheritance lifts holder and slow-rx to 30, so the hog cannot get in and the gate passes."""
+    import contextlib
+    import io
+    import xml.etree.ElementTree as ET
+    from tracestudio.cli import main
+    for name, want in (("mutex_chain_nopi", 1), ("mutex_chain_hog", 0)):
+        report = os.path.join(TMP, name + "-junit.xml")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["check", kev(name, DATA4), "--no-inversions", "--client", "ts_mutex/hi", "--junit", report])
+        assert code == want, (name, out.getvalue())
+        kinds = [f.get("type") for f in ET.parse(report).iter("failure")]
+        assert kinds == (["PriorityInversion"] if want else []), (name, kinds)
+    m = Model(KevFile(kev("mutex_chain_nopi", DATA4)))
+    inv = suspected_inversions(m, only=lambda k: m.label(k) == "ts_mutex/hi")
+    sus = [x for x in inv["suspected"] if x["server"] == "ts_mutex/mrx"]
+    assert len(sus) == 20 and inv["insufficient_evidence"] == [], (len(sus), inv["insufficient_evidence"])
+    for x in sus:
+        assert x["preempted_by"][0]["thread"] == "ts_mutex/hog" and x["preempted_by"][0]["prio"] == 20
+        top = x["held_up"][0]
+        assert top["thread"] == "ts_mslow/slow-rx" and top["prio"] == 10, top
+        assert top["chain"].startswith("ts_mutex/mrx MUTEX-blocked on mutex ") and \
+            "(owner ts_mutex/holder) -> ts_mutex/holder REPLY-blocked on ts_mslow (txn " in top["chain"], top
+        assert "ts_mutex/holder" in x["evidence"] and "ts_mutex/hog (prio 20) on CPU 0" in x["evidence"]
+
+
+def test_action_args_split_like_a_shell():
+    """action.yml passes `args` to tracestudio check split as a shell would: quotes group words, wildcards stay
+    literal, and an unbalanced quote fails the step before check runs."""
+    import re
+    with open(os.path.join(HERE, "..", "action.yml")) as f:
+        text = f.read()
+    step = text[text.index("- name: tracestudio check"):]
+    head, body = re.search(r"\n( *)run: \|\n((?:\1  .*\n|\n)+)", step).groups()
+    script = "\n".join(ln[len(head) + 2:] for ln in body.splitlines())
+    work = tempfile.mkdtemp(prefix="ts-action-")
+    shim = os.path.join(work, "bin")
+    os.mkdir(shim)
+    with open(os.path.join(shim, "tracestudio"), "w") as f:
+        f.write("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n")
+    os.chmod(os.path.join(shim, "tracestudio"), 0o755)
+    open(os.path.join(work, "ts_x"), "w").close()                 # what an unquoted ts_* would expand to
+    os.symlink(sys.executable, os.path.join(shim, "python"))       # the action runs `python` from setup-python
+
+    def run(args):
+        env = dict(os.environ, PATH=os.pathsep.join([shim, os.environ.get("PATH", "")]), TS_TRACE="t.kev",
+                   TS_ARGS=args, TS_JUNIT="r.xml", RUNNER_TEMP=work)
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script], cwd=work, env=env,
+                              capture_output=True, text=True)
+    r = run('--client "ts pload/" --no-inversions')
+    assert r.returncode == 0 and r.stdout.splitlines() == [
+        "check", "t.kev", "--client", "ts pload/", "--no-inversions", "--junit", "r.xml"], (r.stdout, r.stderr)
+    r = run("--client ts_*")
+    assert r.returncode == 0 and r.stdout.splitlines()[2:4] == ["--client", "ts_*"], r.stdout
+    r = run('--client "ts pload/')
+    assert r.returncode != 0 and r.stdout == "", (r.returncode, r.stdout)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

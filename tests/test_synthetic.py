@@ -1916,3 +1916,155 @@ def test_critical_path_follows_a_mutex_owner_into_its_request():
         assert got == [("MUTEX 0x1000 (owner s2)", 210, 890), ("MUTEX 0x1000 (owner not traced after the release)",
                        1100, 10), ("MUTEX 0x1000 woken, until SyncMutexLock returns", 1110, 100)], got
         tp.close()
+
+
+def chain_scene(unlock_value=0x1002, owner_prio=10):
+    """hi (30) asks s1, which blocks on mutex 0x1000 owned by s2 (pinned to CPU 0); mid (20) then holds CPU 0 for
+    about 2 ms while s2 is READY. s2 unlocks with `unlock_value` (0x1002 is the owner value s1's lock read)."""
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, S2, owner_prio)
+    g.runmask(0, T + 20, 0x1)
+    ms = 1_000_000
+    g.state(0, T + ms, READY, S2, owner_prio)
+    g.state(0, T + ms + 1, RUNNING, H, 30)
+    g.send(0, T + ms + 10, H, S[0], 0x10001, prio=30)
+    g.receive(0, T + ms + 40, S, H, 0x10001, prio=30)
+    g.kcall(0, T + ms + 100, K_MUTEX_LOCK, [0x1000, 0x80000000, 0x1002])
+    g.state(0, T + ms + 110, ST_MUTEX_CODE, S, 30)
+    g.state(0, T + ms + 120, RUNNING, M, 20)
+    g.state(0, T + 3 * ms, NANOSLEEP, M, 20)
+    g.state(0, T + 3 * ms + 10, RUNNING, S2, owner_prio)
+    g.kcall(0, T + 3 * ms + 500, K_MUTEX_UNLOCK, [0x1000, 0x80000000, 0x80000000 | unlock_value])
+    g.kcall(0, T + 3 * ms + 505, K_MUTEX_UNLOCK, [0, 0], EXIT)
+    g.state(0, T + 3 * ms + 510, READY, S2, owner_prio)
+    g.state(0, T + 3 * ms + 511, RUNNING, S, 30)
+    g.kcall(0, T + 3 * ms + 520, K_MUTEX_LOCK, [0, 0], EXIT)
+    g.reply(0, T + 3 * ms + 600, S, H, 0x10001, 30)
+    g.wait_receive(0, T + 3 * ms + 640, S, 30)
+    g.send_exit(0, T + 3 * ms + 660, H, 30)
+    return model(g)
+
+
+def test_inversion_through_a_mutex_owner():
+    _, m = chain_scene()
+    r = suspected_inversions(m)
+    (x,) = r["suspected"]
+    assert x["client"] == "high/h" and x["server"] == "server/s1" and 1999 < x["inversion_us"] < 2001
+    assert x["preempted_by"][0]["thread"] == "mid/m" and x["preempted_by"][0]["prio"] == 20
+    (h,) = x["held_up"]
+    assert (h["thread"], h["prio"], h["run_mask"], h["eligible_cpus"]) == ("server/s2", 10, "0x1", [0])
+    assert h["chain"] == "server/s1 MUTEX-blocked on mutex 0x1000 (owner server/s2)", h
+    assert x["server_prio_while_ready"] is None and x["server_run_mask"] is None and x["eligible_cpus"] is None
+    assert "server/s1 MUTEX-blocked on mutex 0x1000 (owner server/s2), server/s2 was READY at prio 10" in x["evidence"]
+    assert "mid/m (prio 20) on CPU 0" in x["evidence"]
+
+
+def test_inversion_through_an_unknown_owner_is_insufficient_evidence():
+    _, m = chain_scene(unlock_value=0x1003)                      # another owner value: the owner is not known
+    r = suspected_inversions(m)
+    assert r["suspected"] == []
+    (x,) = r["insufficient_evidence"]
+    top = next(iter(x["reasons"]))
+    assert x["unexplained_us"] > 1999 and top.startswith("server/s1 MUTEX-blocked on mutex 0x1000: "), x["reasons"]
+
+
+def test_inversion_chain_stops_at_the_link_limit():
+    import tracestudio.analyses as an
+    _, m = chain_scene()
+    old, an.CHAIN_LINKS = an.CHAIN_LINKS, 0
+    try:
+        r = suspected_inversions(m)
+    finally:
+        an.CHAIN_LINKS = old
+    (x,) = r["insufficient_evidence"]
+    assert r["suspected"] == [] and next(iter(x["reasons"])) == "blocking chain longer than 0 links", x["reasons"]
+
+
+def test_owner_at_or_above_the_client_is_no_inversion():
+    _, m = chain_scene(owner_prio=30)                            # e.g. raised by priority inheritance
+    r = suspected_inversions(m)
+    assert r["suspected"] == [] and r["insufficient_evidence"] == []
+
+
+def test_malformed_traces_fail_check_with_a_trace_error():
+    """Every malformed header field, a bad system page length and corrupt, truncated or oversized gzip data give
+    exit status 1 and a JUnit report with a TraceError naming the problem, replacing any older report."""
+    import gzip
+    import re
+    import xml.etree.ElementTree as ET
+    from tracestudio.cli import main
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.state(0, T + 10, RUNNING, C, 10)
+    good = g.bytes()
+
+    def field(key, value):
+        return re.sub(rb"TRACE_%s::[^T]*" % key.encode(), b"TRACE_%s::%s" % (key.encode(), value.encode()), good)
+    big = gzip.compress(good + bytes(1 << 20))
+    cases = [("CYCLES_PER_SEC", field("CYCLES_PER_SEC", "abc"), {}), ("CPU_NUM", field("CPU_NUM", "x"), {}),
+             ("CPU_NUM", field("CPU_NUM", "0"), {}), ("VER_MAJOR", field("VER_MAJOR", "?"), {}),
+             ("SYSPAGE_LEN", field("SYSPAGE_LEN", "-32"), {}), ("SYSPAGE_LEN", field("SYSPAGE_LEN", "99999"), {}),
+             ("corrupt gzip", gzip.compress(good)[:10] + b"\xff" * 40, {}),
+             ("corrupt gzip", gzip.compress(good)[:-20], {}),
+             ("TRACESTUDIO_MAX_KEV_BYTES", big, {"TRACESTUDIO_MAX_KEV_BYTES": str(1 << 20)}),
+             ("TRACESTUDIO_MAX_KEV_BYTES", big, {"TRACESTUDIO_MAX_KEV_BYTES": "lots"})]
+    report = os.path.join(TMP, "malformed.xml")
+    for i, (what, data, env) in enumerate(cases):
+        path = os.path.join(TMP, "malformed%d.kev" % i)
+        with open(path, "wb") as f:
+            f.write(data)
+        with open(report, "w") as f:
+            f.write("stale")
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = main(["check", path, "--no-inversions", "--junit", report])
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k)
+                else:
+                    os.environ[k] = v
+        assert code == 1, (what, code)
+        (e,) = ET.parse(report).getroot().iter("error")
+        assert e.get("type") == "TraceError" and what in e.get("message"), (what, e.get("message"))
+        assert what in err.getvalue(), (what, err.getvalue())
+    k = KevFile("ok.kev", gzip.compress(good))                      # a well-formed gzip still reads
+    assert k.data == good and k.events_offset == good.index(b"TRACE_HEADER_END::") + len(b"TRACE_HEADER_END::")
+
+
+def test_unfinished_means_still_open_at_trace_end():
+    """A request whose MsgSendv entry is not in the trace but which returns in it is untrustworthy (excluded); only a
+    request whose MsgSendv has not returned when the trace ends is unfinished."""
+    from kevgen import SMSG
+    from tracestudio.analyses import deadline_misses
+    from tracestudio.check import run_checks
+    from tracestudio.cli import build_parser
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 1, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.comm(0, T + 20, SMSG, 0x10001, S[0])                      # entered MsgSendv before the trace: not traced
+    g.state(0, T + 30, REPLY, C, 10)
+    g.receive(0, T + 40, S, C, 0x10001, prio=10)
+    g.reply(0, T + 100, S, C, 0x10001, client_prio=10)
+    g.wait_receive(0, T + 140, S, prio=10)
+    g.send_exit(0, T + 160, C, 10)
+    t = exchange(g, 0, T + 200, C, S, 0x20002)
+    g.state(0, t, RUNNING, C, 10)
+    g.send(0, t + 10, C, S[0], 0x30003, prio=10)                # never returns in the trace
+    _, m = model(g)
+    assert [x.t_call is None for x in m.txns] == [True, False, False]
+    (row,) = ipc_latency(m)
+    assert (row["n"], row["excluded"], row["unfinished"]) == (1, 1, 1), row
+    assert {k: deadline_misses(m, "c", 1e6)["server"][k] for k in ("requests", "excluded", "unfinished")} == {
+        "requests": 1, "excluded": 1, "unfinished": 1}
+    a = build_parser().parse_args(["check", "x.kev", "--max-latency", "client/c=1000000", "--allow-loss"])
+    (_, lat) = run_checks(m, Timeline(m), a)
+    assert lat.ok and "1 excluded as untrustworthy, 1 unfinished" in lat.summary, lat.summary

@@ -31,8 +31,8 @@ Times are in microseconds (`_us`). Thread labels are `process/thread`. A verdict
 | `client` | string | client role: `process/thread@priority` |
 | `server` | string | server process |
 | `n` | int | trustworthy requests |
-| `excluded` | int | requests left out as untrustworthy |
-| `unfinished` | int | requests still open when the trace ended |
+| `excluded` | int | requests left out as untrustworthy, including a request that returned but whose MsgSendv entry is not in the trace |
+| `unfinished` | int | requests whose MsgSendv had not returned when the trace ended |
 | `client_threads` | int | client threads merged into the role |
 | `min_us` | float | latency statistics over the trustworthy requests |
 | `p50_us` | float | |
@@ -64,10 +64,11 @@ Times are in microseconds (`_us`). Thread labels are `process/thread`. A verdict
 | `verdict` | string | always `suspected priority inversion` |
 | `inversion_us` | float | time with evidence of an inversion |
 | `while` | object | that time split by the client's state (`SEND`, `REPLY`) |
-| `server_prio_while_ready` | int | lowest server priority seen while it was READY with evidence |
-| `server_run_mask` | string | run masks of the server during the evidence, hex |
-| `eligible_cpus` | list of int | CPUs the server could run on |
-| `preempted_by` | list | `thread`, `prio`, `cpu`, `us` for each thread that held those CPUs, longest first |
+| `server_prio_while_ready` | int or null | lowest server priority seen while it was READY with evidence; null when all the evidence is on threads the server waited for |
+| `server_run_mask` | string or null | run masks of the server during that evidence, hex; null as above |
+| `eligible_cpus` | list of int or null | CPUs the server could run on; null as above |
+| `held_up` | list | every thread found READY and held up, longest first: `thread`, `prio` (lowest seen), `run_mask`, `eligible_cpus`, `us`, and `chain`, the blocking chain from the server to that thread (null for the server itself) |
+| `preempted_by` | list | `thread`, `prio`, `cpu`, `us` for each thread that held the CPUs of a thread in `held_up`, longest first |
 | `server_busy_with` | list | `txn`, `client` of other requests the server handled during the wait |
 | `insufficient_evidence_us` | float | time in the same wait that the trace cannot explain |
 | `assumptions` | list of string | supplied run masks the verdict relies on |
@@ -94,8 +95,8 @@ Times are in microseconds (`_us`). Thread labels are `process/thread`. A verdict
 | `requests` | int | trustworthy requests of the named client threads to that server |
 | `missed` | int | requests over the deadline |
 | `max_us` | float | slowest of them |
-| `excluded` | int | requests left out as untrustworthy |
-| `unfinished` | int | requests still open when the trace ended |
+| `excluded` | int | requests left out as untrustworthy, including a request that returned but whose MsgSendv entry is not in the trace |
+| `unfinished` | int | requests whose MsgSendv had not returned when the trace ended |
 
 ### mutex_waits[]
 
