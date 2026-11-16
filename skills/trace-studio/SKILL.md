@@ -43,7 +43,7 @@ Every analysis uses only trustworthy exchanges. The first lines of `analyze` say
 
 A request in the inversion analysis gets one of three results:
 
-* **suspected priority inversion**: the trace shows, for every instant counted, that the client waited on the server, the server was READY at a lower priority, and every CPU the server may use ran a thread above the server and at least one below the client. The `evidence` text names the threads and CPUs. Quote it.
+* **suspected priority inversion**: the trace shows, for every instant counted, that the client waited on the server, and that the server, or a thread the server waited for, was READY at a lower priority than the client while every CPU that thread may use ran a thread above it and at least one below the client. The server waits for a mutex owner when it is MUTEX-blocked and the trace shows the owner, and for a nested server when it is REPLY-blocked on a trustworthy request; the chain is followed for up to 4 links and named in `held_up[].chain`. The `evidence` text names the threads, the chain and the CPUs. Quote it.
 * **insufficient evidence**: the trace cannot show why the server did not run. The reasons are listed with the time each covers. Report it as "not known from this trace", never as an inversion and never as "no inversion".
 * no row: the request had no inversion time and no unexplained time above `--min-us`.
 

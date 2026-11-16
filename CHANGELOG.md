@@ -2,6 +2,8 @@
 
 ## 0.4.0
 
+- Inversions follow the server's blocking chain: a MUTEX wait to the owner, a REPLY wait to the nested server, up to 4 links. `check --no-inversions` now fails on `mutex_chain_nopi` and names the owner and the preempting thread. Links the trace cannot follow are "insufficient evidence" with the link named. Suspected rows gain `held_up`; the `server_*` fields are null when the server itself was never READY with evidence.
+
 - Inversions: SEND-phase verdicts for multi-threaded servers. Every receive-capable thread of the server must be accounted for, or the result is "insufficient evidence".
 - Fixed: `analyze --min-us 0` and `check --min-us 0` crashed on a request with no inversion time.
 - `action.yml`: a GitHub Action that runs `tracestudio check` and writes a JUnit report.

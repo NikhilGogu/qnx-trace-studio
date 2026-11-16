@@ -34,6 +34,11 @@ insufficient evidence. A
 request is reported as a suspected inversion when the evidence covers at least
 min_us; when unexplained time does instead, it is reported as "insufficient
 evidence" with the reasons.
+
+A server that is itself blocked passes the client's wait on: MUTEX-blocked with a known owner to the owner,
+REPLY-blocked on a trustworthy nested request to its server thread (next_hop), up to CHAIN_LINKS links. The
+rule above then applies to the READY thread of that chain, against the client's priority, and the verdict
+names the chain. A link the trace cannot follow counts as insufficient evidence, with the link named.
 """
 from __future__ import annotations
 
@@ -500,124 +505,153 @@ def _pool_member(tl, tx, o, pc, ts):
     return "ok", HELD_UP, (None if src == "traced" else "run mask 0x%x of %s supplied by %s" % (mask, m.label(o), src))
 
 
+CHAIN_LINKS = 4     # links followed from the server thread: mutex owners and servers of nested requests
+
+
 def _inversion(tl, tx):
-    """Evidence for one exchange: (inversion cycles, unexplained cycles, culprits, reasons, details)."""
+    """Evidence for one exchange: (inversion cycles, unexplained cycles, culprits, reasons, details).
+
+    The client waits on the server thread, and through it on every thread the server waits for: a MUTEX wait
+    leads to the owner and a REPLY wait to the nested server (next_hop). The READY rule applies to whichever
+    thread of that chain is READY; a link the trace cannot follow is insufficient evidence."""
     m = tl.m
     srv = tx.server
-    inv = unk = 0
+    total = {"inv": 0, "unk": 0}
     culprits = defaultdict(int)       # (thread, prio, cpu) -> cycles
     reasons = Counter()
     phase = Counter()
-    sprios, masks, busy, assumed = set(), set(), [], set()
+    held = {}                         # (thread held up, chain to it or None for the server) -> what backs it
+    busy, assumed = [], set()
     pool = None                       # (problem, other threads) once a SEND-phase verdict needs it
     members = defaultdict(Counter)    # thread -> {how it stood: cycles} over the evidence of a pool verdict
+    ccode = sole = None
+
+    def unknown(reason, n):
+        total["unk"] += n
+        reasons[reason] += n
+
+    def ready(key, kprio, c, d, hops):
+        """The READY rule over [c, d) for `key`: the server (no hops) or a thread it waits for through hops."""
+        nonlocal pool
+        whose = "the server's" if not hops else "%s's" % m.label(key)
+        pc = tl.prio_at(tx.client, c)
+        if pc is None or kprio is None:
+            unknown("priority unknown (fast-mode trace?)", d - c)
+            return
+        if kprio >= pc:
+            return
+        if not sole:
+            if pool is None:
+                pool = _pool(tl, tx, srv)
+            if pool[0] is not None:
+                unknown(pool[0], d - c)
+                return
+        if m.aps_seen:
+            unknown("adaptive partitioning in use: budgets not evaluated", d - c)
+            return
+        if tl.policy_at(key, c) == SCHED_SPORADIC:
+            unknown("server uses sporadic scheduling" if not hops else "%s uses sporadic scheduling" % m.label(key),
+                    d - c)
+            return
+        cuts = {c, d}
+        for cpu in tl.cpus:
+            cuts.update(tl.switch_times(cpu, c, d))
+        cuts.update(tl.runmask_changes(key, c, d))
+        for o in (pool[1] if not sole else ()):
+            cuts.update(tl.state_times(o, c, d))
+            cuts.update(tl.runmask_changes(o, c, d))
+        cuts = sorted(cuts)
+        chain = chain_text(tl, hops) if hops else None
+        for e, f in zip(cuts, cuts[1:]):
+            mask, src = tl.runmask_source(key, e)
+            if mask is None:
+                unknown("run mask of %s not traced" % m.label(key), f - e)
+                continue
+            cpus = mask_cpus(mask, tl.cpus)
+            if not cpus:
+                unknown("run mask 0x%x names no CPU of the trace" % mask, f - e)
+                continue
+            occ = [(x, tl.occupant(x, e)) for x in cpus]
+            missing = [x for x, o in occ if o is None or o == UNKNOWN]
+            if missing:
+                unknown("occupant of CPU %s unknown" % ",".join(map(str, missing)), f - e)
+                continue
+            prios = [(x, o, tl.prio_at(o, e)) for x, o in occ]
+            if any(p is None for _, _, p in prios):
+                unknown("priority of a running thread unknown", f - e)
+                continue
+            low = [(x, o, p) for x, o, p in prios if p <= kprio]
+            if low:
+                x, o, p = low[0]
+                unknown("CPU %d ran %s at prio %d, not above %s %d" % (x, m.label(o), p, whose, kprio), f - e)
+                continue
+            blockers = [(x, o, p) for x, o, p in prios if p < pc]
+            if not blockers:
+                continue
+            if not sole:
+                stood = [(o, _pool_member(tl, tx, o, pc, e)) for o in pool[1]]
+                if any(r[0] == "receivable" for _, r in stood):
+                    continue      # a thread waited in MsgReceivev on the channel: not this inversion
+                bad = [r[1] for _, r in stood if r[0] == "unknown"]
+                if bad:
+                    unknown(bad[0], f - e)
+                    continue
+                members[srv][HELD_UP if not hops else "%s-blocked, %s held up" % (hops[0][1], m.label(key))] += f - e
+                for o, r in stood:
+                    members[o][r[1]] += f - e
+                    if r[2]:
+                        assumed.add(r[2])
+            total["inv"] += f - e
+            phase[state_name(ccode)] += f - e
+            h = held.setdefault((key, chain), {"prios": set(), "masks": set(), "cyc": 0})
+            h["prios"].add(kprio)
+            h["masks"].add(mask)
+            h["cyc"] += f - e
+            if src != "traced":
+                assumed.add("run mask 0x%x supplied by %s" % (mask, src))
+            for x, o, p in blockers:
+                culprits[(o, p, x)] += f - e
+            if ccode == ST_SEND:
+                b = tl.handling_at(srv, e)
+                if b is not None and b is not tx and b not in busy:
+                    busy.append(b)
+
+    def through(key, a, b, hops):
+        """Credit [a, b) of the client's wait to `key`, the server or a thread on its chain."""
+        for c, d, code, prio in tl.segments(key, a, b):
+            if code in (None, ST_UNKNOWN):
+                unknown("server state unknown" if not hops else "state of %s unknown" % m.label(key), d - c)
+            elif code == ST_READY:
+                ready(key, prio, c, d, hops)
+            elif code in (ST_MUTEX, ST_SEND, ST_REPLY):
+                e = c
+                while e < d:
+                    nxt, what, why, until = next_hop(tl, key, code, e)
+                    f = until if until is not None and e < until < d else d
+                    if nxt is None:
+                        unknown("%s %s-blocked%s: %s" % (m.label(key), state_name(code), " on " + what if what else "",
+                                                         why), f - e)
+                    elif nxt == tx.client or nxt in [h[0] for h in hops] + [key]:
+                        unknown("blocking chain returns to %s" % m.label(nxt), f - e)
+                    elif len(hops) >= CHAIN_LINKS:
+                        unknown("blocking chain longer than %d links" % CHAIN_LINKS, f - e)
+                    else:
+                        through(nxt, e, f, hops + [(key, state_name(code), what, nxt)])
+                    e = f
+
     for a, b, ccode, _cp in tl.segments(tx.client, tx.t_call, tx.t_exit):
         if ccode not in (ST_SEND, ST_REPLY):
             continue
         send_phase = ccode == ST_SEND and (tx.t_rx_exit is None or a < tx.t_rx_exit)
         if not send_phase and tx.replier is not None and tx.replier != srv:
             # another thread replied: after the receive the work may be anywhere in the server process
-            unk += b - a
-            reasons["request handed off: received by %s (tid %d), replied by %s (tid %d)" % (
-                m.label(srv), srv[1], m.label(tx.replier), tx.replier[1])] += b - a
+            unknown("request handed off: received by %s (tid %d), replied by %s (tid %d)" % (
+                m.label(srv), srv[1], m.label(tx.replier), tx.replier[1]), b - a)
             continue
         sole = not send_phase or tl.sole_thread(srv, a, b)
-        for c, d, scode, sprio in tl.segments(srv, a, b):
-            if scode in (None, ST_UNKNOWN):
-                unk += d - c
-                reasons["server state unknown"] += d - c
-                continue
-            if scode != ST_READY:
-                continue
-            pc = tl.prio_at(tx.client, c)
-            if pc is None or sprio is None:
-                unk += d - c
-                reasons["priority unknown (fast-mode trace?)"] += d - c
-                continue
-            if sprio >= pc:
-                continue
-            if not sole:
-                if pool is None:
-                    pool = _pool(tl, tx, srv)
-                if pool[0] is not None:
-                    unk += d - c
-                    reasons[pool[0]] += d - c
-                    continue
-            if m.aps_seen:
-                unk += d - c
-                reasons["adaptive partitioning in use: budgets not evaluated"] += d - c
-                continue
-            if tl.policy_at(srv, c) == SCHED_SPORADIC:
-                unk += d - c
-                reasons["server uses sporadic scheduling"] += d - c
-                continue
-            cuts = {c, d}
-            for cpu in tl.cpus:
-                cuts.update(tl.switch_times(cpu, c, d))
-            cuts.update(tl.runmask_changes(srv, c, d))
-            for o in (pool[1] if not sole else ()):
-                cuts.update(tl.state_times(o, c, d))
-                cuts.update(tl.runmask_changes(o, c, d))
-            cuts = sorted(cuts)
-            for e, f in zip(cuts, cuts[1:]):
-                mask, src = tl.runmask_source(srv, e)
-                if mask is None:
-                    unk += f - e
-                    reasons["run mask of %s not traced" % m.label(srv)] += f - e
-                    continue
-                cpus = mask_cpus(mask, tl.cpus)
-                if not cpus:
-                    unk += f - e
-                    reasons["run mask 0x%x names no CPU of the trace" % mask] += f - e
-                    continue
-                occ = [(x, tl.occupant(x, e)) for x in cpus]
-                missing = [x for x, o in occ if o is None or o == UNKNOWN]
-                if missing:
-                    unk += f - e
-                    reasons["occupant of CPU %s unknown" % ",".join(map(str, missing))] += f - e
-                    continue
-                prios = [(x, o, tl.prio_at(o, e)) for x, o in occ]
-                if any(p is None for _, _, p in prios):
-                    unk += f - e
-                    reasons["priority of a running thread unknown"] += f - e
-                    continue
-                low = [(x, o, p) for x, o, p in prios if p <= sprio]
-                if low:
-                    x, o, p = low[0]
-                    reasons["CPU %d ran %s at prio %d, not above the server's %d" % (x, m.label(o), p, sprio)] += f - e
-                    unk += f - e
-                    continue
-                blockers = [(x, o, p) for x, o, p in prios if p < pc]
-                if not blockers:
-                    continue
-                if not sole:
-                    stood = [(o, _pool_member(tl, tx, o, pc, e)) for o in pool[1]]
-                    if any(r[0] == "receivable" for _, r in stood):
-                        continue      # a thread waited in MsgReceivev on the channel: not this inversion
-                    bad = [r[1] for _, r in stood if r[0] == "unknown"]
-                    if bad:
-                        unk += f - e
-                        reasons[bad[0]] += f - e
-                        continue
-                    members[srv][HELD_UP] += f - e
-                    for o, r in stood:
-                        members[o][r[1]] += f - e
-                        if r[2]:
-                            assumed.add(r[2])
-                inv += f - e
-                phase[state_name(ccode)] += f - e
-                sprios.add(sprio)
-                masks.add(mask)
-                if src != "traced":
-                    assumed.add("run mask 0x%x supplied by %s" % (mask, src))
-                for x, o, p in blockers:
-                    culprits[(o, p, x)] += f - e
-                if ccode == ST_SEND:
-                    h = tl.handling_at(srv, e)
-                    if h is not None and h is not tx and h not in busy:
-                        busy.append(h)
-    return inv, unk, culprits, reasons, {"phase": phase, "sprios": sprios, "masks": masks, "busy": busy,
-                                         "assumed": sorted(assumed), "members": members}
+        through(srv, a, b, [])
+    return total["inv"], total["unk"], culprits, reasons, {"phase": phase, "held": held, "busy": busy,
+                                                           "assumed": sorted(assumed), "members": members}
 
 
 def suspected_inversions(model, tl=None, min_us=100.0, only=None):
@@ -647,15 +681,22 @@ def suspected_inversions(model, tl=None, min_us=100.0, only=None):
         row = {"txn": tx.idx, "client": m.label(tx.client), "client_prio": pc, "server": m.label(tx.server),
                "latency_us": round(us(m, tx.t_exit - tx.t_call), 1)}
         if suspected:
-            ms = sorted(d["masks"])
-            cpus = sorted({x for mk in ms for x in mask_cpus(mk, tl.cpus)})
+            def cpus_of(masks):
+                return sorted({x for mk in masks for x in mask_cpus(mk, tl.cpus)})
+            held = sorted(d["held"].items(), key=lambda kv: -kv[1]["cyc"])
+            own = [v for (_, chain), v in held if chain is None]      # the server's own READY time
+            ms = sorted(set().union(*(v["masks"] for v in own)))
             row.update({
                 "verdict": "suspected priority inversion",
                 "inversion_us": round(inv_us, 1),
                 "while": {k: round(us(m, v), 1) for k, v in d["phase"].items()},
-                "server_prio_while_ready": min(d["sprios"]),
-                "server_run_mask": ", ".join("0x%x" % x for x in ms),
-                "eligible_cpus": cpus,
+                "server_prio_while_ready": min(min(v["prios"]) for v in own) if own else None,
+                "server_run_mask": ", ".join("0x%x" % x for x in ms) if own else None,
+                "eligible_cpus": cpus_of(ms) if own else None,
+                "held_up": [{"thread": m.label(k), "prio": min(v["prios"]),
+                             "run_mask": ", ".join("0x%x" % x for x in sorted(v["masks"])),
+                             "eligible_cpus": cpus_of(v["masks"]), "chain": chain, "us": round(us(m, v["cyc"]), 1)}
+                            for (k, chain), v in held],
                 "preempted_by": [{"thread": m.label(k), "prio": p, "cpu": cpu, "us": round(us(m, v), 1)}
                                  for (k, p, cpu), v in sorted(culprits.items(), key=lambda x: -x[1])],
                 "server_busy_with": [{"txn": h.idx, "client": m.label(h.client)} for h in d["busy"]],
@@ -666,14 +707,18 @@ def suspected_inversions(model, tl=None, min_us=100.0, only=None):
                               for k in sorted(d["members"])],
             })
             top = row["preempted_by"][0]
+            several = len(row["held_up"]) > 1
             row["evidence"] = (
-                "%s (prio %s) waited %.1f us in MsgSend; for %.1f us of it (%s) %s was READY at prio %d while "
-                "every CPU it may run on (CPU %s, run mask %s) ran a thread above prio %d, at least one of them "
-                "below the client's %s; most of the time %s (prio %d) on CPU %d, %.1f us%s." % (
+                "%s (prio %s) waited %.1f us in MsgSend; for %.1f us of it (%s) %s; most of the time %s (prio %d) "
+                "on CPU %d, %.1f us%s." % (
                     row["client"], pc, row["latency_us"], row["inversion_us"],
-                    ", ".join("%s-blocked %.1f us" % kv for kv in row["while"].items()), row["server"],
-                    row["server_prio_while_ready"], ",".join(map(str, cpus)), row["server_run_mask"],
-                    row["server_prio_while_ready"], pc, top["thread"], top["prio"], top["cpu"], top["us"],
+                    ", ".join("%s-blocked %.1f us" % kv for kv in row["while"].items()), "; ".join(
+                        "%s%s was READY at prio %d%s while every CPU it may run on (CPU %s, run mask %s) ran a thread "
+                        "above prio %d, at least one of them below the client's %s" % (
+                            "along %s, " % h["chain"] if h["chain"] else "", h["thread"], h["prio"],
+                            " for %.1f us" % h["us"] if several else "", ",".join(map(str, h["eligible_cpus"])),
+                            h["run_mask"], h["prio"], pc) for h in row["held_up"]),
+                    top["thread"], top["prio"], top["cpu"], top["us"],
                     "; the server was busy with %s" % ", ".join("%s's request (txn %d)" % (b["client"], b["txn"])
                                                                for b in row["server_busy_with"])
                     if row["server_busy_with"] else "")) + (
@@ -704,29 +749,46 @@ def mutex_owner_at(tl, w, ts):
     return w.owner, None
 
 
-def blocking_chain(tl, key, ts, depth=4):
-    """What `key` waits for at ts, hop by hop: [(thread, state name, object text, next thread or None)]. A hop
-    follows a MUTEX wait to its owner (only when the owner is known) and a SEND or REPLY wait to the server
-    thread of the exchange (only when the exchange is trustworthy and was received)."""
+def next_hop(tl, key, code, ts):
+    """The thread that `key`, in state `code` at ts, waits for: (thread or None, object text, reason or None,
+    until). A MUTEX wait leads to the owner while the trace shows it (until its SyncMutexUnlock); a REPLY wait
+    leads to the server thread of a trustworthy exchange that the same thread received and replies to. When a
+    MUTEX, SEND or REPLY wait leads nowhere, the reason says why; other states give (None, "", None, None)."""
     m = tl.m
+    if code == ST_MUTEX:
+        w = tl.mutex_wait_at(key, ts)
+        if w is None:
+            return None, "a mutex", "no SyncMutexLock traced", None
+        owner, why = mutex_owner_at(tl, w, ts)
+        return owner, "mutex 0x%x" % w.sync, why, (w.t_release if owner is not None else None)
+    if code in (ST_SEND, ST_REPLY):
+        tx = tl.client_txn_at(key, ts)
+        if tx is None:
+            return None, "", "no MsgSendv traced", None
+        what = "%s (txn %d)" % (m.server_name(tx), tx.idx)
+        if not tx.trustworthy:
+            return None, what, "the exchange is not trustworthy", None
+        if code == ST_SEND:
+            return None, what, "not received yet", None
+        # REPLY-blocked: the kernel has delivered the message to tx.server, even before its MsgReceivev returns
+        if tx.server is None:
+            return None, what, "receiving thread not identified", None
+        if tx.replier is not None and tx.replier != tx.server:
+            return None, what, "handed off to %s" % m.label(tx.replier), None
+        return tx.server, what, None, None
+    return None, "", None, None
+
+
+def blocking_chain(tl, key, ts, depth=4):
+    """What `key` waits for at ts, hop by hop (see next_hop): [(thread, state name, object text, next thread or
+    None)]."""
     out, seen = [], set()
     while key is not None and key not in seen and len(out) < depth:
         seen.add(key)
         code, _ = tl.state_at(key, ts)
-        nxt, what = None, ""
-        if code == ST_MUTEX:
-            w = tl.mutex_wait_at(key, ts)
-            if w is None:
-                what = "a mutex (no SyncMutexLock traced)"
-            else:
-                nxt, why = mutex_owner_at(tl, w, ts)
-                what = "mutex 0x%x" % w.sync + ("" if nxt else " (owner unknown: %s)" % why)
-        elif code in (ST_SEND, ST_REPLY):
-            tx = tl.client_txn_at(key, ts)
-            if tx is not None:
-                what = "%s (txn %d)" % (m.server_name(tx), tx.idx)
-                if tx.trustworthy and tx.server is not None and (tx.t_rx_exit is None or ts >= tx.t_rx_exit):
-                    nxt = tx.server if code == ST_REPLY else None
+        nxt, what, why, _ = next_hop(tl, key, code, ts)
+        if code == ST_MUTEX and nxt is None:
+            what += " (owner unknown: %s)" % why
         out.append((key, state_name(code) if code is not None else "?", what, nxt))
         key = nxt
     return out

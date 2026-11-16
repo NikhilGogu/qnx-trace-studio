@@ -32,7 +32,7 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass, field
 
-from .analyses import Timeline, mask_cpus, mutex_owner_at, us
+from .analyses import Timeline, mask_cpus, next_hop, us
 from .events import state_name
 from .model import ST_MUTEX, ST_READY, ST_RECEIVE, ST_REPLY, ST_RUNNING, ST_SEND, ST_UNKNOWN, UNKNOWN
 
@@ -176,14 +176,13 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0, _seen=frozenset()):
     def mutex_part(c, d, waiter, wprio):
         """A MUTEX wait of `waiter` in [c, d], partitioned by what the mutex's owner did, when it is known."""
         wl, ws = m.label(waiter), _tn(m, waiter)
-        w = tl.mutex_wait_at(waiter, c)
-        owner, why = mutex_owner_at(tl, w, c) if w is not None else (None, "no SyncMutexLock traced")
+        owner, what, why, until = next_hop(tl, waiter, ST_MUTEX, c)
         if owner is None:
-            add(c, d, "server blocked", "%s MUTEX-blocked on %s, owner unknown (%s)" % (
-                wl, "mutex 0x%x" % w.sync if w else "a mutex", why), waiter, wprio, short="%s MUTEX, owner unknown" % ws)
+            add(c, d, "server blocked", "%s MUTEX-blocked on %s, owner unknown (%s)" % (wl, what, why), waiter, wprio,
+                short="%s MUTEX, owner unknown" % ws)
             return
-        known_end = min(d, w.t_release) if w.t_release is not None else d
-        pre = "%s MUTEX-blocked on mutex 0x%x owned by %s" % (wl, w.sync, m.label(owner))
+        known_end = min(d, until) if until is not None else d
+        pre = "%s MUTEX-blocked on %s owned by %s" % (wl, what, m.label(owner))
         on = _tn(m, owner)
         for e, f, ocode, oprio in tl.segments(owner, c, known_end):
             if ocode == ST_RUNNING:
@@ -210,8 +209,8 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0, _seen=frozenset()):
                 add(e, f, "mutex owner blocked", "%s, which is blocked in %s" % (pre, state_name(ocode)), owner, oprio,
                     short="%s: owner %s %s" % (ws, on, state_name(ocode)))
         if d > known_end:
-            add(known_end, d, "server blocked", "%s MUTEX-blocked on mutex 0x%x after its owner's SyncMutexUnlock began "
-                "(handover; the next owner is not traced)" % (wl, w.sync), waiter, wprio, short="%s MUTEX handover" % ws)
+            add(known_end, d, "server blocked", "%s MUTEX-blocked on %s after its owner's SyncMutexUnlock began "
+                "(handover; the next owner is not traced)" % (wl, what), waiter, wprio, short="%s MUTEX handover" % ws)
 
     def server_part(a, b):
         if srv is None:

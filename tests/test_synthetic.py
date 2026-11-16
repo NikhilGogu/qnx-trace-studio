@@ -1916,3 +1916,74 @@ def test_critical_path_follows_a_mutex_owner_into_its_request():
         assert got == [("MUTEX 0x1000 (owner s2)", 210, 890), ("MUTEX 0x1000 (owner not traced after the release)",
                        1100, 10), ("MUTEX 0x1000 woken, until SyncMutexLock returns", 1110, 100)], got
         tp.close()
+
+
+def chain_scene(unlock_value=0x1002, owner_prio=10):
+    """hi (30) asks s1, which blocks on mutex 0x1000 owned by s2 (pinned to CPU 0); mid (20) then holds CPU 0 for
+    about 2 ms while s2 is READY. s2 unlocks with `unlock_value` (0x1002 is the owner value s1's lock read)."""
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, S2, owner_prio)
+    g.runmask(0, T + 20, 0x1)
+    ms = 1_000_000
+    g.state(0, T + ms, READY, S2, owner_prio)
+    g.state(0, T + ms + 1, RUNNING, H, 30)
+    g.send(0, T + ms + 10, H, S[0], 0x10001, prio=30)
+    g.receive(0, T + ms + 40, S, H, 0x10001, prio=30)
+    g.kcall(0, T + ms + 100, K_MUTEX_LOCK, [0x1000, 0x80000000, 0x1002])
+    g.state(0, T + ms + 110, ST_MUTEX_CODE, S, 30)
+    g.state(0, T + ms + 120, RUNNING, M, 20)
+    g.state(0, T + 3 * ms, NANOSLEEP, M, 20)
+    g.state(0, T + 3 * ms + 10, RUNNING, S2, owner_prio)
+    g.kcall(0, T + 3 * ms + 500, K_MUTEX_UNLOCK, [0x1000, 0x80000000, 0x80000000 | unlock_value])
+    g.kcall(0, T + 3 * ms + 505, K_MUTEX_UNLOCK, [0, 0], EXIT)
+    g.state(0, T + 3 * ms + 510, READY, S2, owner_prio)
+    g.state(0, T + 3 * ms + 511, RUNNING, S, 30)
+    g.kcall(0, T + 3 * ms + 520, K_MUTEX_LOCK, [0, 0], EXIT)
+    g.reply(0, T + 3 * ms + 600, S, H, 0x10001, 30)
+    g.wait_receive(0, T + 3 * ms + 640, S, 30)
+    g.send_exit(0, T + 3 * ms + 660, H, 30)
+    return model(g)
+
+
+def test_inversion_through_a_mutex_owner():
+    _, m = chain_scene()
+    r = suspected_inversions(m)
+    (x,) = r["suspected"]
+    assert x["client"] == "high/h" and x["server"] == "server/s1" and 1999 < x["inversion_us"] < 2001
+    assert x["preempted_by"][0]["thread"] == "mid/m" and x["preempted_by"][0]["prio"] == 20
+    (h,) = x["held_up"]
+    assert (h["thread"], h["prio"], h["run_mask"], h["eligible_cpus"]) == ("server/s2", 10, "0x1", [0])
+    assert h["chain"] == "server/s1 MUTEX-blocked on mutex 0x1000 (owner server/s2)", h
+    assert x["server_prio_while_ready"] is None and x["server_run_mask"] is None and x["eligible_cpus"] is None
+    assert "server/s1 MUTEX-blocked on mutex 0x1000 (owner server/s2), server/s2 was READY at prio 10" in x["evidence"]
+    assert "mid/m (prio 20) on CPU 0" in x["evidence"]
+
+
+def test_inversion_through_an_unknown_owner_is_insufficient_evidence():
+    _, m = chain_scene(unlock_value=0x1003)                      # another owner value: the owner is not known
+    r = suspected_inversions(m)
+    assert r["suspected"] == []
+    (x,) = r["insufficient_evidence"]
+    top = next(iter(x["reasons"]))
+    assert x["unexplained_us"] > 1999 and top.startswith("server/s1 MUTEX-blocked on mutex 0x1000: "), x["reasons"]
+
+
+def test_inversion_chain_stops_at_the_link_limit():
+    import tracestudio.analyses as an
+    _, m = chain_scene()
+    old, an.CHAIN_LINKS = an.CHAIN_LINKS, 0
+    try:
+        r = suspected_inversions(m)
+    finally:
+        an.CHAIN_LINKS = old
+    (x,) = r["insufficient_evidence"]
+    assert r["suspected"] == [] and next(iter(x["reasons"])) == "blocking chain longer than 0 links", x["reasons"]
+
+
+def test_owner_at_or_above_the_client_is_no_inversion():
+    _, m = chain_scene(owner_prio=30)                            # e.g. raised by priority inheritance
+    r = suspected_inversions(m)
+    assert r["suspected"] == [] and r["insufficient_evidence"] == []
