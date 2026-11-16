@@ -466,6 +466,24 @@ def test_docs_links_resolve_and_test_counts_match():
         for n in re.findall(r"(\d+) on (?:the checked-in captures|the captures in)", text):
             assert int(n) == captures, (doc, n, captures)
 
+
+def test_validate_all_summarises_every_capture():
+    import contextlib
+    import io
+    from validate_all import main as validate_all
+    out_file = os.path.join(TMP, "validation-summary.txt")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert validate_all([DATA, DATA3, "--skip-traceprinter", "--out", out_file]) == 0
+    lines = open(out_file).read().splitlines()
+    assert lines == out.getvalue().splitlines()
+    assert len([ln for ln in lines if ln.startswith("PASS validate ")]) == 6, lines     # cancel and rm_small: no
+    assert "logged requests 200, matched 200" in lines[0] and lines[-1] == "8 captures, all checks passed"
+    if not shutil.which("traceprinter"):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert validate_all([DATA]) == 1
+        assert out.getvalue().startswith("error: traceprinter not on PATH")
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window
