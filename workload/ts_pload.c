@@ -14,12 +14,17 @@
  * -o LO,HOG,HI moves the three start offsets (us); for example -o 0,4200,4000
  * with a short lo request makes the hog preempt the server while it already
  * handles hi's request (inversion after the receive).
+ * -k K starts K lo threads (lo, lo2, ...) at the same offset, so K threads of
+ * a thread-pool server (ts_pool) are busy when hi sends. Request ids stay
+ * unique: lo thread j uses 10000 + 100 * j + period, so -k needs -n 100 or less.
  *
- * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi]
+ * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi] [-k lo_threads]
  */
 #include "common.h"
 
-static int nper = 20;
+#define TS_MAX_LO 7
+
+static int nper = 20, nlo = 1;
 static unsigned period_us = 25000, lo_us = 4000, hog_us = 10000, hi_us = 500, dl_us = 5000;
 static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000;
 static struct timespec t_base;
@@ -37,7 +42,7 @@ static void at(int k, unsigned off_us)
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 }
 
-typedef struct { const char *name; int prio; unsigned off_us; unsigned work_us; int role; } spec_t;
+typedef struct { char name[16]; int prio; unsigned off_us; unsigned work_us; int role; int lo_index; } spec_t;
 
 static void *worker(void *arg)
 {
@@ -61,7 +66,7 @@ static void *worker(void *arg)
             ts_log("HOG_END", (uint32_t)k, s->prio, 0, 0, 0);
             continue;
         }
-        uint32_t id = (uint32_t)(s->prio * 1000 + k);
+        uint32_t id = (uint32_t)(s->prio * 1000 + s->lo_index * 100 + k);
         ts_msg_t m = { TS_MSG_PRIO, 0, id, s->work_us, (uint32_t)pthread_self() };
         ts_reply_t r;
         uint64_t t0 = ClockCycles();
@@ -83,7 +88,7 @@ static void *worker(void *arg)
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:")) != -1) {
         switch (opt) {
         case 'n': nper = atoi(optarg); break;
         case 'P': period_us = (unsigned)atoi(optarg); break;
@@ -96,7 +101,12 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case 'k': nlo = atoi(optarg); break;
         }
+    }
+    if (nlo < 1 || nlo > TS_MAX_LO || (nlo > 1 && nper > 100)) {
+        fprintf(stderr, "-k wants 1 to %d lo threads, and -n 100 or less with more than one\n", TS_MAX_LO);
+        return 2;
     }
     ts_role = "pload";
     ts_pin_cpu0();
@@ -104,19 +114,23 @@ int main(int argc, char **argv)
     ts_calibrate();
     if (ts_read_addr("/tmp/ts_psrv.addr", &srv_pid, &srv_chid)) { fprintf(stderr, "no ts_psrv\n"); return 1; }
 
-    spec_t sp[3] = {
-        { "lo", 10, off_lo, lo_us, 0 },
-        { "hog", 20, off_hog, hog_us, 1 },
-        { "hi", 30, off_hi, hi_us, 2 },
-    };
-    pthread_barrier_init(&bar, NULL, 4);
-    pthread_t th[3];
-    for (int i = 0; i < 3; i++) pthread_create(&th[i], NULL, worker, &sp[i]);
+    spec_t sp[TS_MAX_LO + 2];
+    int nth = 0;
+    for (int j = 0; j < nlo; j++, nth++) {
+        sp[nth] = (spec_t){ "lo", 10, off_lo, lo_us, 0, j };
+        if (j)
+            snprintf(sp[nth].name, sizeof sp[nth].name, "lo%d", j + 1);
+    }
+    sp[nth++] = (spec_t){ "hog", 20, off_hog, hog_us, 1, 0 };
+    sp[nth++] = (spec_t){ "hi", 30, off_hi, hi_us, 2, 0 };
+    pthread_barrier_init(&bar, NULL, (unsigned)nth + 1);
+    pthread_t th[TS_MAX_LO + 2];
+    for (int i = 0; i < nth; i++) pthread_create(&th[i], NULL, worker, &sp[i]);
     clock_gettime(CLOCK_MONOTONIC, &t_base);
     t_base.tv_sec += 1;   /* first period starts one second from now */
     t_base.tv_nsec = 0;
     pthread_barrier_wait(&bar);
-    for (int i = 0; i < 3; i++) pthread_join(th[i], NULL);
+    for (int i = 0; i < nth; i++) pthread_join(th[i], NULL);
 
     int coid = ConnectAttach(0, srv_pid, srv_chid, _NTO_SIDE_CHANNEL, 0);
     ts_msg_t q = { TS_MSG_QUIT, 0, 0, 0, 0 };
