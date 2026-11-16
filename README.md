@@ -7,7 +7,7 @@ trace-studio explains missed deadlines on QNX OS 8.0 from a kernel trace. It rea
 A high-priority client (`hi`) waits in SEND while a medium-priority thread (`hog`) holds the only CPU the server may use. The critical-path track under `hi` names the cause.
 
 - Demo video (under 3 minutes): https://youtu.be/YeNumwjDXUk
-- Codelab, about 40 minutes: [Find a priority inversion in QNX message passing](https://nikhil-qnx-codelabs.pages.dev/find-priority-inversion/) (source in [codelab/](codelab/find-priority-inversion.md))
+- Codelab: [Find a priority inversion in QNX message passing](https://nikhil-qnx-codelabs.pages.dev/find-priority-inversion/) (source in [codelab/](codelab/find-priority-inversion.md))
 
 ## Try it without a QNX target
 
@@ -67,7 +67,7 @@ What it does:
 
 Python 3.10 or newer. The two install lines under [Try it without a QNX target](#try-it-without-a-qnx-target) are all it takes; `venv/bin/tracestudio --help` lists the commands. The examples below write `tracestudio` for `venv/bin/tracestudio` and use short file names such as `trace.kev` for your own captures.
 
-Dependencies: `perfetto` 0.59.x (its generated protobuf classes, and TraceProcessor for the tests) and `protobuf` 7.x. Only `convert` needs them at run time.
+Dependencies: `perfetto` 0.59.x (its generated protobuf classes, and TraceProcessor for the tests) and `protobuf` 7.x. `pip install .` installs both. `convert` and `open` use them at run time; the other commands do not.
 
 ## Capture on QNX 8.0
 
