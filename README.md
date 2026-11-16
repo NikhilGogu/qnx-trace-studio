@@ -66,6 +66,22 @@ What it does:
 - `diff`: before and after comparison of two traces.
 - Keeps exchanges that cross lost events or carry contradictory kernel information, marks them `[not trustworthy]` and leaves them out of the analyses, with counts. A request with an ambiguous parent is kept in latency and left out of critical paths and inversions. Conclusions the trace cannot support are reported as "insufficient evidence", "not explained by the trace" or "unknown".
 
+## What trace-studio adds
+
+Each capability below names the code that implements it and a test that checks it.
+
+| capability | code | test |
+|---|---|---|
+| A critical path that crosses processes: it splits one request's latency into segments that add up exactly, follows nested requests to other servers, and follows a mutex into the owner's own request | `critical_path` in [tracestudio/critical.py](tracestudio/critical.py) | `test_critical_path_follows_a_mutex_owner_into_its_request`, `test_mutex_chain_captures` |
+| Mutex owner chains: the owner of a contended mutex is named only when the trace shows its successful unlock | `mutex_waits`, `blocking_chain` in [tracestudio/analyses.py](tracestudio/analyses.py) | `test_mutex_owner_needs_the_owners_successful_unlock` |
+| Inversion verdicts for multi-threaded servers in the SEND phase, with every receive-capable thread accounted for | `_pool`, `_pool_member` in [tracestudio/analyses.py](tracestudio/analyses.py) | `test_send_phase_inversion_in_a_thread_pool`, `test_send_phase_pool_needs_every_receiver_accounted_for` |
+| "Insufficient evidence" with its reasons when the trace cannot support a verdict (untraced run mask, lost events, other receivers, handoffs, sporadic scheduling) | `_inversion` in [tracestudio/analyses.py](tracestudio/analyses.py) | `test_unknown_run_mask_is_not_all_cpus`, `test_sporadic_server_is_insufficient_evidence` |
+| Exchanges that cross lost events are flagged, drawn without arrows and left out of every verdict | [tracestudio/model.py](tracestudio/model.py) | `test_fault_injection_never_links_wrong`, `test_untrustworthy_exchange_has_no_arrows_and_warns_on_every_slice` |
+| A check of the decoded exchanges against the workload's own logs | `validate` in [tracestudio/validate.py](tracestudio/validate.py) | `test_ground_truth_links` |
+| A CI gate with exit status and JUnit XML | `run_checks` in [tracestudio/check.py](tracestudio/check.py) | `test_check_fails_prio_fixed_and_passes_prio_inherit` |
+| An aarch64le capture as a regression fixture beside the x86_64 ones | `tests/data/run5/prio_fixed.kev.gz` | `test_aarch64le_capture` |
+| Perfetto SQL on the converted trace, with example queries | [docs/sql](docs/sql) | `test_sql_examples_run_on_converted_captures` |
+
 ## Install
 
 Python 3.10 or newer. The two install lines under [Try it without a QNX target](#try-it-without-a-qnx-target) are all it takes; `venv/bin/tracestudio --help` lists the commands. The examples below write `tracestudio` for `venv/bin/tracestudio` and use short file names such as `trace.kev` for your own captures.
@@ -109,7 +125,7 @@ tracestudio convert trace.kev                  # writes trace.perfetto-trace
 
 Every command also reads gzip-compressed traces (`trace.kev.gz`), such as the captures in `tests/data`.
 
-Open the output in https://ui.perfetto.dev ("Open trace file"). You can also query it with Perfetto SQL (`trace_processor_shell` or the `perfetto` Python package).
+Open the output in https://ui.perfetto.dev ("Open trace file"). You can also query it with Perfetto SQL (`trace_processor_shell` or the `perfetto` Python package). [docs/sql](docs/sql) has example queries: the slowest trustworthy requests, where each client's time went by critical-path segment kind, and the priority each server thread ran at for each client.
 
 Each thread has its slice track (MsgSend, handle, MsgReply, pulses) and three child tracks: `QNX state` (the kernel's thread states, `qnx_prio` argument, UNKNOWN where data was lost), `QNX priority` (when it changes) and `critical path`. Every slice of an exchange (MsgSend, handle, MsgReply or MsgError, reply received) carries `txn`, `trustworthy` and any `warnings`; the MsgSend slice also has `rcvid`, `coid`, `message`, `path_candidate`, `client_qnx_prio`, `outcome` and `latency_us`. Click a slice to see them and follow its arrows. Arrows join only trustworthy exchanges; the slices of the others end in `[not trustworthy]`. Messages to procnto are named from its protocols (`_PROC_*`, `_IO_*`, ...). For other servers an `_IO_*` name needs a connection or channel that answered an `_IO_CONNECT` (type 0x100) in the trace; since an application message can use that number too, such names are labelled `(candidate)`, and other messages show their number (`type 0x0101`).
 
@@ -396,7 +412,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
 - 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 92 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 19 on the checked-in captures, among them one that runs the quickstart commands above.
+- `python3 tests/test_tracestudio.py` runs 94 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 21 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

@@ -160,6 +160,51 @@ def test_every_checked_in_capture_converts_and_loads():
         assert list(tp.query("SELECT COUNT(*) n FROM thread_state"))[0].n > 0, rel
         tp.close()
 
+
+def test_sql_examples_run_on_converted_captures():
+    try:
+        from perfetto.trace_processor import TraceProcessor
+        from tracestudio.perfetto_out import write
+    except ImportError:
+        return skip("perfetto package not installed")
+    sql_dir = os.path.join(HERE, "..", "docs", "sql")
+    queries = {f[:-4]: open(os.path.join(sql_dir, f)).read() for f in sorted(os.listdir(sql_dir)) if f.endswith(".sql")}
+    assert set(queries) == {"slowest_requests", "critical_path_by_kind", "server_priority_while_handling"}, queries
+    for name, hi_prio, preempted_first in (("prio_fixed", 10, True), ("prio_inherit", 30, False)):
+        m = Model(KevFile(kev(name)))
+        out = os.path.join(TMP, name + "_sql.perfetto-trace")
+        write(m, out)
+        tp = TraceProcessor(trace=out)
+        res = {q: list(tp.query(text)) for q, text in queries.items()}
+        tp.close()
+        slowest = max((t for t in m.txns if t.trustworthy), key=lambda t: t.t_exit - t.t_call)
+        assert len(res["slowest_requests"]) == 20 and res["slowest_requests"][0].txn == slowest.idx, name
+        kinds = [r.kind for r in res["critical_path_by_kind"] if r.client_thread == "hi"]
+        assert (kinds[0] == "server preempted") == preempted_first, (name, kinds)
+        prios = {r.server_prio for r in res["server_priority_while_handling"]
+                 if r.client_thread == "hi" and r.server_thread == "psrv-rx"}
+        assert prios == {hi_prio}, (name, prios)
+
+
+def test_readme_capabilities_point_at_real_code():
+    import re
+    with open(os.path.join(HERE, "..", "README.md")) as f:
+        text = f.read()
+    sec = text.split("## What trace-studio adds", 1)[1].split("\n## ", 1)[0]
+    root = os.path.join(HERE, "..")
+    for path in re.findall(r"\]\(([^)#]+)\)", sec) + re.findall(r"`(tests/data/[^`]+)`", sec):
+        assert os.path.exists(os.path.join(root, path)), path
+    src = "".join(open(os.path.join(root, "tracestudio", f)).read() for f in os.listdir(os.path.join(root, "tracestudio"))
+                  if f.endswith(".py"))
+    tests = open(os.path.join(HERE, "test_synthetic.py")).read() + open(os.path.join(HERE, "test_tracestudio.py")).read()
+    names = re.findall(r"`(\w+)`", sec)
+    assert len(names) > 15, names
+    for n in names:
+        if n.startswith("test_"):
+            assert re.search(r"^def %s\(" % n, tests, re.M), n
+        else:
+            assert re.search(r"^def %s\(" % n, src, re.M), n
+
 def test_inversion_after_receive_on_a_real_capture():
     # run 3: lo sends 0.5 ms of work at t+0, hi at t+4 ms, the hog wakes at t+4.2 ms, while
     # the server already handles hi's request
