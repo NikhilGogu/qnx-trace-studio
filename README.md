@@ -44,6 +44,15 @@ txn 520: ts_pload/hi (prio 30) waited 10937.8 us in MsgSend; for 8151.9 us of it
 
 Step 2 shows 0 of 20 misses and no inversions once the channel inherits the client's priority.
 
+To see every checked-in capture on one page, with a button that opens each in Perfetto:
+
+```
+venv/bin/python tools/build_examples.py --out site --with-timing
+python3 -m http.server -d site 8000        # then open http://127.0.0.1:8000
+```
+
+Without `--with-timing` the page replaces every measured time with "[timing withheld]". That is the version `.github/workflows/pages.yml` publishes, because the QNX licence does not allow publishing performance results without approval.
+
 The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload turns inheritance off on purpose. Step 5 is the more common case. A mutex created with `PTHREAD_PRIO_NONE` is held by a low-priority thread that waits on another server, and the critical path follows the chain from hi's server thread to the mutex owner and into the owner's own request, where a medium-priority hog holds the CPU (output under [Mutex owner chains](#mutex-owner-chains)). Thread-pool servers are covered by the inversion rule too, so far on synthetic traces only (see [Limitations](#limitations)).
 
 ## trace-studio and the System Profiler
@@ -431,7 +440,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
 - 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 95 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 22 on the checked-in captures, among them one that runs the quickstart commands above.
+- `python3 tests/test_tracestudio.py` runs 96 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 23 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

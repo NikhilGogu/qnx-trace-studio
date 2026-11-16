@@ -205,6 +205,41 @@ def test_readme_capabilities_point_at_real_code():
         else:
             assert re.search(r"^def %s\(" % n, src, re.M), n
 
+
+def test_examples_page_withholds_timing():
+    import contextlib
+    import io
+    import re
+    try:
+        import perfetto  # noqa: F401
+    except ImportError:
+        return skip("perfetto package not installed")
+    from build_examples import TIMING, main as build
+    only = ["--only", "run1/prio_fixed", "--only", "run1/prio_inherit"]
+    pages = {}
+    for mode in ("withheld", "with-timing"):
+        out = os.path.join(TMP, "site-" + mode)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert build(["--out", out] + only + (["--with-timing"] if mode == "with-timing" else [])) == 0
+        assert sorted(os.listdir(out)) == ["index.html", "run1_prio_fixed.perfetto-trace",
+                                           "run1_prio_inherit.perfetto-trace"]
+        with open(os.path.join(out, "index.html")) as f:
+            pages[mode] = f.read()
+    text = pages["withheld"]
+    assert not TIMING.search(text.split("<script>")[0]), TIMING.search(text).group(0)
+    assert text.count("<section ") == 2 and "[timing withheld]" in text
+    assert "suspected priority inversions: 20" in text and "suspected priority inversions: 0;" in text
+    assert "ts_pload/hog (prio 20) on CPU 0" in text and "fails (exit 1)" in text and "passes (exit 0)" in text
+    assert "startupCommands=" in text and "PinTracksByRegex" in text
+    assert re.search(r"MsgSend latency \d+\.\d us", pages["with-timing"])
+    assert pages["with-timing"].replace("[timing withheld]", "") == pages["with-timing"]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            build(["--out", os.path.join(TMP, "site-x"), "--only", "run9/nothing"])
+        raise AssertionError("an unknown example was accepted")
+    except SystemExit as e:
+        assert e.code == 2
+
 def test_inversion_after_receive_on_a_real_capture():
     # run 3: lo sends 0.5 ms of work at t+0, hi at t+4 ms, the hog wakes at t+4.2 ms, while
     # the server already handles hi's request
