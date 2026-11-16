@@ -241,6 +241,31 @@ def test_min_us_zero_from_the_command_line():
         assert main(["check", kev("prio_inherit"), "--no-inversions", "--client", "ts_pload/", "--min-us", "0"]) == 0
     assert "suspected priority inversions: 0" in out.getvalue(), out.getvalue()
 
+
+def test_readme_quickstart_commands():
+    """Every tracestudio command in the README's no-QNX quickstart runs on the checked-in captures with the exit
+    status the README promises (open needs a browser and is covered by its own test)."""
+    import contextlib
+    import io
+    import shlex
+    from tracestudio.cli import main
+    with open(os.path.join(HERE, "..", "README.md")) as f:
+        text = f.read()
+    block = text.split("## Try it without a QNX target", 1)[1].split("```", 2)[1]
+    cmds = [shlex.split(ln.split("#", 1)[0])[1:] for ln in block.splitlines() if ln.startswith("venv/bin/tracestudio ")]
+    assert [c[0] for c in cmds] == ["analyze", "diff", "open", "check", "check", "analyze"], cmds
+    for c in cmds:
+        if c[0] == "open":
+            continue
+        args = [os.path.join(HERE, "..", a) if a.startswith("tests/data/") else a for a in c]
+        want = 1 if c[0] == "check" and "prio_fixed" in c[1] else 0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main(args) == want, (c, out.getvalue()[-2000:])
+        if c[0] == "analyze" and "mutex_chain_nopi" in c[1]:
+            assert "MUTEX-blocked on mutex" in out.getvalue() and "owned by ts_mutex/holder" in out.getvalue()
+            assert "held by ts_mutex/hog (prio 20)" in out.getvalue()
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window

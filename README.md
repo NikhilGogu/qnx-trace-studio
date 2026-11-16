@@ -29,6 +29,9 @@ venv/bin/tracestudio open tests/data/run1/prio_fixed.kev.gz
 # 4. The same question as a CI gate: exit status 1 for the first trace, 0 for the second
 venv/bin/tracestudio check tests/data/run1/prio_fixed.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
 venv/bin/tracestudio check tests/data/run1/prio_inherit.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+
+# 5. A mutex without priority inheritance: whose lock did hi's server wait on, and what was the owner doing?
+venv/bin/tracestudio analyze tests/data/run4/mutex_chain_nopi.kev.gz --slowest 1 --client ts_mutex/hi
 ```
 
 Step 1 reports that 20 of 20 `hi` requests missed the deadline and lists 20 suspected priority inversions. Each one comes with its evidence, for example:
@@ -41,7 +44,7 @@ txn 520: ts_pload/hi (prio 30) waited 10937.8 us in MsgSend; for 8151.9 us of it
 
 Step 2 shows 0 of 20 misses and no inversions once the channel inherits the client's priority.
 
-The repository also has a second, more common case: a mutex created with `PTHREAD_PRIO_NONE`, where the owner chain is followed from the waiter to what the owner was doing (`tests/data/run4/mutex_chain_nopi.kev.gz`, see [Mutex owner chains](#mutex-owner-chains)).
+The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload turns inheritance off on purpose. Step 5 is the more common case. A mutex created with `PTHREAD_PRIO_NONE` is held by a low-priority thread that waits on another server, and the critical path follows the chain from hi's server thread to the mutex owner and into the owner's own request, where a medium-priority hog holds the CPU (output under [Mutex owner chains](#mutex-owner-chains)). Thread-pool servers are covered by the inversion rule too, so far on synthetic traces only (see [Limitations](#limitations)).
 
 ## trace-studio and the System Profiler
 
@@ -389,7 +392,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
 - 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 89 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 16 on the checked-in captures.
+- `python3 tests/test_tracestudio.py` runs 90 tests: 73 on synthetic slot streams, with a counterexample for each defect found in code review, and 17 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

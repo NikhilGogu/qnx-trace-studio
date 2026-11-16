@@ -33,3 +33,5 @@ jobs:
             echo "expected exit status 1 for prio_fixed"; exit 1
           fi
           tracestudio check tests/data/run1/prio_inherit.kev.gz --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
+      - name: The mutex owner chain from the quickstart
+        run: tracestudio analyze tests/data/run4/mutex_chain_nopi.kev.gz --slowest 1 --client ts_mutex/hi
