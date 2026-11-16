@@ -2,9 +2,8 @@ name: examples page
 
 # Builds the examples page from tests/data (measured times withheld) and publishes it with GitHub
 # Pages. Pages must be enabled in the repository settings, with GitHub Actions as the source.
+# Run by hand until then; add a push trigger once Pages is on.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
