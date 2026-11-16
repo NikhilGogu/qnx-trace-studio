@@ -2,6 +2,7 @@
 
 ## 0.4.0
 
+- Fixed: a malformed header field, a system page length outside the file, or corrupt gzip data gave a traceback, and `check` left an older JUnit report in place. These now fail with a message naming the field and a `TraceError` report. Gzip data is decompressed in chunks up to 4 GiB, or `TRACESTUDIO_MAX_KEV_BYTES`.
 - Inversions: SEND-phase verdicts for multi-threaded servers. Every receive-capable thread of the server must be accounted for, or the result is "insufficient evidence".
 - Fixed: `analyze --min-us 0` and `check --min-us 0` crashed on a request with no inversion time.
 - `action.yml`: a GitHub Action that runs `tracestudio check` and writes a JUnit report.

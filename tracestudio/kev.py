@@ -35,8 +35,11 @@ closed as partial, so slots from both sides of a gap are never joined.
 from __future__ import annotations
 
 import gzip
+import io
+import os
 import re
 import struct
+import zlib
 from dataclasses import dataclass, field
 
 # internal classes (_TRACE_*_C >> 10)
@@ -109,6 +112,54 @@ class KevError(Exception):
     pass
 
 
+# Decompressed size above which a .kev.gz is refused, so corrupt or hostile input cannot exhaust memory.
+# Override with the environment variable TRACESTUDIO_MAX_KEV_BYTES (bytes).
+MAX_KEV_BYTES = 4 << 30
+MAX_CPUS = 64             # the event header has 6 CPU bits
+
+
+def _max_kev_bytes():
+    v = os.environ.get("TRACESTUDIO_MAX_KEV_BYTES")
+    if v is None:
+        return MAX_KEV_BYTES
+    try:
+        n = int(v)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        raise KevError("TRACESTUDIO_MAX_KEV_BYTES must be a positive number of bytes, not %r" % v)
+    return n
+
+
+def _gunzip(data, limit):
+    """The decompressed bytes of gzip data, read in chunks; KevError when corrupt, truncated or over limit."""
+    out = bytearray()
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > limit:
+                    raise KevError("decompressed trace is larger than %d bytes (TRACESTUDIO_MAX_KEV_BYTES)" % limit)
+    except (OSError, EOFError, zlib.error) as e:
+        raise KevError("corrupt gzip data: %s" % (e or type(e).__name__)) from e
+    return bytes(out)
+
+
+def _header_int(attrs, key, default, lo, hi=None):
+    """The integer header field TRACE_<key>, which must lie in [lo, hi]; KevError naming the field otherwise."""
+    text = attrs.get(key, default) or default
+    try:
+        v = int(text)
+    except ValueError:
+        raise KevError("header field TRACE_%s is not an integer: %r" % (key, text[:40])) from None
+    if v < lo or hi is not None and v > hi:
+        raise KevError("header field TRACE_%s is %d, outside %d..%s" % (key, v, lo, "" if hi is None else hi))
+    return v
+
+
 class KevFile:
     def __init__(self, path: str, data: bytes | None = None):
         self.path = path
@@ -116,18 +167,18 @@ class KevFile:
             with open(path, "rb") as f:
                 data = f.read()
         if data[:2] == b"\x1f\x8b":
-            data = gzip.decompress(data)
+            data = _gunzip(data, _max_kev_bytes())
         self.data = data
         self.attrs, self.syspage, self.events_offset = self._parse_header(self.data)
         if self.attrs.get("LITTLE_ENDIAN", "TRUE") != "TRUE":
             raise KevError("only little-endian traces are supported")
         if not self.attrs.get("ENCODING", "16 byte events").startswith("16 byte"):
             raise KevError("unsupported encoding %r" % self.attrs.get("ENCODING"))
-        self.cycles_per_sec = int(self.attrs.get("CYCLES_PER_SEC", "0") or 0)
-        if self.cycles_per_sec <= 0:
+        if not self.attrs.get("CYCLES_PER_SEC"):
             raise KevError("header has no TRACE_CYCLES_PER_SEC")
-        self.ncpu = int(self.attrs.get("CPU_NUM", "1"))
-        self.version = (int(self.attrs.get("VER_MAJOR", "0")), int(self.attrs.get("VER_MINOR", "0")))
+        self.cycles_per_sec = _header_int(self.attrs, "CYCLES_PER_SEC", "0", 1)
+        self.ncpu = _header_int(self.attrs, "CPU_NUM", "1", 1, MAX_CPUS)
+        self.version = (_header_int(self.attrs, "VER_MAJOR", "0", 0), _header_int(self.attrs, "VER_MINOR", "0", 0))
         self.stats = KevStats()
         self._losses: list[Loss] = []
         self._events = None
@@ -147,7 +198,7 @@ class KevFile:
         for m in re.finditer(r"TRACE_([A-Z0-9_]+)::(.*?)(?=TRACE_[A-Z0-9_]+::|$)", text, re.S):
             attrs[m.group(1)] = m.group(2)
         off = end + len(end_tag)
-        splen = int(attrs.get("SYSPAGE_LEN", "0") or 0)
+        splen = _header_int(attrs, "SYSPAGE_LEN", "0", 0, len(data) - off)
         syspage = data[off:off + splen]
         return attrs, syspage, off + splen
 
