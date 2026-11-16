@@ -38,7 +38,7 @@ def _latency_assertion(model, name, budget_us, match, allow_loss, min_requests):
     for t in model.txns:
         if not match(t):
             continue
-        if t.t_call is None or t.t_exit is None:
+        if t.unfinished:
             unfinished += 1
             continue
         if not t.trustworthy:

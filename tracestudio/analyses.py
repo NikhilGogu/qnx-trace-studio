@@ -340,7 +340,7 @@ def ipc_latency(model):
     for t in model.txns:
         g = (role_label(thread_key(model, t.client, t.client_prio)), model.server_name(t))
         keys[g].add(t.client)
-        if t.t_call is None or t.t_exit is None:
+        if t.unfinished:
             unfinished[g] += 1
         elif t.trustworthy:
             groups[g].append(us(model, t.t_exit - t.t_call))
@@ -380,7 +380,7 @@ def deadline_misses(model, thread_name, deadline_us, only=None):
             continue
         r = out.setdefault(model.server_name(t), {"requests": 0, "missed": 0, "max_us": 0.0, "excluded": 0,
                                                  "unfinished": 0})
-        if t.t_call is None or t.t_exit is None:
+        if t.unfinished:
             r["unfinished"] += 1
             continue
         if not t.trustworthy:

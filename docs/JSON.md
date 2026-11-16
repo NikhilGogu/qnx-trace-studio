@@ -31,8 +31,8 @@ Times are in microseconds (`_us`). Thread labels are `process/thread`. A verdict
 | `client` | string | client role: `process/thread@priority` |
 | `server` | string | server process |
 | `n` | int | trustworthy requests |
-| `excluded` | int | requests left out as untrustworthy |
-| `unfinished` | int | requests still open when the trace ended |
+| `excluded` | int | requests left out as untrustworthy, including a request that returned but whose MsgSendv entry is not in the trace |
+| `unfinished` | int | requests whose MsgSendv had not returned when the trace ended |
 | `client_threads` | int | client threads merged into the role |
 | `min_us` | float | latency statistics over the trustworthy requests |
 | `p50_us` | float | |
@@ -94,8 +94,8 @@ Times are in microseconds (`_us`). Thread labels are `process/thread`. A verdict
 | `requests` | int | trustworthy requests of the named client threads to that server |
 | `missed` | int | requests over the deadline |
 | `max_us` | float | slowest of them |
-| `excluded` | int | requests left out as untrustworthy |
-| `unfinished` | int | requests still open when the trace ended |
+| `excluded` | int | requests left out as untrustworthy, including a request that returned but whose MsgSendv entry is not in the trace |
+| `unfinished` | int | requests whose MsgSendv had not returned when the trace ended |
 
 ### mutex_waits[]
 
