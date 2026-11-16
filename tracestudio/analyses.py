@@ -17,14 +17,20 @@ SEND- or REPLY-blocked on a server thread, the inference needs:
     client's mask on), naming at least one CPU of the trace;
   * every CPU in that mask busy with a thread above Ps, and at least one of
     those threads below Pc. Those threads are the evidence.
-While the client is SEND-blocked, the eventual receiver is the dependency only
-when it is provably the only thread of its process: the process was created
-during the trace (or its threads were listed at trace start) and no other
-thread of it was alive. The client's wait is split at every state change of
-client and server, every context switch on the eligible CPUs and every
-run-mask change. Anything else that could explain a low-priority READY server
-(unknown mask, occupant, state or priority, an eligible CPU running something
-at or below Ps, several possible receivers) counts as insufficient evidence. A
+While the client is SEND-blocked, any thread of the server process could
+receive the message. The thread list must be complete (the process was created
+during the trace, or its threads were listed at trace start, and no events were
+lost since) and no thread may start or end during the wait. Every other thread
+must then be blocked in another kernel call, RECEIVE-blocked on another
+channel, or READY below Pc and held up the same way (known mask, every CPU in
+it busy above its priority, at least one thread below Pc); the verdict lists
+them all. A thread waiting in MsgReceivev on the client's channel means no
+inversion (the kernel would have delivered the message). The client's wait is
+split at every state change of client and server threads, every context switch
+and every run-mask change. Anything else that could explain a low-priority
+READY server (unknown mask, occupant, state or priority, an eligible CPU
+running something at or below Ps, another thread that could receive) counts as
+insufficient evidence. A
 request is reported as a suspected inversion when the evidence covers at least
 min_us; when unexplained time does instead, it is reported as "insufficient
 evidence" with the reasons.
@@ -35,7 +41,8 @@ import bisect
 from collections import Counter, defaultdict
 
 from .events import state_name
-from .model import SCHED_SPORADIC, ST_DEAD, ST_DESTROY, ST_MUTEX, ST_READY, ST_RUNNING, ST_SEND, ST_REPLY, ST_UNKNOWN, UNKNOWN
+from .model import (SCHED_SPORADIC, ST_DEAD, ST_DESTROY, ST_MUTEX, ST_READY, ST_RECEIVE, ST_REPLY, ST_RUNNING, ST_SEND,
+                    ST_UNKNOWN, UNKNOWN)
 
 
 def us(model, cyc):
@@ -246,30 +253,58 @@ class Timeline:
             return lst[i]
         return None
 
-    def sole_thread(self, key, t0, t1):
-        """True when `key` is provably the only live thread of its process during [t0, t1]: the inventory of
-        its threads is complete (process created in the trace, or its threads listed at trace start, and no
-        lost events since then that could hide a thread) and no other thread is alive in the interval. A
-        thread id that dies and is used again starts a new lifetime."""
+    def receive_channel(self, key, ts):
+        """(receive kernel call, chid or None) of the RECEIVE block the thread is in at ts, or None when its
+        latest state at ts is not a RECEIVE entered inside a traced MsgReceivev or MsgReceivePulsev call."""
+        tss, sts = self._st(key)
+        i = bisect.bisect_right(tss, ts) - 1
+        if i < 0 or sts[i][1] != ST_RECEIVE:
+            return None
+        t = self.m.threads.get(key)
+        for when, name, chid in reversed(t.receives if t else []):
+            if when == sts[i][0]:
+                return name, chid
+            if when < sts[i][0]:
+                break
+        return None
+
+    def state_times(self, key, t0, t1):
+        """Times of the thread's events strictly inside (t0, t1)."""
+        tss, _ = self._st(key)
+        return tss[bisect.bisect_right(tss, t0):bisect.bisect_left(tss, t1)]
+
+    def inventory_complete(self, pid, t1):
+        """True when every thread of the process alive up to t1 is in the trace: the process was created in
+        the trace, or its threads were listed at trace start, and no events were lost since then (a thread
+        created inside lost events may never show up)."""
         m = self.m
-        p = m.processes.get(key[0])
+        p = m.processes.get(pid)
         if p is None:
             return False
         if p.created_ts is not None:
             since = p.created_ts
-        elif key[0] in m.injected_pids:
+        elif pid in m.injected_pids:
             since = m.start_ts
         else:
             return False      # threads that existed before the trace may never show up
-        for lst in m.loss_windows.values():
-            if any(w0 < t1 and w1 > since for w0, w1 in lst):
-                return False  # a thread created inside lost events may never show up either
-        for other, t in m.threads.items():
+        return not any(w0 < t1 and w1 > since for lst in m.loss_windows.values() for w0, w1 in lst)
+
+    def other_threads(self, key, t0, t1):
+        """{thread: [(birth, death or None)]}: the other threads of key's process with a lifetime overlapping
+        [t0, t1]. A thread id that dies and is used again starts a new lifetime."""
+        out = {}
+        for other, t in self.m.threads.items():
             if other[0] != key[0] or other == key or not t.states:
                 continue
-            if any(b < t1 and (d is None or d > t0) for b, d in _lifetimes(t)):
-                return False
-        return True
+            lives = [(b, d) for b, d in _lifetimes(t) if b < t1 and (d is None or d > t0)]
+            if lives:
+                out[other] = lives
+        return out
+
+    def sole_thread(self, key, t0, t1):
+        """True when `key` is provably the only live thread of its process during [t0, t1]: the inventory of
+        its threads is complete and no other thread is alive in the interval."""
+        return self.inventory_complete(key[0], t1) and not self.other_threads(key, t0, t1)
 
 
 def _lifetimes(t):
@@ -392,6 +427,79 @@ def _channel(tx):
     return (tx.server_pid, tx.info.get("chid", tx.rx_chid))
 
 
+# blocked inside another kernel call: such a thread cannot take a message until that call ends
+# (SEND, REPLY, SIGSUSPEND, SIGWAITINFO, NANOSLEEP, MUTEX, CONDVAR, JOIN, INTR, SEM)
+_BLOCKED_ELSEWHERE = frozenset({ST_SEND, ST_REPLY, 10, 11, 12, ST_MUTEX, 14, 15, 16, 17})
+HELD_UP = "READY, held up"
+
+
+def _pool(tl, tx, srv):
+    """While the client is SEND-blocked and the receiver is not provably alone: (problem or None, the other
+    threads of the server process). Every thread must be in the trace for the whole wait, none started or
+    ended during it."""
+    m = tl.m
+    t0 = tx.t_call
+    t1 = tx.t_rx_exit if tx.t_rx_exit is not None and tx.t_rx_exit < tx.t_exit else tx.t_exit
+    if not tl.inventory_complete(srv[0], t1):
+        return "other threads of %s may receive on the channel" % m.server_name(tx), []
+    others = tl.other_threads(srv, t0, t1)
+    for lives in others.values():
+        if any(x is not None and t0 <= x <= t1 for life in lives for x in life):
+            return "a thread of %s started or ended during the wait" % m.server_name(tx), []
+    return None, sorted(others)
+
+
+def _pool_member(tl, tx, o, pc, ts):
+    """How thread `o` of the server process stood at ts while the client (prio pc) was SEND-blocked:
+    ("ok", description, assumption or None) when it could not take the message (blocked in another call,
+    receiving on another channel, or READY below pc behind threads above it on every CPU it may use, at
+    least one of them below pc); ("receivable", ...) when it waited in MsgReceivev on the client's channel;
+    ("unknown", reason, None) otherwise."""
+    m = tl.m
+    generic = "other threads of %s may receive on the channel" % m.server_name(tx)
+    code, prio = tl.state_at(o, ts)
+    if code in (None, ST_UNKNOWN):
+        return "unknown", "state of %s unknown" % m.label(o), None
+    if code in _BLOCKED_ELSEWHERE:
+        return "ok", "%s-blocked" % state_name(code), None
+    if code == ST_RECEIVE:
+        rc, chid = tl.receive_channel(o, ts), _channel(tx)[1]
+        if rc is None or rc[1] is None or chid is None:
+            return "unknown", generic, None
+        if rc[1] != chid:
+            return "ok", "RECEIVE-blocked on chid %d" % rc[1], None
+        if rc[0] == "MSG_RECEIVEV":
+            return "receivable", None, None
+        return "unknown", generic, None
+    if code != ST_READY:
+        return "unknown", generic, None
+    if prio is None:
+        return "unknown", "priority of %s unknown" % m.label(o), None
+    if prio >= pc:
+        return "unknown", generic, None
+    if tl.policy_at(o, ts) == SCHED_SPORADIC:
+        return "unknown", "%s uses sporadic scheduling" % m.label(o), None
+    mask, src = tl.runmask_source(o, ts)
+    if mask is None:
+        return "unknown", "run mask of %s not traced" % m.label(o), None
+    cpus = mask_cpus(mask, tl.cpus)
+    if not cpus:
+        return "unknown", "run mask 0x%x names no CPU of the trace" % mask, None
+    occ = [(x, tl.occupant(x, ts)) for x in cpus]
+    missing = [x for x, w in occ if w is None or w == UNKNOWN]
+    if missing:
+        return "unknown", "occupant of CPU %s unknown" % ",".join(map(str, missing)), None
+    prios = [(x, w, tl.prio_at(w, ts)) for x, w in occ]
+    if any(p is None for _, _, p in prios):
+        return "unknown", "priority of a running thread unknown", None
+    for x, w, p in prios:
+        if p <= prio:
+            return "unknown", "CPU %d ran %s at prio %d, not above %s's %d" % (x, m.label(w), p, m.label(o), prio), None
+    if not any(p < pc for _, _, p in prios):
+        return "unknown", generic, None
+    return "ok", HELD_UP, (None if src == "traced" else "run mask 0x%x of %s supplied by %s" % (mask, m.label(o), src))
+
+
 def _inversion(tl, tx):
     """Evidence for one exchange: (inversion cycles, unexplained cycles, culprits, reasons, details)."""
     m = tl.m
@@ -401,6 +509,8 @@ def _inversion(tl, tx):
     reasons = Counter()
     phase = Counter()
     sprios, masks, busy, assumed = set(), set(), [], set()
+    pool = None                       # (problem, other threads) once a SEND-phase verdict needs it
+    members = defaultdict(Counter)    # thread -> {how it stood: cycles} over the evidence of a pool verdict
     for a, b, ccode, _cp in tl.segments(tx.client, tx.t_call, tx.t_exit):
         if ccode not in (ST_SEND, ST_REPLY):
             continue
@@ -427,9 +537,12 @@ def _inversion(tl, tx):
             if sprio >= pc:
                 continue
             if not sole:
-                unk += d - c
-                reasons["other threads of %s may receive on the channel" % m.server_name(tx)] += d - c
-                continue
+                if pool is None:
+                    pool = _pool(tl, tx, srv)
+                if pool[0] is not None:
+                    unk += d - c
+                    reasons[pool[0]] += d - c
+                    continue
             if m.aps_seen:
                 unk += d - c
                 reasons["adaptive partitioning in use: budgets not evaluated"] += d - c
@@ -442,6 +555,9 @@ def _inversion(tl, tx):
             for cpu in tl.cpus:
                 cuts.update(tl.switch_times(cpu, c, d))
             cuts.update(tl.runmask_changes(srv, c, d))
+            for o in (pool[1] if not sole else ()):
+                cuts.update(tl.state_times(o, c, d))
+                cuts.update(tl.runmask_changes(o, c, d))
             cuts = sorted(cuts)
             for e, f in zip(cuts, cuts[1:]):
                 mask, src = tl.runmask_source(srv, e)
@@ -474,6 +590,20 @@ def _inversion(tl, tx):
                 blockers = [(x, o, p) for x, o, p in prios if p < pc]
                 if not blockers:
                     continue
+                if not sole:
+                    stood = [(o, _pool_member(tl, tx, o, pc, e)) for o in pool[1]]
+                    if any(r[0] == "receivable" for _, r in stood):
+                        continue      # a thread waited in MsgReceivev on the channel: not this inversion
+                    bad = [r[1] for _, r in stood if r[0] == "unknown"]
+                    if bad:
+                        unk += f - e
+                        reasons[bad[0]] += f - e
+                        continue
+                    members[srv][HELD_UP] += f - e
+                    for o, r in stood:
+                        members[o][r[1]] += f - e
+                        if r[2]:
+                            assumed.add(r[2])
                 inv += f - e
                 phase[state_name(ccode)] += f - e
                 sprios.add(sprio)
@@ -487,7 +617,7 @@ def _inversion(tl, tx):
                     if h is not None and h is not tx and h not in busy:
                         busy.append(h)
     return inv, unk, culprits, reasons, {"phase": phase, "sprios": sprios, "masks": masks, "busy": busy,
-                                         "assumed": sorted(assumed)}
+                                         "assumed": sorted(assumed), "members": members}
 
 
 def suspected_inversions(model, tl=None, min_us=100.0, only=None):
@@ -530,6 +660,9 @@ def suspected_inversions(model, tl=None, min_us=100.0, only=None):
                 "server_busy_with": [{"txn": h.idx, "client": m.label(h.client)} for h in d["busy"]],
                 "insufficient_evidence_us": round(unk_us, 1),
                 "assumptions": d["assumed"],
+                "receivers": [{"thread": m.label(k), "tid": k[1],
+                               "states": {s: round(us(m, v), 1) for s, v in d["members"][k].most_common()}}
+                              for k in sorted(d["members"])],
             })
             top = row["preempted_by"][0]
             row["evidence"] = (
@@ -543,6 +676,11 @@ def suspected_inversions(model, tl=None, min_us=100.0, only=None):
                     "; the server was busy with %s" % ", ".join("%s's request (txn %d)" % (b["client"], b["txn"])
                                                                for b in row["server_busy_with"])
                     if row["server_busy_with"] else "")) + (
+                " %s had other threads, so the SEND-phase evidence rests on all %d known receive-capable threads "
+                "of %s, each blocked in another call, receiving on another channel, or READY and held up the same "
+                "way: %s." % (m.server_name(tx), len(row["receivers"]), m.server_name(tx), "; ".join(
+                    "%s (tid %d): %s" % (r["thread"], r["tid"], ", then ".join(r["states"]))
+                    for r in row["receivers"])) if row["receivers"] else "") + (
                 " Relies on %s." % "; ".join(d["assumed"]) if d["assumed"] else "")
             found.append(row)
         else:

@@ -118,6 +118,7 @@ class Thread:
     states: list = field(default_factory=list)    # (ts, state code, prio or None, cpu, injected, policy or None)
     prios: list = field(default_factory=list)     # (ts, prio) on change
     runmask: list = field(default_factory=list)   # (ts, mask or None) from ThreadCtl; None: not known
+    receives: list = field(default_factory=list)  # (ts of a RECEIVE state, receive kernel call, chid or None)
 
     @property
     def key(self):
@@ -622,6 +623,9 @@ class Model:
             elif code != ST_MUTEX and w.t_block is not None and w.t_wake is None:
                 w.t_wake = ev.ts
         if code == ST_RECEIVE and not uncertain:
+            call = self._in_call.get(key)
+            if call is not None and call.name in RECEIVE_CALLS:   # the channel this RECEIVE block is on
+                t.receives.append((ev.ts, call.name, call.args.get("chid")))
             self._resync_pulses(key)
         if code == ST_DEAD:
             self._thread_gone(key, ev.ts, "died")
