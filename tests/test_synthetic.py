@@ -719,6 +719,24 @@ def test_no_inversion_for_plain_blocking():
     assert r["checked"] == 1 and r["suspected"] == [] and r["insufficient_evidence"] == []
 
 
+
+def test_min_us_zero_does_not_crash():
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 1, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, B, 10)
+    g.send(0, T + 20, B, S[0], 0x10001, prio=10)
+    g.receive(0, T + 50, S, B, 0x10001, prio=10)
+    g.reply(0, T + 500, S, B, 0x10001, 10)
+    g.send_exit(0, T + 600, B, 10)
+    _, m = model(g)
+    r = suspected_inversions(m, min_us=0)                      # no inversion time at all: no row, no crash
+    assert r["checked"] == 1 and r["suspected"] == [] and r["insufficient_evidence"] == [], r
+    _, m = prio_scene(0x1, M, 20)                               # a real inversion is still found at threshold 0
+    r0, r100 = suspected_inversions(m, min_us=0), suspected_inversions(m)
+    assert [x["txn"] for x in r0["suspected"]] == [x["txn"] for x in r100["suspected"]] != []
+
 # ---- exact Perfetto output ------------------------------------------------------------------
 def test_perfetto_exact_slices_threads_and_flows():
     g = Gen(ncpu=1)

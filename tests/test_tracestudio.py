@@ -204,6 +204,17 @@ def test_cli_exit_codes():
     assert main(["info", junk]) == 1 and main(["analyze", junk]) == 1
 
 
+
+def test_min_us_zero_from_the_command_line():
+    import contextlib
+    import io
+    from tracestudio.cli import main
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["analyze", kev("ipc_wide"), "--min-us", "0"]) == 0
+        assert main(["check", kev("prio_inherit"), "--no-inversions", "--client", "ts_pload/", "--min-us", "0"]) == 0
+    assert "suspected priority inversions: 0" in out.getvalue(), out.getvalue()
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window

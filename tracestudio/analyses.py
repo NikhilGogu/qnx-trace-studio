@@ -640,12 +640,13 @@ def suspected_inversions(model, tl=None, min_us=100.0, only=None):
         checked += 1
         inv, unk, culprits, reasons, d = _inversion(tl, tx)
         inv_us, unk_us = us(m, inv), us(m, unk)
-        if inv_us < min_us and unk_us < min_us:
+        suspected = inv > 0 and inv_us >= min_us             # with min_us=0, rows need some time of their kind
+        if not suspected and not (unk > 0 and unk_us >= min_us):
             continue
         pc = tl.prio_at(tx.client, tx.t_call)
         row = {"txn": tx.idx, "client": m.label(tx.client), "client_prio": pc, "server": m.label(tx.server),
                "latency_us": round(us(m, tx.t_exit - tx.t_call), 1)}
-        if inv_us >= min_us:
+        if suspected:
             ms = sorted(d["masks"])
             cpus = sorted({x for mk in ms for x in mask_cpus(mk, tl.cpus)})
             row.update({
