@@ -266,6 +266,52 @@ def test_readme_quickstart_commands():
             assert "MUTEX-blocked on mutex" in out.getvalue() and "owned by ts_mutex/holder" in out.getvalue()
             assert "held by ts_mutex/hog (prio 20)" in out.getvalue()
 
+
+def _json_doc_keys():
+    """{section heading: set of keys} from the tables of docs/JSON.md (first column, in backticks)."""
+    import re
+    keys, head = {}, None
+    with open(os.path.join(HERE, "..", "docs", "JSON.md")) as f:
+        for ln in f:
+            if ln.startswith("### "):
+                head = ln[4:].strip()
+                keys[head] = set()
+            m = re.match(r"\| `(\w+)` \|", ln)
+            if m and head:
+                keys[head].add(m.group(1))
+    return keys
+
+
+def test_analyze_json_contract():
+    import contextlib
+    import io
+    import json
+    from tracestudio.cli import main
+
+    def run(*args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main(list(args)) == 0
+        return json.loads(out.getvalue())
+    doc = _json_doc_keys()
+    a = run("analyze", kev("prio_fixed"), "--json", "--deadline", "hi=5000", "--slowest", "1")
+    m = run("analyze", kev("mutex_chain_nopi", DATA4), "--json", "--slowest", "1")
+    assert set(a) == set(m) == doc["Top level"], set(a) ^ doc["Top level"]
+    assert set(a["ipc_latency"][0]) == doc["ipc_latency[]"]
+    assert set(a["inversions"]) == doc["inversions"]
+    assert set(a["inversions"]["suspected"][0]) == doc["inversions.suspected[]"]
+    assert set(a["inversions"]["insufficient_evidence"][0]) == doc["inversions.insufficient_evidence[]"]
+    assert set(a["deadlines"]["hi"]["by_server"]["ts_psrv"]) == doc["deadlines.NAME.by_server.SERVER"]
+    known = [w for w in m["mutex_waits"] if w["owner"]]
+    assert known and all(set(w) == doc["mutex_waits[]"] - {"owner_unknown"} for w in known)
+    cp = a["critical_paths"][0]
+    assert set(cp) == doc["critical_paths[]"]
+    seen = set().union(*(set(sg) for c in (cp, m["critical_paths"][0]) for sg in c["segments"]))
+    assert seen <= doc["critical_paths[].segments[]"] and {"start_us", "us", "kind", "what", "txn"} <= seen, seen
+    d = run("diff", kev("prio_fixed"), kev("prio_inherit"), "--json", "--deadline", "hi=5000")
+    assert set(d) == {"before", "after", "comparison"} and set(d["comparison"]) == {"latency", "server_priority"}
+    assert set(d["before"]) == set(d["after"]) == doc["Top level"] - {"critical_paths"}
+
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
     data, nbuf, removed = drop_buffers(k, {79, 80, 83, 84})   # two buffers per CPU inside the workload window
