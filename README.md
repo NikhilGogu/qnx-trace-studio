@@ -62,7 +62,7 @@ The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload tu
 
 | criterion | where to look |
 |---|---|
-| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 105 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
+| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 106 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
 | Design | The quickstart above runs on the checked-in captures without QNX. `check` gives an exit status and JUnit XML, and [action.yml](action.yml) runs it as a GitHub Action. `open` loads a trace in Perfetto with the right tracks pinned. [tools/build_examples.py](tools/build_examples.py) builds a page with every capture. [docs/JSON.md](docs/JSON.md) documents the JSON output |
 | Potential impact | Timing budgets and "no suspected inversion" as a CI gate for QNX message passing. The mutex owner chain in quickstart step 5, which is the more common case in real code. Verdicts for multi-threaded servers |
 | Innovation | Verdicts that carry their evidence, and "insufficient evidence" with reasons when the trace cannot support one. A critical path that crosses processes and follows mutex owners ([What trace-studio adds](#what-trace-studio-adds)). Perfetto SQL examples in [docs/sql](docs/sql). An agent skill in [skills/trace-studio](skills/trace-studio/SKILL.md) |
@@ -463,7 +463,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
 - 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 105 tests: 78 on synthetic slot streams, with a counterexample for each defect found in code review, and 27 on the checked-in captures, among them one that runs the quickstart commands above.
+- `python3 tests/test_tracestudio.py` runs 106 tests: 79 on synthetic slot streams, with a counterexample for each defect found in code review, and 27 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

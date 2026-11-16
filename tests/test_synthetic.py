@@ -2036,3 +2036,35 @@ def test_malformed_traces_fail_check_with_a_trace_error():
         assert what in err.getvalue(), (what, err.getvalue())
     k = KevFile("ok.kev", gzip.compress(good))                      # a well-formed gzip still reads
     assert k.data == good and k.events_offset == good.index(b"TRACE_HEADER_END::") + len(b"TRACE_HEADER_END::")
+
+
+def test_unfinished_means_still_open_at_trace_end():
+    """A request whose MsgSendv entry is not in the trace but which returns in it is untrustworthy (excluded); only a
+    request whose MsgSendv has not returned when the trace ends is unfinished."""
+    from kevgen import SMSG
+    from tracestudio.analyses import deadline_misses
+    from tracestudio.check import run_checks
+    from tracestudio.cli import build_parser
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 1, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.comm(0, T + 20, SMSG, 0x10001, S[0])                      # entered MsgSendv before the trace: not traced
+    g.state(0, T + 30, REPLY, C, 10)
+    g.receive(0, T + 40, S, C, 0x10001, prio=10)
+    g.reply(0, T + 100, S, C, 0x10001, client_prio=10)
+    g.wait_receive(0, T + 140, S, prio=10)
+    g.send_exit(0, T + 160, C, 10)
+    t = exchange(g, 0, T + 200, C, S, 0x20002)
+    g.state(0, t, RUNNING, C, 10)
+    g.send(0, t + 10, C, S[0], 0x30003, prio=10)                # never returns in the trace
+    _, m = model(g)
+    assert [x.t_call is None for x in m.txns] == [True, False, False]
+    (row,) = ipc_latency(m)
+    assert (row["n"], row["excluded"], row["unfinished"]) == (1, 1, 1), row
+    assert {k: deadline_misses(m, "c", 1e6)["server"][k] for k in ("requests", "excluded", "unfinished")} == {
+        "requests": 1, "excluded": 1, "unfinished": 1}
+    a = build_parser().parse_args(["check", "x.kev", "--max-latency", "client/c=1000000", "--allow-loss"])
+    (_, lat) = run_checks(m, Timeline(m), a)
+    assert lat.ok and "1 excluded as untrustworthy, 1 unfinished" in lat.summary, lat.summary
