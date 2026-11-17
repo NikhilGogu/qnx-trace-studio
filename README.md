@@ -141,7 +141,7 @@ sh run_scenarios.sh /tmp/ts/bin /tmp/ts/out prio_fixed prio_inherit
 | `ipc_wide`, `ipc_fast` | ts_front (2 receive threads) forwards every fourth request to ts_back; 4 client threads, 40 requests each; pulses |
 | `prio_fixed`, `prio_inherit` | on CPU 0: lo (prio 10) asks ts_psrv for 4 ms of work, hog (20) burns 10 ms, hi (30) asks for 0.5 ms with a 5 ms deadline; ts_psrv's channel with or without `_NTO_CHF_FIXED_PRIORITY` |
 | `prio_fixed_rx`, `prio_inherit_rx` | as above, but the hog starts after ts_psrv already received hi's request |
-| `pool_fixed`, `pool_inherit` | ts_pool: two receive threads on one channel and a thread that only sleeps, all at prio 10 on CPU 0; ts_pload `-k 2 -L 11,12 -s 1000` adds lo2: lo (prio 11) sends first and lo2 (prio 12) sends 1 ms later, so both receive threads hold a lo request when hi sends; the channel with or without `_NTO_CHF_FIXED_PRIORITY`. With the fixed channel both threads wait at 10 behind the hog and hi misses its deadline. With inheritance the thread that serves lo2 runs at hi's priority 30 while hi waits, finishes that request, receives hi's, and hi meets its deadline. Not checked in |
+| `pool_fixed`, `pool_inherit` | ts_pool: two receive threads on one channel and a thread that only sleeps, all at prio 10 on CPU 0; ts_pload `-k 2 -L 11,12 -s 1000` adds lo2: lo (prio 11) sends first and lo2 (prio 12) sends 1 ms later, so both receive threads hold a lo request when hi sends; the channel with or without `_NTO_CHF_FIXED_PRIORITY`. With the fixed channel both threads wait at 10 behind the hog and hi misses its deadline. With inheritance the thread that serves lo2 runs at hi's priority 30 while hi waits, finishes that request, receives hi's, and hi meets its deadline. Both captures are in `tests/data/run6` |
 | `cancel` | requests that end by TimerTimeout (ETIMEDOUT) or a signal (EINTR) while the server replies late |
 | `rm_traffic`, `rm_small` | `ls`, `find`, `cat`, `dd`, `wc` on the qnx6 file systems served by devb-eide |
 | `mutex_chain`, `mutex_chain_hog`, `mutex_chain_nopi` | ts_mutex on CPU 0: holder (prio 10) locks a mutex and, while it owns it, asks ts_mslow for 3 ms of work; mrx receives hi's (prio 30) request and blocks on that mutex; `_hog` adds a hog at 20; `_nopi` also creates the mutex with `PTHREAD_PRIO_NONE` |
@@ -463,7 +463,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
-- 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
+- 11 of the 20 captures are in `tests/data`, and `tests/data/run6` adds the two thread-pool captures. The test suite runs on all 13 and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
 - `python3 tests/test_tracestudio.py` runs 109 tests: 81 on synthetic slot streams, with a counterexample for each defect found in code review, and 28 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
