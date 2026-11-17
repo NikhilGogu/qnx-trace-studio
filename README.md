@@ -62,7 +62,7 @@ The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload tu
 
 | criterion | where to look |
 |---|---|
-| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 106 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
+| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 111 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
 | Design | The quickstart above runs on the checked-in captures without QNX. `check` gives an exit status and JUnit XML, and [action.yml](action.yml) runs it as a GitHub Action. `open` loads a trace in Perfetto with the right tracks pinned. [tools/build_examples.py](tools/build_examples.py) builds a page with every capture. [docs/JSON.md](docs/JSON.md) documents the JSON output |
 | Potential impact | Timing budgets and "no suspected inversion" as a CI gate for QNX message passing. The mutex owner chain in quickstart step 5, which is the more common case in real code. Verdicts for multi-threaded servers |
 | Innovation | Verdicts that carry their evidence, and "insufficient evidence" with reasons when the trace cannot support one. A critical path that crosses processes and follows mutex owners ([What trace-studio adds](#what-trace-studio-adds)). Perfetto SQL examples in [docs/sql](docs/sql). An agent skill in [skills/trace-studio](skills/trace-studio/SKILL.md) |
@@ -141,6 +141,7 @@ sh run_scenarios.sh /tmp/ts/bin /tmp/ts/out prio_fixed prio_inherit
 | `ipc_wide`, `ipc_fast` | ts_front (2 receive threads) forwards every fourth request to ts_back; 4 client threads, 40 requests each; pulses |
 | `prio_fixed`, `prio_inherit` | on CPU 0: lo (prio 10) asks ts_psrv for 4 ms of work, hog (20) burns 10 ms, hi (30) asks for 0.5 ms with a 5 ms deadline; ts_psrv's channel with or without `_NTO_CHF_FIXED_PRIORITY` |
 | `prio_fixed_rx`, `prio_inherit_rx` | as above, but the hog starts after ts_psrv already received hi's request |
+| `pool_fixed`, `pool_inherit` | ts_pool: two receive threads on one channel and a thread that only sleeps, all at prio 10 on CPU 0; ts_pload `-k 2 -L 11,12 -s 1000` adds lo2: lo (prio 11) sends first and lo2 (prio 12) sends 1 ms later, so both receive threads hold a lo request when hi sends; the channel with or without `_NTO_CHF_FIXED_PRIORITY`. With the fixed channel both threads wait at 10 behind the hog and hi misses its deadline. With inheritance the thread that serves lo2 runs at hi's priority 30 while hi waits, finishes that request, receives hi's, and hi meets its deadline. In 1 of 6 runs of pool_inherit the pool was not full in the first 4 periods, because devb-eide's disk thread (prio 21, writing the trace) delayed lo and lo2; hi still met its deadline. Both captures are in `tests/data/run6` |
 | `cancel` | requests that end by TimerTimeout (ETIMEDOUT) or a signal (EINTR) while the server replies late |
 | `rm_traffic`, `rm_small` | `ls`, `find`, `cat`, `dd`, `wc` on the qnx6 file systems served by devb-eide |
 | `mutex_chain`, `mutex_chain_hog`, `mutex_chain_nopi` | ts_mutex on CPU 0: holder (prio 10) locks a mutex and, while it owns it, asks ts_mslow for 3 ms of work; mrx receives hi's (prio 30) request and blocks on that mutex; `_hog` adds a hog at 20; `_nopi` also creates the mutex with `PTHREAD_PRIO_NONE` |
@@ -368,7 +369,7 @@ The `action-selftest` job in `.github/workflows/test.yml` runs the action on `pr
 
 ```
 source ~/qnx800/qnxsdp-env.sh
-make -C ~/work/trace-studio/workload                    # qcc -Vgcc_ntox86_64 ... -o build/x86_64/ts_* (6 programs)
+make -C ~/work/trace-studio/workload                    # qcc -Vgcc_ntox86_64 ... -o build/x86_64/ts_* (9 programs)
 python3 -m venv ~/work/ts-ci/prio_fixed/venv
 ~/work/ts-ci/prio_fixed/venv/bin/pip install -q ~/work/trace-studio
 cd ~/work/ts-ci/prio_fixed/target
@@ -432,7 +433,7 @@ The JUnit report of the failing run starts like this:
       <failure message="20 of 20 trustworthy requests over 5000 us, max 11096.0 us; matched ..." type="DeadlineMissed">
 ```
 
-Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. The workload's own measurement (11112 us) is about 15 us longer than the traced MsgSend.
+Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. `--client ts_pload/` can fail the same way: on a fresh `prio_inherit_rx` capture, a request from ts_pload's main thread to procnto was handed off inside procnto. To gate on hi alone, use `--client ts_pload/hi`. The workload's own measurement (11112 us) is about 15 us longer than the traced MsgSend.
 
 ## Use from a coding agent
 
@@ -462,8 +463,8 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
-- 11 of the 20 captures are in `tests/data`. The test suite runs on them and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 106 tests: 79 on synthetic slot streams, with a counterexample for each defect found in code review, and 27 on the checked-in captures, among them one that runs the quickstart commands above.
+- 11 of the 20 captures are in `tests/data`, and `tests/data/run6` adds the two thread-pool captures. The test suite runs on all 13 and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
+- `python3 tests/test_tracestudio.py` runs 111 tests: 83 on synthetic slot streams, with a counterexample for each defect found in code review, and 28 on the checked-in captures, among them one that runs the quickstart commands above.
 
 ## Limitations
 

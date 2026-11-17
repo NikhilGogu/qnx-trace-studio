@@ -7,7 +7,9 @@
 #            cancel (timeouts, signals and late replies), rm_traffic (ls, find, cat, wc on qnx6 file systems),
 #            rm_small (a short capture of a few known file reads, used as a test fixture),
 #            mutex_chain, mutex_chain_hog (a mutex owner REPLY-blocked on another server; with a hog at 20),
-#            mutex_chain_nopi (as mutex_chain_hog with PTHREAD_PRIO_NONE: no mutex priority inheritance)
+#            mutex_chain_nopi (as mutex_chain_hog with PTHREAD_PRIO_NONE: no mutex priority inheritance),
+#            pool_fixed, pool_inherit (a two-thread server pool, both threads busy when hi sends; with
+#            inheritance a busy thread runs at hi's priority and hi is served in time)
 B=${1:-/tmp/ts/bin}
 O=${2:-/tmp/ts/out}
 shift 2
@@ -60,6 +62,15 @@ run_mutex() {     # <name> [ts_mutex options]
     finish $1
 }
 
+run_pool() {      # <name> <ts_pool options> <ts_pload options>
+    rm -f /tmp/ts_psrv.addr
+    start_trace $1 -w 4
+    "$B/ts_pool" $2 &
+    sleep 1
+    "$B/ts_pload" -n 20 $3
+    finish $1
+}
+
 run_cancel() {
     start_trace cancel -w 3
     "$B/ts_cancel" -n 5
@@ -97,8 +108,10 @@ for s in $SCEN; do
     mutex_chain)     run_mutex mutex_chain ;;
     mutex_chain_hog) run_mutex mutex_chain_hog -g ;;
     mutex_chain_nopi) run_mutex mutex_chain_nopi "-g -N" ;;
-    prio_inherit_rx) run_prio prio_inherit_rx "" "-l 500 -o 0,4200,4000" ;;
-    prio_fixed_rx)   run_prio prio_fixed_rx -f "-l 500 -o 0,4200,4000" ;;
+    prio_inherit_rx) run_prio prio_inherit_rx "" "-l 500 -o 0,4000,4000" ;;
+    prio_fixed_rx)   run_prio prio_fixed_rx -f "-l 500 -o 0,4000,4000" ;;
+    pool_fixed)   run_pool pool_fixed "-f -n 2 -a" "-k 2 -L 11,12 -s 1000" ;;
+    pool_inherit) run_pool pool_inherit "-n 2 -a" "-k 2 -L 11,12 -s 1000" ;;
     cancel)       run_cancel ;;
     rm_traffic)   run_rm ;;
     rm_small)     run_rm_small ;;

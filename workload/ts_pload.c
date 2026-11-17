@@ -11,17 +11,37 @@
  * finishes lo's request ahead of the hog; with a fixed-priority channel
  * (ts_psrv -f) the hog runs first and hi misses its deadline.
  * At exit it prints how many of hi's requests missed the deadline.
- * -o LO,HOG,HI moves the three start offsets (us); for example -o 0,4200,4000
+ * -o LO,HOG,HI moves the three start offsets (us); for example -o 0,4000,4000
  * with a short lo request makes the hog preempt the server while it already
- * handles hi's request (inversion after the receive).
+ * handles hi's request (inversion after the receive). hi and the hog wake at
+ * the same time and hi runs first, so hi's request reaches the server before
+ * the hog runs. With the hog 200 us after hi, as before, it depended on the
+ * clock tick whether both woke on the same tick.
+ * -k K starts K lo threads (lo, lo2, ...) at the same offset, so K threads of
+ * a thread-pool server (ts_pool) are busy when hi sends. Request ids stay
+ * unique: lo thread j uses 1000 * prio + 100 * j + period, so -k needs -n 100
+ * or less.
+ * -L PRIO runs the lo threads at PRIO (1 to 19, default 10). A server thread
+ * that receives a request runs before other ready threads of its priority, so
+ * with lo at the pool's priority 10 lo2 sends only after lo's request is done.
+ * With -L 11 every lo thread sends before a fixed-priority pool runs.
+ * -L P1,P2,... gives lo, lo2, ... their own priorities; the last one repeats.
+ * -s US starts lo thread j at j * US after lo (default 0). The pool scenarios
+ * use -L 11,12 -s 1000: lo2 wakes one clock tick after lo and preempts the
+ * receive thread that runs lo's request, also when that thread inherited
+ * lo's 11, so both receive threads are busy when hi sends. With -s 500 both
+ * woke on the same tick and lo2 ran first.
  *
- * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi]
+ * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi] [-k lo_threads]
+ *                 [-L lo_prio[,lo2_prio...]] [-s lo_step_us]
  */
 #include "common.h"
 
-static int nper = 20;
+#define TS_MAX_LO 7
+
+static int nper = 20, nlo = 1, nlo_prio = 1, lo_prio[TS_MAX_LO] = { 10 };
 static unsigned period_us = 25000, lo_us = 4000, hog_us = 10000, hi_us = 500, dl_us = 5000;
-static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000;
+static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000, lo_step_us = 0;
 static struct timespec t_base;
 static int srv_pid, srv_chid;
 static pthread_barrier_t bar;
@@ -37,7 +57,7 @@ static void at(int k, unsigned off_us)
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 }
 
-typedef struct { const char *name; int prio; unsigned off_us; unsigned work_us; int role; } spec_t;
+typedef struct { char name[16]; int prio; unsigned off_us; unsigned work_us; int role; int lo_index; } spec_t;
 
 static void *worker(void *arg)
 {
@@ -61,7 +81,7 @@ static void *worker(void *arg)
             ts_log("HOG_END", (uint32_t)k, s->prio, 0, 0, 0);
             continue;
         }
-        uint32_t id = (uint32_t)(s->prio * 1000 + k);
+        uint32_t id = (uint32_t)(s->prio * 1000 + s->lo_index * 100 + k);
         ts_msg_t m = { TS_MSG_PRIO, 0, id, s->work_us, (uint32_t)pthread_self() };
         ts_reply_t r;
         uint64_t t0 = ClockCycles();
@@ -83,7 +103,7 @@ static void *worker(void *arg)
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:L:s:")) != -1) {
         switch (opt) {
         case 'n': nper = atoi(optarg); break;
         case 'P': period_us = (unsigned)atoi(optarg); break;
@@ -96,27 +116,56 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case 'k': nlo = atoi(optarg); break;
+        case 'L': {
+            char *p = optarg;
+            for (nlo_prio = 0; nlo_prio < TS_MAX_LO && *p; nlo_prio++) {
+                lo_prio[nlo_prio] = (int)strtol(p, &p, 10);
+                if (*p == ',')
+                    p++;
+            }
+            if (*p || nlo_prio == 0) {
+                fprintf(stderr, "-L wants PRIO or PRIO,PRIO,... (at most %d)\n", TS_MAX_LO);
+                return 2;
+            }
+            break;
+        }
+        case 's': lo_step_us = (unsigned)atoi(optarg); break;
         }
     }
+    if (nlo < 1 || nlo > TS_MAX_LO || (nlo > 1 && nper > 100)) {
+        fprintf(stderr, "-k wants 1 to %d lo threads, and -n 100 or less with more than one\n", TS_MAX_LO);
+        return 2;
+    }
+    for (int j = 0; j < nlo_prio; j++)
+        if (lo_prio[j] < 1 || lo_prio[j] > 19) {
+            fprintf(stderr, "-L wants lo priorities from 1 to 19, below the hog's 20\n");
+            return 2;
+        }
     ts_role = "pload";
     ts_pin_cpu0();
     ts_set_prio(SCHED_FIFO, 40);
     ts_calibrate();
     if (ts_read_addr("/tmp/ts_psrv.addr", &srv_pid, &srv_chid)) { fprintf(stderr, "no ts_psrv\n"); return 1; }
 
-    spec_t sp[3] = {
-        { "lo", 10, off_lo, lo_us, 0 },
-        { "hog", 20, off_hog, hog_us, 1 },
-        { "hi", 30, off_hi, hi_us, 2 },
-    };
-    pthread_barrier_init(&bar, NULL, 4);
-    pthread_t th[3];
-    for (int i = 0; i < 3; i++) pthread_create(&th[i], NULL, worker, &sp[i]);
+    spec_t sp[TS_MAX_LO + 2];
+    int nth = 0;
+    for (int j = 0; j < nlo; j++, nth++) {
+        int prio = lo_prio[j < nlo_prio ? j : nlo_prio - 1];
+        sp[nth] = (spec_t){ "lo", prio, off_lo + (unsigned)j * lo_step_us, lo_us, 0, j };
+        if (j)
+            snprintf(sp[nth].name, sizeof sp[nth].name, "lo%d", j + 1);
+    }
+    sp[nth++] = (spec_t){ "hog", 20, off_hog, hog_us, 1, 0 };
+    sp[nth++] = (spec_t){ "hi", 30, off_hi, hi_us, 2, 0 };
+    pthread_barrier_init(&bar, NULL, (unsigned)nth + 1);
+    pthread_t th[TS_MAX_LO + 2];
+    for (int i = 0; i < nth; i++) pthread_create(&th[i], NULL, worker, &sp[i]);
     clock_gettime(CLOCK_MONOTONIC, &t_base);
     t_base.tv_sec += 1;   /* first period starts one second from now */
     t_base.tv_nsec = 0;
     pthread_barrier_wait(&bar);
-    for (int i = 0; i < 3; i++) pthread_join(th[i], NULL);
+    for (int i = 0; i < nth; i++) pthread_join(th[i], NULL);
 
     int coid = ConnectAttach(0, srv_pid, srv_chid, _NTO_SIDE_CHANNEL, 0);
     ts_msg_t q = { TS_MSG_QUIT, 0, 0, 0, 0 };

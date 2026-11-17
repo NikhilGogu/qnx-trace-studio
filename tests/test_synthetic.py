@@ -464,6 +464,82 @@ def test_pulse_queue_loses_sync_at_a_loss():
     assert [p.match for p in m.pulses] == ["unsynced", "unique", "unsynced"]
 
 
+def test_pulse_handed_to_a_waiting_receiver_stays_matched_when_another_receiver_blocks():
+    """MsgSendPulse wakes s2, which waits in MsgReceive on the channel; s1 then blocks in MsgReceive on the same
+    channel before s2 runs. The pulse is already s2's, so s1's block must not mark it unseen (seen on ipc_wide)."""
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.buffer(1, T)
+    g.names(0, T, NAMES)
+    g.state(0, T, RUNNING, S, 10)
+    g.kcall(0, T + 1, K_RECEIVEV, [1, 1])
+    g.state(1, T + 10, RUNNING, C, 10)
+    g.pulse(1, T + 20, C, S[0], 0x10001, 0)
+    receive_pulse(g, 0, T + 100, S, 0x10001, block=False)       # s1 learns the scoid's channel
+    g.state(1, T + 200, RUNNING, S2, 10)
+    g.wait_receive(1, T + 210, S2, 10)                          # s2 waits on the channel: queue in sync
+    g.state(1, T + 300, RUNNING, C, 10)
+    g.kcall(1, T + 310, K_PULSE, [0x40000001, 10, 5, 7])
+    g.state(1, T + 315, READY, S2, 10)                          # the kernel hands the pulse to s2
+    g.comm(1, T + 320, SPULSE, 0x10001, S[0])
+    g.kcall(1, T + 325, K_PULSE, [0], EXIT)
+    g.wait_receive(0, T + 400, S, 10)                           # s1 blocks on the channel before s2 runs
+    receive_pulse(g, 1, T + 500, S2, 0x10001)
+    _, m = model(g)
+    p0, p1 = m.pulses
+    assert (p1.match, p1.sender, p1.receiver, p1.value) == ("unique", C, S2, 7), (p1.match, p1.receiver)
+    assert not m.counters.get("pulse_receive_unseen") and not m.counters.get("pulse_recv_without_send")
+
+
+def test_convert_survives_a_corrupt_thread_id():
+    """A corrupted copy of a real capture gave a thread event with a negative pid, and convert failed with
+    ValueError from protobuf (pid * 100 + tid does not fit a Perfetto tid)."""
+    from tracestudio.perfetto_out import write
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.state(0, T + 20, READY, (0x83180018, 0xFFFFFF07), 10)     # decodes as pid -2095579112, tid -249
+    g.state(0, T + 30, RUNNING, (0x83180018, 0xFFFFFF07), 10)
+    g.state(0, T + 40, RUNNING, C, 10)
+    _, m = model(g)
+    assert any(k[0] < 0 for k in m.threads), sorted(m.threads)
+    write(m, os.path.join(TMP, "corrupt-tid.perfetto-trace"))
+
+
+def test_event_of_another_cpu_takes_the_epoch_of_its_buffer():
+    """The kernel writes some THRUNNING events of CPU 0 into CPU 1's buffer, with the low 32 bits of CPU 1's clock.
+    In a fresh mutex_chain capture CPU 0's latest TIME in file order was 230 ms later than that slot, and the event
+    was placed 2^32 cycles late (traceprinter placed it right). Its epoch comes from the buffer that holds it."""
+    g = Gen(ncpu=2)
+    g.buffer(0, T + 0x30000000)                    # CPU 0's buffer, written first, ends later than CPU 1's slots
+    g.state(0, T + 0x30000010, RUNNING, C)
+    g.buffer(1, T)
+    g.cur[3].append([(C_PRTH << 10) | RUNNING, (T + 100) & M32, S[0], S[1]])    # CPU 0's event in CPU 1's buffer
+    g.state(1, T + 200, RUNNING, B)
+    k = kev(g)
+    (e,) = [x for x in k.events() if x.cpu == 0 and x.cls == C_PRTH and x.words[:2] == S]
+    assert e.ts == T + 100, hex(e.ts - T)
+
+
+def test_convert_reports_an_event_before_cycle_zero():
+    """A cut in the event data of a real capture left a TIME event near cycle 0, so a later slot was placed at a
+    negative timestamp, and convert failed with ValueError from protobuf. It now exits 1 and names the problem."""
+    import contextlib
+    from tracestudio.cli import main
+    g = Gen(ncpu=1)
+    g.buffer(0, 100)                                                    # TIME at cycle 100
+    g.event(0, 0, C_PRTH, RUNNING, [C[0], C[1], 10, 2], lsb=0xFFFFFF00)  # 256 cycles before cycle 0
+    path = os.path.join(TMP, "before-zero.kev")
+    with open(path, "wb") as f:
+        f.write(g.bytes())
+    assert min(e.ts for e in KevFile(path).events()) < 0
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        assert main(["convert", path, "-o", path + ".perfetto-trace"]) == 1
+    assert "before clock cycle 0" in err.getvalue(), err.getvalue()
+
+
 # ---- inversion inference ---------------------------------------------------------------
 def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, other_prio=None, after_receive=True,
                chan_flags=0x1, sibling=False, gen=False, server_policy=2, replier=S):
@@ -1176,20 +1252,6 @@ def test_server_time_is_credited_once():
     # cps 1e9: s1 runs 60 ns while it holds only X (T+120..160 and T+300..320), 80 ns holding both
     # (credited once), 100 ns while it holds only Y
     assert got == {"client/c": 0.06, SEVERAL: 0.08, "other/b": 0.1}
-
-if __name__ == "__main__":
-    failed = 0
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            try:
-                fn()
-                print("ok", name)
-            except Exception as e:   # report every failure, then exit nonzero
-                failed += 1
-                import traceback
-                traceback.print_exc()
-                print("FAIL", name, e)
-    sys.exit(1 if failed else 0)
 
 
 # ---- third review (v0.1b): counterexamples -----------------------------------------------------------
@@ -1990,7 +2052,8 @@ def test_owner_at_or_above_the_client_is_no_inversion():
 
 
 def test_malformed_traces_fail_check_with_a_trace_error():
-    """Every malformed header field, a bad system page length and corrupt, truncated or oversized gzip data give
+    """Every malformed header field, a missing CPU count, a bad system page length and corrupt, truncated or
+    oversized gzip data give
     exit status 1 and a JUnit report with a TraceError naming the problem, replacing any older report."""
     import gzip
     import re
@@ -2005,7 +2068,9 @@ def test_malformed_traces_fail_check_with_a_trace_error():
         return re.sub(rb"TRACE_%s::[^T]*" % key.encode(), b"TRACE_%s::%s" % (key.encode(), value.encode()), good)
     big = gzip.compress(good + bytes(1 << 20))
     cases = [("CYCLES_PER_SEC", field("CYCLES_PER_SEC", "abc"), {}), ("CPU_NUM", field("CPU_NUM", "x"), {}),
-             ("CPU_NUM", field("CPU_NUM", "0"), {}), ("VER_MAJOR", field("VER_MAJOR", "?"), {}),
+             ("CPU_NUM", field("CPU_NUM", "0"), {}), ("CPU_NUM", field("CPU_NUM", ""), {}),
+             ("CPU_NUM", good.replace(b"TRACE_CPU_NUM::", b"TRACE_CPU_NUX::", 1), {}),   # renamed key
+             ("VER_MAJOR", field("VER_MAJOR", "?"), {}),
              ("SYSPAGE_LEN", field("SYSPAGE_LEN", "-32"), {}), ("SYSPAGE_LEN", field("SYSPAGE_LEN", "99999"), {}),
              ("corrupt gzip", gzip.compress(good)[:10] + b"\xff" * 40, {}),
              ("corrupt gzip", gzip.compress(good)[:-20], {}),
@@ -2068,3 +2133,18 @@ def test_unfinished_means_still_open_at_trace_end():
     a = build_parser().parse_args(["check", "x.kev", "--max-latency", "client/c=1000000", "--allow-loss"])
     (_, lat) = run_checks(m, Timeline(m), a)
     assert lat.ok and "1 excluded as untrustworthy, 1 unfinished" in lat.summary, lat.summary
+
+
+if __name__ == "__main__":
+    failed = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            try:
+                fn()
+                print("ok", name)
+            except Exception as e:   # report every failure, then exit nonzero
+                failed += 1
+                import traceback
+                traceback.print_exc()
+                print("FAIL", name, e)
+    sys.exit(1 if failed else 0)

@@ -177,7 +177,10 @@ class KevFile:
         if not self.attrs.get("CYCLES_PER_SEC"):
             raise KevError("header has no TRACE_CYCLES_PER_SEC")
         self.cycles_per_sec = _header_int(self.attrs, "CYCLES_PER_SEC", "0", 1)
-        self.ncpu = _header_int(self.attrs, "CPU_NUM", "1", 1, MAX_CPUS)
+        if not self.attrs.get("CPU_NUM"):
+            # the CPU count bounds the run-mask reasoning of the inversion analysis, so it is not guessed
+            raise KevError("header has no TRACE_CPU_NUM (the number of CPUs)")
+        self.ncpu = _header_int(self.attrs, "CPU_NUM", "0", 1, MAX_CPUS)
         self.version = (_header_int(self.attrs, "VER_MAJOR", "0", 0), _header_int(self.attrs, "VER_MINOR", "0", 0))
         self.stats = KevStats()
         self._losses: list[Loss] = []
@@ -311,7 +314,9 @@ class KevFile:
                     close_partial(key)
                     st.stale_combines += 1
             elif struct_ in (S_SIMPLE, S_BEGIN):
-                ts = place(cpu, d0)
+                # the low 32 bits come from the clock of the CPU whose buffer holds the slot; the kernel writes
+                # some events of another CPU (THRUNNING) into it
+                ts = place(table[bi][2] if bi >= 0 else cpu, d0)
             else:
                 ts = None
             # before its CPU's first TIME a slot's epoch is borrowed from another CPU: a guess, not trusted

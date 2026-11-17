@@ -11,7 +11,8 @@ For each .kev or .kev.gz file it runs two checks and prints one line per check:
   compare   traceprinter -f TRACE -o TRACE.txt, then tools/compare_traceprinter.py: events only on one
             side, argument values compared and mismatches, values not compared
   validate  tracestudio validate against the workload logs in NAME.logs, when they exist: logged
-            requests and how many matched (the cancel workload has no validate support)
+            requests and how many matched (the cancel workload has no validate support; a NAME.logs
+            directory without CSV files counts as no logs)
 
 The exit status is 1 when any check fails or traceprinter is missing; --skip-traceprinter runs only
 the validate checks. The summary has counts only, no timing.
@@ -74,6 +75,8 @@ def check_logs(path):
     name = os.path.basename(logs)[:-len(".logs")]
     if not os.path.isdir(logs) or name in NO_VALIDATE:
         return None
+    if not any(f.endswith(".csv") for f in os.listdir(logs)):
+        return None      # run_scenarios.sh makes NAME.logs for every scenario, empty for rm_traffic and rm_small
     res, _, _ = validate(Model(KevFile(path)), logs)
     return res["ok"], "logged requests %d, matched %d, failed checks %s" % (
         res["requests"], res["matched"], ", ".join(res["failed_checks"]) or "none")

@@ -42,6 +42,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from .events import state_name
+from .kev import KevError
 from .model import ST_UNKNOWN, UNKNOWN
 
 try:
@@ -102,7 +103,7 @@ class TidMap:
         if v is None:
             pid, tid = key
             v = pid * 100 + tid
-            if tid >= 100 or v >= (1 << 31) - (1 << 20):
+            if pid < 0 or not 0 <= tid < 100 or v >= (1 << 31) - (1 << 20):   # a corrupt event can carry any id
                 v = self.next
                 self.next += 1
             self.map[key] = v
@@ -126,6 +127,8 @@ class Writer:
         self.stats = defaultdict(int)
 
     def ns(self, cyc):
+        if cyc < 0:      # Perfetto timestamps are unsigned; only corrupt data places an event before cycle 0
+            raise KevError("an event is placed before clock cycle 0 (at %d cycles): the trace is corrupt" % cyc)
         return self.kev.cycles_to_ns(cyc)
 
     def uuid(self):

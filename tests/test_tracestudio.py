@@ -26,6 +26,7 @@ DATA = os.path.join(HERE, "data", "run1")
 DATA3 = os.path.join(HERE, "data", "run3")
 DATA4 = os.path.join(HERE, "data", "run4")
 DATA5 = os.path.join(HERE, "data", "run5")
+DATA6 = os.path.join(HERE, "data", "run6")      # thread-pool captures (workload/ts_pool.c)
 TMP = tempfile.mkdtemp(prefix="ts-test-")
 SCEN = ["ipc_wide", "ipc_fast", "prio_inherit", "prio_fixed"]
 
@@ -143,7 +144,7 @@ def test_every_checked_in_capture_converts_and_loads():
         return skip("perfetto package not installed")
     found = sorted(os.path.relpath(os.path.join(d, f), os.path.join(HERE, "data"))
                    for d, _, fs in os.walk(os.path.join(HERE, "data")) for f in fs if f.endswith(".kev.gz"))
-    assert len(found) == 11, found                          # README and docs/VALIDATION.md name this count
+    assert len(found) == 13, found                          # README and docs/VALIDATION.md name this count
     for rel in found:
         run, name = os.path.split(rel[:-len(".kev.gz")])
         out = os.path.join(TMP, "%s_%s.perfetto-trace" % (run, name))
@@ -483,6 +484,52 @@ def test_validate_all_summarises_every_capture():
         with contextlib.redirect_stdout(io.StringIO()) as out:
             assert validate_all([DATA]) == 1
         assert out.getvalue().startswith("error: traceprinter not on PATH")
+    # run_scenarios.sh leaves an empty NAME.logs for scenarios without workload logs (rm_small, rm_traffic)
+    d = os.path.join(TMP, "empty-logs")
+    os.makedirs(os.path.join(d, "rm_small.logs"), exist_ok=True)
+    shutil.copy(os.path.join(DATA3, "rm_small.kev.gz"), d)
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        assert validate_all([d, "--skip-traceprinter"]) == 0, out.getvalue()
+    assert out.getvalue().splitlines() == ["1 captures, all checks passed"], out.getvalue()
+
+
+def test_pool_captures():
+    """pool_fixed and pool_inherit (workload/run_scenarios.sh): lo (prio 11) and lo2 (prio 12) hold both receive
+    threads of ts_pool when hi sends. Fixed channel: every hi request is a suspected SEND-phase inversion that names
+    both receive threads, the hog first. Inheritance: the thread that serves lo2 runs at hi's 30 while hi waits, and
+    hi meets its deadline with no suspected inversion. Every logged request is matched in both."""
+    import contextlib
+    import csv
+    import io
+    from tracestudio.cli import main
+    gate = ["--deadline", "hi@ts_pool=5000", "--no-inversions", "--client", "ts_pload/hi"]
+    m = Model(KevFile(kev("pool_fixed", DATA6)))
+    res, _, _ = validate(m, os.path.join(DATA6, "pool_fixed.logs"))
+    assert res["ok"] and res["matched"] == res["requests"] == 60, res["examples"]
+    sus = suspected_inversions(m)["suspected"]
+    hi = [x for x in sus if x["client"].endswith("/hi")]
+    assert len(hi) == 20 and all(x["while"].get("SEND", 0) > 0 for x in hi), hi[:1]
+    assert all({r["thread"].split("/")[1] for r in x["receivers"]} >= {"pool-rx0", "pool-rx1"} for x in hi)
+    assert all(x["preempted_by"][0]["thread"].endswith("/hog") for x in hi)
+
+    m = Model(KevFile(kev("pool_inherit", DATA6)))
+    res, _, _ = validate(m, os.path.join(DATA6, "pool_inherit.logs"))
+    assert res["ok"] and res["matched"] == res["requests"] == 60, res["examples"]
+    inv = suspected_inversions(m)
+    assert not [x for x in inv["suspected"] + inv["insufficient_evidence"] if x["client"].endswith("/hi")], inv
+    rows = []
+    for name in sorted(os.listdir(os.path.join(DATA6, "pool_inherit.logs"))):
+        with open(os.path.join(DATA6, "pool_inherit.logs", name)) as f:
+            rows += list(csv.DictReader(line for line in f if not line.startswith("#")))
+    t = {(r["ev"], int(r["id"])): (int(r["cycles"]), int(r["d"])) for r in rows if r["ev"] in ("RX", "REPLY", "SEND")}
+    for k in range(20):
+        hi_sent = t[("SEND", 30000 + k)][0]
+        assert all(t[("RX", i)][0] < hi_sent < t[("REPLY", i)][0] for i in (11000 + k, 12100 + k)), k
+        assert t[("REPLY", 12100 + k)][1] == 30, k               # lo2's request finished at hi's priority
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert main(["check", kev("pool_fixed", DATA6)] + gate) == 1
+        assert main(["check", kev("pool_inherit", DATA6)] + gate) == 0
+
 
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
