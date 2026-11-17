@@ -314,7 +314,9 @@ class KevFile:
                     close_partial(key)
                     st.stale_combines += 1
             elif struct_ in (S_SIMPLE, S_BEGIN):
-                ts = place(cpu, d0)
+                # the low 32 bits come from the clock of the CPU whose buffer holds the slot; the kernel writes
+                # some events of another CPU (THRUNNING) into it
+                ts = place(table[bi][2] if bi >= 0 else cpu, d0)
             else:
                 ts = None
             # before its CPU's first TIME a slot's epoch is borrowed from another CPU: a guess, not trusted

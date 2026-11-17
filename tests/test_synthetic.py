@@ -507,6 +507,21 @@ def test_convert_survives_a_corrupt_thread_id():
     write(m, os.path.join(TMP, "corrupt-tid.perfetto-trace"))
 
 
+def test_event_of_another_cpu_takes_the_epoch_of_its_buffer():
+    """The kernel writes some THRUNNING events of CPU 0 into CPU 1's buffer, with the low 32 bits of CPU 1's clock.
+    In a fresh mutex_chain capture CPU 0's latest TIME in file order was 230 ms later than that slot, and the event
+    was placed 2^32 cycles late (traceprinter placed it right). Its epoch comes from the buffer that holds it."""
+    g = Gen(ncpu=2)
+    g.buffer(0, T + 0x30000000)                    # CPU 0's buffer, written first, ends later than CPU 1's slots
+    g.state(0, T + 0x30000010, RUNNING, C)
+    g.buffer(1, T)
+    g.cur[3].append([(C_PRTH << 10) | RUNNING, (T + 100) & M32, S[0], S[1]])    # CPU 0's event in CPU 1's buffer
+    g.state(1, T + 200, RUNNING, B)
+    k = kev(g)
+    (e,) = [x for x in k.events() if x.cpu == 0 and x.cls == C_PRTH and x.words[:2] == S]
+    assert e.ts == T + 100, hex(e.ts - T)
+
+
 def test_convert_reports_an_event_before_cycle_zero():
     """A cut in the event data of a real capture left a TIME event near cycle 0, so a later slot was placed at a
     negative timestamp, and convert failed with ValueError from protobuf. It now exits 1 and names the problem."""
