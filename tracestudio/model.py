@@ -1102,12 +1102,21 @@ class Model:
         if call is None or call.name not in RECEIVE_CALLS or call.args.get("chid") is None:
             return
         chid = call.args["chid"]
+        # a pulse that woke another receiver is already delivered to it, not pending on the channel
+        bound = {id(pl) for w, (_, pl) in self._wake_pulse.items() if w != key}
         for k, ch in self._scoid_chan.items():
             if k[0] == key[0] and ch == chid:
                 q = self._pulse_q.get(k)
+                kept = []
                 while q:
-                    q.popleft().match = "unseen"     # its receive is not in the trace (lost or merged)
-                    self.counters["pulse_receive_unseen"] += 1
+                    pl = q.popleft()
+                    if id(pl) in bound:
+                        kept.append(pl)
+                    else:
+                        pl.match = "unseen"      # its receive is not in the trace (lost or merged)
+                        self.counters["pulse_receive_unseen"] += 1
+                if kept:
+                    q.extend(kept)
                 self._pulse_synced.add(k)
 
     # ---- index maintenance (by identity) ----------------------------------

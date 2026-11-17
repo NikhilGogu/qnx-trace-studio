@@ -464,6 +464,49 @@ def test_pulse_queue_loses_sync_at_a_loss():
     assert [p.match for p in m.pulses] == ["unsynced", "unique", "unsynced"]
 
 
+def test_pulse_handed_to_a_waiting_receiver_stays_matched_when_another_receiver_blocks():
+    """MsgSendPulse wakes s2, which waits in MsgReceive on the channel; s1 then blocks in MsgReceive on the same
+    channel before s2 runs. The pulse is already s2's, so s1's block must not mark it unseen (seen on ipc_wide)."""
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.buffer(1, T)
+    g.names(0, T, NAMES)
+    g.state(0, T, RUNNING, S, 10)
+    g.kcall(0, T + 1, K_RECEIVEV, [1, 1])
+    g.state(1, T + 10, RUNNING, C, 10)
+    g.pulse(1, T + 20, C, S[0], 0x10001, 0)
+    receive_pulse(g, 0, T + 100, S, 0x10001, block=False)       # s1 learns the scoid's channel
+    g.state(1, T + 200, RUNNING, S2, 10)
+    g.wait_receive(1, T + 210, S2, 10)                          # s2 waits on the channel: queue in sync
+    g.state(1, T + 300, RUNNING, C, 10)
+    g.kcall(1, T + 310, K_PULSE, [0x40000001, 10, 5, 7])
+    g.state(1, T + 315, READY, S2, 10)                          # the kernel hands the pulse to s2
+    g.comm(1, T + 320, SPULSE, 0x10001, S[0])
+    g.kcall(1, T + 325, K_PULSE, [0], EXIT)
+    g.wait_receive(0, T + 400, S, 10)                           # s1 blocks on the channel before s2 runs
+    receive_pulse(g, 1, T + 500, S2, 0x10001)
+    _, m = model(g)
+    p0, p1 = m.pulses
+    assert (p1.match, p1.sender, p1.receiver, p1.value) == ("unique", C, S2, 7), (p1.match, p1.receiver)
+    assert not m.counters.get("pulse_receive_unseen") and not m.counters.get("pulse_recv_without_send")
+
+
+def test_convert_survives_a_corrupt_thread_id():
+    """A corrupted copy of a real capture gave a thread event with a negative pid, and convert failed with
+    ValueError from protobuf (pid * 100 + tid does not fit a Perfetto tid)."""
+    from tracestudio.perfetto_out import write
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.state(0, T + 20, READY, (0x83180018, 0xFFFFFF07), 10)     # decodes as pid -2095579112, tid -249
+    g.state(0, T + 30, RUNNING, (0x83180018, 0xFFFFFF07), 10)
+    g.state(0, T + 40, RUNNING, C, 10)
+    _, m = model(g)
+    assert any(k[0] < 0 for k in m.threads), sorted(m.threads)
+    write(m, os.path.join(TMP, "corrupt-tid.perfetto-trace"))
+
+
 # ---- inversion inference ---------------------------------------------------------------
 def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, other_prio=None, after_receive=True,
                chan_flags=0x1, sibling=False, gen=False, server_policy=2, replier=S):
@@ -1176,20 +1219,6 @@ def test_server_time_is_credited_once():
     # cps 1e9: s1 runs 60 ns while it holds only X (T+120..160 and T+300..320), 80 ns holding both
     # (credited once), 100 ns while it holds only Y
     assert got == {"client/c": 0.06, SEVERAL: 0.08, "other/b": 0.1}
-
-if __name__ == "__main__":
-    failed = 0
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            try:
-                fn()
-                print("ok", name)
-            except Exception as e:   # report every failure, then exit nonzero
-                failed += 1
-                import traceback
-                traceback.print_exc()
-                print("FAIL", name, e)
-    sys.exit(1 if failed else 0)
 
 
 # ---- third review (v0.1b): counterexamples -----------------------------------------------------------
@@ -2068,3 +2097,18 @@ def test_unfinished_means_still_open_at_trace_end():
     a = build_parser().parse_args(["check", "x.kev", "--max-latency", "client/c=1000000", "--allow-loss"])
     (_, lat) = run_checks(m, Timeline(m), a)
     assert lat.ok and "1 excluded as untrustworthy, 1 unfinished" in lat.summary, lat.summary
+
+
+if __name__ == "__main__":
+    failed = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            try:
+                fn()
+                print("ok", name)
+            except Exception as e:   # report every failure, then exit nonzero
+                failed += 1
+                import traceback
+                traceback.print_exc()
+                print("FAIL", name, e)
+    sys.exit(1 if failed else 0)

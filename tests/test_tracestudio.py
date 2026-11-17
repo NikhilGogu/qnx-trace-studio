@@ -483,6 +483,13 @@ def test_validate_all_summarises_every_capture():
         with contextlib.redirect_stdout(io.StringIO()) as out:
             assert validate_all([DATA]) == 1
         assert out.getvalue().startswith("error: traceprinter not on PATH")
+    # run_scenarios.sh leaves an empty NAME.logs for scenarios without workload logs (rm_small, rm_traffic)
+    d = os.path.join(TMP, "empty-logs")
+    os.makedirs(os.path.join(d, "rm_small.logs"), exist_ok=True)
+    shutil.copy(os.path.join(DATA3, "rm_small.kev.gz"), d)
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        assert validate_all([d, "--skip-traceprinter"]) == 0, out.getvalue()
+    assert out.getvalue().splitlines() == ["1 captures, all checks passed"], out.getvalue()
 
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
