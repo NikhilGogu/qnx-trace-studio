@@ -25,17 +25,23 @@
  * that receives a request runs before other ready threads of its priority, so
  * with lo at the pool's priority 10 lo2 sends only after lo's request is done.
  * With -L 11 every lo thread sends before a fixed-priority pool runs.
+ * -L P1,P2,... gives lo, lo2, ... their own priorities; the last one repeats.
+ * -s US starts lo thread j at j * US after lo (default 0). The pool scenarios
+ * use -L 11,12 -s 1000: lo2 wakes one clock tick after lo and preempts the
+ * receive thread that runs lo's request, also when that thread inherited
+ * lo's 11, so both receive threads are busy when hi sends. With -s 500 both
+ * woke on the same tick and lo2 ran first.
  *
  * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi] [-k lo_threads]
- *                 [-L lo_prio]
+ *                 [-L lo_prio[,lo2_prio...]] [-s lo_step_us]
  */
 #include "common.h"
 
 #define TS_MAX_LO 7
 
-static int nper = 20, nlo = 1, lo_prio = 10;
+static int nper = 20, nlo = 1, nlo_prio = 1, lo_prio[TS_MAX_LO] = { 10 };
 static unsigned period_us = 25000, lo_us = 4000, hog_us = 10000, hi_us = 500, dl_us = 5000;
-static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000;
+static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000, lo_step_us = 0;
 static struct timespec t_base;
 static int srv_pid, srv_chid;
 static pthread_barrier_t bar;
@@ -97,7 +103,7 @@ static void *worker(void *arg)
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:L:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:L:s:")) != -1) {
         switch (opt) {
         case 'n': nper = atoi(optarg); break;
         case 'P': period_us = (unsigned)atoi(optarg); break;
@@ -111,17 +117,31 @@ int main(int argc, char **argv)
             }
             break;
         case 'k': nlo = atoi(optarg); break;
-        case 'L': lo_prio = atoi(optarg); break;
+        case 'L': {
+            char *p = optarg;
+            for (nlo_prio = 0; nlo_prio < TS_MAX_LO && *p; nlo_prio++) {
+                lo_prio[nlo_prio] = (int)strtol(p, &p, 10);
+                if (*p == ',')
+                    p++;
+            }
+            if (*p || nlo_prio == 0) {
+                fprintf(stderr, "-L wants PRIO or PRIO,PRIO,... (at most %d)\n", TS_MAX_LO);
+                return 2;
+            }
+            break;
+        }
+        case 's': lo_step_us = (unsigned)atoi(optarg); break;
         }
     }
     if (nlo < 1 || nlo > TS_MAX_LO || (nlo > 1 && nper > 100)) {
         fprintf(stderr, "-k wants 1 to %d lo threads, and -n 100 or less with more than one\n", TS_MAX_LO);
         return 2;
     }
-    if (lo_prio < 1 || lo_prio > 19) {
-        fprintf(stderr, "-L wants a lo priority from 1 to 19, below the hog's 20\n");
-        return 2;
-    }
+    for (int j = 0; j < nlo_prio; j++)
+        if (lo_prio[j] < 1 || lo_prio[j] > 19) {
+            fprintf(stderr, "-L wants lo priorities from 1 to 19, below the hog's 20\n");
+            return 2;
+        }
     ts_role = "pload";
     ts_pin_cpu0();
     ts_set_prio(SCHED_FIFO, 40);
@@ -131,7 +151,8 @@ int main(int argc, char **argv)
     spec_t sp[TS_MAX_LO + 2];
     int nth = 0;
     for (int j = 0; j < nlo; j++, nth++) {
-        sp[nth] = (spec_t){ "lo", lo_prio, off_lo, lo_us, 0, j };
+        int prio = lo_prio[j < nlo_prio ? j : nlo_prio - 1];
+        sp[nth] = (spec_t){ "lo", prio, off_lo + (unsigned)j * lo_step_us, lo_us, 0, j };
         if (j)
             snprintf(sp[nth].name, sizeof sp[nth].name, "lo%d", j + 1);
     }
