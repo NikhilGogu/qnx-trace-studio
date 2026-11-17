@@ -464,6 +464,33 @@ def test_pulse_queue_loses_sync_at_a_loss():
     assert [p.match for p in m.pulses] == ["unsynced", "unique", "unsynced"]
 
 
+def test_pulse_handed_to_a_waiting_receiver_stays_matched_when_another_receiver_blocks():
+    """MsgSendPulse wakes s2, which waits in MsgReceive on the channel; s1 then blocks in MsgReceive on the same
+    channel before s2 runs. The pulse is already s2's, so s1's block must not mark it unseen (seen on ipc_wide)."""
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.buffer(1, T)
+    g.names(0, T, NAMES)
+    g.state(0, T, RUNNING, S, 10)
+    g.kcall(0, T + 1, K_RECEIVEV, [1, 1])
+    g.state(1, T + 10, RUNNING, C, 10)
+    g.pulse(1, T + 20, C, S[0], 0x10001, 0)
+    receive_pulse(g, 0, T + 100, S, 0x10001, block=False)       # s1 learns the scoid's channel
+    g.state(1, T + 200, RUNNING, S2, 10)
+    g.wait_receive(1, T + 210, S2, 10)                          # s2 waits on the channel: queue in sync
+    g.state(1, T + 300, RUNNING, C, 10)
+    g.kcall(1, T + 310, K_PULSE, [0x40000001, 10, 5, 7])
+    g.state(1, T + 315, READY, S2, 10)                          # the kernel hands the pulse to s2
+    g.comm(1, T + 320, SPULSE, 0x10001, S[0])
+    g.kcall(1, T + 325, K_PULSE, [0], EXIT)
+    g.wait_receive(0, T + 400, S, 10)                           # s1 blocks on the channel before s2 runs
+    receive_pulse(g, 1, T + 500, S2, 0x10001)
+    _, m = model(g)
+    p0, p1 = m.pulses
+    assert (p1.match, p1.sender, p1.receiver, p1.value) == ("unique", C, S2, 7), (p1.match, p1.receiver)
+    assert not m.counters.get("pulse_receive_unseen") and not m.counters.get("pulse_recv_without_send")
+
+
 # ---- inversion inference ---------------------------------------------------------------
 def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, other_prio=None, after_receive=True,
                chan_flags=0x1, sibling=False, gen=False, server_policy=2, replier=S):
