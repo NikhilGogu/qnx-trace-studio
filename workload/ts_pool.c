@@ -67,6 +67,7 @@ static void *sleeper(void *arg)
     ts_set_prio(SCHED_FIFO, 10);
     for (;;)
         usleep(100000);
+    return NULL;
 }
 
 int main(int argc, char **argv)
