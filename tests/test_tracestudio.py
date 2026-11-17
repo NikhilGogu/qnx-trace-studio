@@ -26,6 +26,7 @@ DATA = os.path.join(HERE, "data", "run1")
 DATA3 = os.path.join(HERE, "data", "run3")
 DATA4 = os.path.join(HERE, "data", "run4")
 DATA5 = os.path.join(HERE, "data", "run5")
+DATA6 = os.path.join(HERE, "data", "run6")      # thread-pool captures (workload/ts_pool.c), not captured yet
 TMP = tempfile.mkdtemp(prefix="ts-test-")
 SCEN = ["ipc_wide", "ipc_fast", "prio_inherit", "prio_fixed"]
 
@@ -490,6 +491,23 @@ def test_validate_all_summarises_every_capture():
     with contextlib.redirect_stdout(io.StringIO()) as out:
         assert validate_all([d, "--skip-traceprinter"]) == 0, out.getvalue()
     assert out.getvalue().splitlines() == ["1 captures, all checks passed"], out.getvalue()
+
+
+def test_pool_capture_when_present():
+    """pool_fixed (workload/run_scenarios.sh): both receive threads busy with lo's and lo2's requests when hi
+    sends, all READY at 10 behind the hog. Expected: every hi request a suspected SEND-phase inversion that names
+    both receive threads, and every logged request matched. Skipped until the capture is checked in."""
+    if not os.path.exists(os.path.join(DATA6, "pool_fixed.kev.gz")):
+        print("skip: tests/data/run6/pool_fixed.kev.gz not captured yet")
+        return
+    m = Model(KevFile(kev("pool_fixed", DATA6)))
+    res, _, _ = validate(m, os.path.join(DATA6, "pool_fixed.logs"))
+    assert res["ok"] and res["matched"] == res["requests"] == 60, res["examples"]
+    sus = suspected_inversions(m)["suspected"]
+    hi = [x for x in sus if x["client"].endswith("/hi")]
+    assert len(hi) == 20 and all(x["while"].get("SEND", 0) > 0 for x in hi), hi[:1]
+    assert all({r["thread"].split("/")[1] for r in x["receivers"]} >= {"pool-rx0", "pool-rx1"} for x in hi)
+    assert all(x["preempted_by"][0]["thread"].endswith("/hog") for x in hi)
 
 def test_fault_injection_never_links_wrong():
     k = KevFile(kev("ipc_wide"))
