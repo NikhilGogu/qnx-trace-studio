@@ -16,15 +16,21 @@
  * handles hi's request (inversion after the receive).
  * -k K starts K lo threads (lo, lo2, ...) at the same offset, so K threads of
  * a thread-pool server (ts_pool) are busy when hi sends. Request ids stay
- * unique: lo thread j uses 10000 + 100 * j + period, so -k needs -n 100 or less.
+ * unique: lo thread j uses 1000 * prio + 100 * j + period, so -k needs -n 100
+ * or less.
+ * -L PRIO runs the lo threads at PRIO (1 to 19, default 10). A server thread
+ * that receives a request runs before other ready threads of its priority, so
+ * with lo at the pool's priority 10 lo2 sends only after lo's request is done.
+ * With -L 11 every lo thread sends before a fixed-priority pool runs.
  *
  * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi] [-k lo_threads]
+ *                 [-L lo_prio]
  */
 #include "common.h"
 
 #define TS_MAX_LO 7
 
-static int nper = 20, nlo = 1;
+static int nper = 20, nlo = 1, lo_prio = 10;
 static unsigned period_us = 25000, lo_us = 4000, hog_us = 10000, hi_us = 500, dl_us = 5000;
 static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000;
 static struct timespec t_base;
@@ -88,7 +94,7 @@ static void *worker(void *arg)
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:L:")) != -1) {
         switch (opt) {
         case 'n': nper = atoi(optarg); break;
         case 'P': period_us = (unsigned)atoi(optarg); break;
@@ -102,10 +108,15 @@ int main(int argc, char **argv)
             }
             break;
         case 'k': nlo = atoi(optarg); break;
+        case 'L': lo_prio = atoi(optarg); break;
         }
     }
     if (nlo < 1 || nlo > TS_MAX_LO || (nlo > 1 && nper > 100)) {
         fprintf(stderr, "-k wants 1 to %d lo threads, and -n 100 or less with more than one\n", TS_MAX_LO);
+        return 2;
+    }
+    if (lo_prio < 1 || lo_prio > 19) {
+        fprintf(stderr, "-L wants a lo priority from 1 to 19, below the hog's 20\n");
         return 2;
     }
     ts_role = "pload";
@@ -117,7 +128,7 @@ int main(int argc, char **argv)
     spec_t sp[TS_MAX_LO + 2];
     int nth = 0;
     for (int j = 0; j < nlo; j++, nth++) {
-        sp[nth] = (spec_t){ "lo", 10, off_lo, lo_us, 0, j };
+        sp[nth] = (spec_t){ "lo", lo_prio, off_lo, lo_us, 0, j };
         if (j)
             snprintf(sp[nth].name, sizeof sp[nth].name, "lo%d", j + 1);
     }

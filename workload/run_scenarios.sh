@@ -109,8 +109,8 @@ for s in $SCEN; do
     mutex_chain_nopi) run_mutex mutex_chain_nopi "-g -N" ;;
     prio_inherit_rx) run_prio prio_inherit_rx "" "-l 500 -o 0,4200,4000" ;;
     prio_fixed_rx)   run_prio prio_fixed_rx -f "-l 500 -o 0,4200,4000" ;;
-    pool_fixed)   run_pool pool_fixed "-f -n 2 -a" "-k 2" ;;
-    pool_inherit) run_pool pool_inherit "-n 2 -a" "-k 2" ;;
+    pool_fixed)   run_pool pool_fixed "-f -n 2 -a" "-k 2 -L 11" ;;
+    pool_inherit) run_pool pool_inherit "-n 2 -a" "-k 2 -L 11" ;;
     cancel)       run_cancel ;;
     rm_traffic)   run_rm ;;
     rm_small)     run_rm_small ;;
