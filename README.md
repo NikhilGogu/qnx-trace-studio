@@ -432,7 +432,7 @@ The JUnit report of the failing run starts like this:
       <failure message="20 of 20 trustworthy requests over 5000 us, max 11096.0 us; matched ..." type="DeadlineMissed">
 ```
 
-Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. The workload's own measurement (11112 us) is about 15 us longer than the traced MsgSend.
+Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. `--client ts_pload/` can fail the same way: on a fresh `prio_inherit_rx` capture, a request from ts_pload's main thread to procnto was handed off inside procnto. To gate on hi alone, use `--client ts_pload/hi`. The workload's own measurement (11112 us) is about 15 us longer than the traced MsgSend.
 
 ## Use from a coding agent
 

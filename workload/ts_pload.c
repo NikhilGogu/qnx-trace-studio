@@ -11,9 +11,12 @@
  * finishes lo's request ahead of the hog; with a fixed-priority channel
  * (ts_psrv -f) the hog runs first and hi misses its deadline.
  * At exit it prints how many of hi's requests missed the deadline.
- * -o LO,HOG,HI moves the three start offsets (us); for example -o 0,4200,4000
+ * -o LO,HOG,HI moves the three start offsets (us); for example -o 0,4000,4000
  * with a short lo request makes the hog preempt the server while it already
- * handles hi's request (inversion after the receive).
+ * handles hi's request (inversion after the receive). hi and the hog wake at
+ * the same time and hi runs first, so hi's request reaches the server before
+ * the hog runs. With the hog 200 us after hi, as before, it depended on the
+ * clock tick whether both woke on the same tick.
  *
  * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi]
  */

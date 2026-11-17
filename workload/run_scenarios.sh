@@ -97,8 +97,8 @@ for s in $SCEN; do
     mutex_chain)     run_mutex mutex_chain ;;
     mutex_chain_hog) run_mutex mutex_chain_hog -g ;;
     mutex_chain_nopi) run_mutex mutex_chain_nopi "-g -N" ;;
-    prio_inherit_rx) run_prio prio_inherit_rx "" "-l 500 -o 0,4200,4000" ;;
-    prio_fixed_rx)   run_prio prio_fixed_rx -f "-l 500 -o 0,4200,4000" ;;
+    prio_inherit_rx) run_prio prio_inherit_rx "" "-l 500 -o 0,4000,4000" ;;
+    prio_fixed_rx)   run_prio prio_fixed_rx -f "-l 500 -o 0,4000,4000" ;;
     cancel)       run_cancel ;;
     rm_traffic)   run_rm ;;
     rm_small)     run_rm_small ;;

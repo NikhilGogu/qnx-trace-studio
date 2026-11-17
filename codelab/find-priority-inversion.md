@@ -536,10 +536,12 @@ The deadline misses went from 20 of 20 to 0 of 20, the suspected inversions from
 
 ```bash
 venv/bin/tracestudio check fixed.kev --deadline hi@ts_psrv=5000 \
-    --no-inversions --client ts_pload/
+    --no-inversions --client ts_pload/hi
 venv/bin/tracestudio check inherit.kev --deadline hi@ts_psrv=5000 \
-    --no-inversions --client ts_pload/
+    --no-inversions --client ts_pload/hi
 ```
+
+`--client ts_pload/hi` limits the inversion check to hi. With `--client ts_pload/` it also covers ts_pload's main thread. In some captures that thread has a request that procnto received on one thread and replied to on another. That request counts as insufficient evidence, and the check of `inherit.kev` then fails although hi met every deadline.
 
 On the traces in the repository, the first command prints `PASS` for the trace integrity and `FAIL` for the deadline and the inversion assertions (`check: 3 assertions, 2 failed`) and exits with status 1. The second prints three `PASS` lines and exits with status 0.
 
