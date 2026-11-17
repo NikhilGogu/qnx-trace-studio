@@ -1204,20 +1204,6 @@ def test_server_time_is_credited_once():
     # (credited once), 100 ns while it holds only Y
     assert got == {"client/c": 0.06, SEVERAL: 0.08, "other/b": 0.1}
 
-if __name__ == "__main__":
-    failed = 0
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            try:
-                fn()
-                print("ok", name)
-            except Exception as e:   # report every failure, then exit nonzero
-                failed += 1
-                import traceback
-                traceback.print_exc()
-                print("FAIL", name, e)
-    sys.exit(1 if failed else 0)
-
 
 # ---- third review (v0.1b): counterexamples -----------------------------------------------------------
 def test_initial_buffer_loss_converts():
@@ -2095,3 +2081,18 @@ def test_unfinished_means_still_open_at_trace_end():
     a = build_parser().parse_args(["check", "x.kev", "--max-latency", "client/c=1000000", "--allow-loss"])
     (_, lat) = run_checks(m, Timeline(m), a)
     assert lat.ok and "1 excluded as untrustworthy, 1 unfinished" in lat.summary, lat.summary
+
+
+if __name__ == "__main__":
+    failed = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            try:
+                fn()
+                print("ok", name)
+            except Exception as e:   # report every failure, then exit nonzero
+                failed += 1
+                import traceback
+                traceback.print_exc()
+                print("FAIL", name, e)
+    sys.exit(1 if failed else 0)
