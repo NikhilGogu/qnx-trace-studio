@@ -369,7 +369,7 @@ The `action-selftest` job in `.github/workflows/test.yml` runs the action on `pr
 
 ```
 source ~/qnx800/qnxsdp-env.sh
-make -C ~/work/trace-studio/workload                    # qcc -Vgcc_ntox86_64 ... -o build/x86_64/ts_* (6 programs)
+make -C ~/work/trace-studio/workload                    # qcc -Vgcc_ntox86_64 ... -o build/x86_64/ts_* (9 programs)
 python3 -m venv ~/work/ts-ci/prio_fixed/venv
 ~/work/ts-ci/prio_fixed/venv/bin/pip install -q ~/work/trace-studio
 cd ~/work/ts-ci/prio_fixed/target
