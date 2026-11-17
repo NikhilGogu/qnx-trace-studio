@@ -102,7 +102,7 @@ class TidMap:
         if v is None:
             pid, tid = key
             v = pid * 100 + tid
-            if tid >= 100 or v >= (1 << 31) - (1 << 20):
+            if pid < 0 or not 0 <= tid < 100 or v >= (1 << 31) - (1 << 20):   # a corrupt event can carry any id
                 v = self.next
                 self.next += 1
             self.map[key] = v

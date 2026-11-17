@@ -491,6 +491,22 @@ def test_pulse_handed_to_a_waiting_receiver_stays_matched_when_another_receiver_
     assert not m.counters.get("pulse_receive_unseen") and not m.counters.get("pulse_recv_without_send")
 
 
+def test_convert_survives_a_corrupt_thread_id():
+    """A corrupted copy of a real capture gave a thread event with a negative pid, and convert failed with
+    ValueError from protobuf (pid * 100 + tid does not fit a Perfetto tid)."""
+    from tracestudio.perfetto_out import write
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.state(0, T + 20, READY, (0x83180018, 0xFFFFFF07), 10)     # decodes as pid -2095579112, tid -249
+    g.state(0, T + 30, RUNNING, (0x83180018, 0xFFFFFF07), 10)
+    g.state(0, T + 40, RUNNING, C, 10)
+    _, m = model(g)
+    assert any(k[0] < 0 for k in m.threads), sorted(m.threads)
+    write(m, os.path.join(TMP, "corrupt-tid.perfetto-trace"))
+
+
 # ---- inversion inference ---------------------------------------------------------------
 def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, other_prio=None, after_receive=True,
                chan_flags=0x1, sibling=False, gen=False, server_policy=2, replier=S):
