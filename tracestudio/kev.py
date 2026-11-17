@@ -177,7 +177,10 @@ class KevFile:
         if not self.attrs.get("CYCLES_PER_SEC"):
             raise KevError("header has no TRACE_CYCLES_PER_SEC")
         self.cycles_per_sec = _header_int(self.attrs, "CYCLES_PER_SEC", "0", 1)
-        self.ncpu = _header_int(self.attrs, "CPU_NUM", "1", 1, MAX_CPUS)
+        if not self.attrs.get("CPU_NUM"):
+            # the CPU count bounds the run-mask reasoning of the inversion analysis, so it is not guessed
+            raise KevError("header has no TRACE_CPU_NUM (the number of CPUs)")
+        self.ncpu = _header_int(self.attrs, "CPU_NUM", "0", 1, MAX_CPUS)
         self.version = (_header_int(self.attrs, "VER_MAJOR", "0", 0), _header_int(self.attrs, "VER_MINOR", "0", 0))
         self.stats = KevStats()
         self._losses: list[Loss] = []

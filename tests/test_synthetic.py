@@ -2019,7 +2019,8 @@ def test_owner_at_or_above_the_client_is_no_inversion():
 
 
 def test_malformed_traces_fail_check_with_a_trace_error():
-    """Every malformed header field, a bad system page length and corrupt, truncated or oversized gzip data give
+    """Every malformed header field, a missing CPU count, a bad system page length and corrupt, truncated or
+    oversized gzip data give
     exit status 1 and a JUnit report with a TraceError naming the problem, replacing any older report."""
     import gzip
     import re
@@ -2034,7 +2035,9 @@ def test_malformed_traces_fail_check_with_a_trace_error():
         return re.sub(rb"TRACE_%s::[^T]*" % key.encode(), b"TRACE_%s::%s" % (key.encode(), value.encode()), good)
     big = gzip.compress(good + bytes(1 << 20))
     cases = [("CYCLES_PER_SEC", field("CYCLES_PER_SEC", "abc"), {}), ("CPU_NUM", field("CPU_NUM", "x"), {}),
-             ("CPU_NUM", field("CPU_NUM", "0"), {}), ("VER_MAJOR", field("VER_MAJOR", "?"), {}),
+             ("CPU_NUM", field("CPU_NUM", "0"), {}), ("CPU_NUM", field("CPU_NUM", ""), {}),
+             ("CPU_NUM", good.replace(b"TRACE_CPU_NUM::", b"TRACE_CPU_NUX::", 1), {}),   # renamed key
+             ("VER_MAJOR", field("VER_MAJOR", "?"), {}),
              ("SYSPAGE_LEN", field("SYSPAGE_LEN", "-32"), {}), ("SYSPAGE_LEN", field("SYSPAGE_LEN", "99999"), {}),
              ("corrupt gzip", gzip.compress(good)[:10] + b"\xff" * 40, {}),
              ("corrupt gzip", gzip.compress(good)[:-20], {}),
