@@ -507,6 +507,24 @@ def test_convert_survives_a_corrupt_thread_id():
     write(m, os.path.join(TMP, "corrupt-tid.perfetto-trace"))
 
 
+def test_convert_reports_an_event_before_cycle_zero():
+    """A cut in the event data of a real capture left a TIME event near cycle 0, so a later slot was placed at a
+    negative timestamp, and convert failed with ValueError from protobuf. It now exits 1 and names the problem."""
+    import contextlib
+    from tracestudio.cli import main
+    g = Gen(ncpu=1)
+    g.buffer(0, 100)                                                    # TIME at cycle 100
+    g.event(0, 0, C_PRTH, RUNNING, [C[0], C[1], 10, 2], lsb=0xFFFFFF00)  # 256 cycles before cycle 0
+    path = os.path.join(TMP, "before-zero.kev")
+    with open(path, "wb") as f:
+        f.write(g.bytes())
+    assert min(e.ts for e in KevFile(path).events()) < 0
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        assert main(["convert", path, "-o", path + ".perfetto-trace"]) == 1
+    assert "before clock cycle 0" in err.getvalue(), err.getvalue()
+
+
 # ---- inversion inference ---------------------------------------------------------------
 def prio_scene(server_mask, preemptor, preemptor_prio, other_cpu_thread=None, other_prio=None, after_receive=True,
                chan_flags=0x1, sibling=False, gen=False, server_policy=2, replier=S):
