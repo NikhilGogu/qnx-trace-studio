@@ -9,7 +9,14 @@
 #            mutex_chain, mutex_chain_hog (a mutex owner REPLY-blocked on another server; with a hog at 20),
 #            mutex_chain_nopi (as mutex_chain_hog with PTHREAD_PRIO_NONE: no mutex priority inheritance),
 #            pool_fixed, pool_inherit (a two-thread server pool, both threads busy when hi sends; with
-#            inheritance a busy thread runs at hi's priority and hi is served in time)
+#            inheritance a busy thread runs at hi's priority and hi is served in time),
+#            seeded regressions for tools/seeded_regressions.py, each a healthy parent with one change:
+#            prio_inherit_late (lo 6 ms, hog 1 ms after hi sends; healthy), prio_hog_high (hog raised to 35,
+#            above hi), prio_hi_low (hi lowered to 15, below the hog), mutex_chain_slowfixed (ts_mslow's channel
+#            fixed-priority), pool_wide (one fixed-priority receiver that may use CPU 0 and 1; healthy),
+#            pool_narrow (its run mask narrowed to CPU 0), pool_long (two inheriting receivers, lo asks for 9 ms;
+#            healthy), pool_long_one (the pool cut to one receiver), pool_long_fixed (the pool's channel
+#            fixed-priority)
 B=${1:-/tmp/ts/bin}
 O=${2:-/tmp/ts/out}
 shift 2
@@ -53,10 +60,10 @@ run_prio() {      # <name> <psrv-flag> [ts_pload options]
     finish $1
 }
 
-run_mutex() {     # <name> [ts_mutex options]
+run_mutex() {     # <name> [ts_mutex options] [ts_mslow options]
     rm -f /tmp/ts_mslow.addr
     start_trace $1 -w 4
-    "$B/ts_mslow" &
+    "$B/ts_mslow" $3 &
     sleep 1
     "$B/ts_mutex" -n 20 $2
     finish $1
@@ -112,6 +119,15 @@ for s in $SCEN; do
     prio_fixed_rx)   run_prio prio_fixed_rx -f "-l 500 -o 0,4000,4000" ;;
     pool_fixed)   run_pool pool_fixed "-f -n 2 -a" "-k 2 -L 11,12 -s 1000" ;;
     pool_inherit) run_pool pool_inherit "-n 2 -a" "-k 2 -L 11,12 -s 1000" ;;
+    prio_inherit_late) run_prio prio_inherit_late "" "-l 6000 -o 0,5000,4000" ;;
+    prio_hog_high)     run_prio prio_hog_high "" "-l 6000 -o 0,5000,4000 -H 35" ;;
+    prio_hi_low)       run_prio prio_hi_low "" "-l 6000 -o 0,5000,4000 -I 15" ;;
+    mutex_chain_slowfixed) run_mutex mutex_chain_slowfixed -g -f ;;
+    pool_wide)       run_pool pool_wide "-f -n 1 -c 0x3" "" ;;
+    pool_narrow)     run_pool pool_narrow "-f -n 1 -c 0x1" "" ;;
+    pool_long)       run_pool pool_long "-n 2 -a" "-l 9000" ;;
+    pool_long_one)   run_pool pool_long_one "-n 1 -a" "-l 9000" ;;
+    pool_long_fixed) run_pool pool_long_fixed "-f -n 2 -a" "-l 9000" ;;
     cancel)       run_cancel ;;
     rm_traffic)   run_rm ;;
     rm_small)     run_rm_small ;;

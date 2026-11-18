@@ -1,18 +1,20 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* ts_mslow: a server that burns -w microseconds of CPU per request at priority 10 on CPU 0 (the "C" of the
- * mutex scenario: ts_mutex's holder thread sends to it while it owns the mutex). */
+ * mutex scenario: ts_mutex's holder thread sends to it while it owns the mutex). With -f its channel has
+ * _NTO_CHF_FIXED_PRIORITY, so slow-rx stays at 10 even when the holder's priority was raised. */
 #include "common.h"
 
 int main(int argc, char **argv)
 {
-    int opt;
+    int opt, fixed = 0;
     ts_role = "mslow";
-    while ((opt = getopt(argc, argv, "")) != -1) {}
+    while ((opt = getopt(argc, argv, "f")) != -1)
+        if (opt == 'f') fixed = 1;
     ts_pin_cpu0();
     ts_set_prio(SCHED_FIFO, 10);
     ts_calibrate();
     pthread_setname_np(pthread_self(), "slow-rx");
-    int chid = ChannelCreate(0);
+    int chid = ChannelCreate(fixed ? _NTO_CHF_FIXED_PRIORITY : 0);
     if (chid == -1) { perror("ChannelCreate"); return 1; }
     ts_write_addr("/tmp/ts_mslow.addr", chid);
     for (;;) {
