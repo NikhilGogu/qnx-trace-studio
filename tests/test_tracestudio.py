@@ -543,6 +543,25 @@ def test_fault_injection_never_links_wrong():
     assert res["matched"] < res["requests"] == 200 and not res["ok"]
 
 
+def test_loss_injection_verdicts_never_wrong():
+    # one damaged copy of each detectable kind on two captures (tools/loss_injection.py runs the full set): every
+    # loss is reported, check fails on it, and no inversion verdict, mutex owner or validate link check is wrong.
+    # Links are counted, not asserted: the full run finds wrong parent links and exits next to lost events
+    # (docs/VALIDATION.md, "Loss injection").
+    import loss_injection as li
+    rows = []
+    for name in ("run1/ipc_wide", "run4/mutex_chain_nopi"):
+        base = os.path.join(HERE, "data", name)
+        rows += li.run_capture(name, base + ".kev.gz", base + ".logs", 1, li.DETECTABLE, TMP)
+    assert [r["kind"] for r in rows] == list(li.DETECTABLE) * 2 and not any(r.get("skipped") for r in rows)
+    assert all(r["detected"] and r["check_exit"] == 1 for r in rows), [(r["kind"], r.get("losses")) for r in rows]
+    total, _ = li.summarise(rows)
+    verdicts = ("wrong_inversion", "missed_inversion", "wrong_owner", "validate_wrong", "check_passed_with_loss",
+                "crashes")
+    assert not any(total.get(f) for f in verdicts), [(r["kind"], r["examples"]) for r in rows if r.get("examples")]
+    assert total["trusted"] > 0 and total["owners"] > 0 and total["suspected"] > 0
+
+
 
 def test_check_fails_prio_fixed_and_passes_prio_inherit():
     import contextlib
