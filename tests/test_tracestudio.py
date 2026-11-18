@@ -562,6 +562,33 @@ def test_loss_injection_verdicts_never_wrong():
     assert total["trusted"] > 0 and total["owners"] > 0 and total["suspected"] > 0
 
 
+def test_cut_trace_does_not_link_a_later_exit():
+    # Damaged copies where one CPU's last events are gone (tools/loss_injection.py). Before the fix, an exchange
+    # whose MsgSendv exit was in the missing tail got a later exit seen on the other CPU and stayed trustworthy.
+    # drop_tail and truncate_at_buffer leave no mark in the file. truncate_mid_slot marks loss on the cut CPU
+    # only; in the ipc_wide copy the cut comes before CPU 0's first buffer, so CPU 0 has no event at all.
+    import random
+    import loss_injection as li
+    trusted = 0
+    for name, kind, seed in (("run1/ipc_fast", "drop_tail", 1), ("run1/prio_inherit", "truncate_at_buffer", 0),
+                             ("run1/prio_fixed", "truncate_mid_slot", 9), ("run1/ipc_wide", "truncate_mid_slot", 0)):
+        src = os.path.join(TMP, "cut-ref.kev")
+        with gzip.open(os.path.join(HERE, "data", name + ".kev.gz")) as f, open(src, "wb") as g:
+            g.write(f.read())
+        kf = KevFile(src)
+        ref = li.answers(Model(kf))
+        data, _ = li.damage(kf, kind, random.Random("%s/%s/%d" % (name, kind, seed)))
+        path = os.path.join(TMP, "cut.kev")
+        with open(path, "wb") as f:
+            f.write(data)
+        dm = Model(KevFile(path))
+        counts, examples = li.compare(ref, li.answers(dm))
+        assert not counts.get("wrong_link"), (name, kind, examples)
+        assert any(w.startswith(("ends after the last event traced on cpu", "no event traced on cpu"))
+                   for t in dm.txns for w in t.warnings), (name, kind)
+        trusted += counts["trusted"]
+    assert trusted > 0
+
 
 def test_check_fails_prio_fixed_and_passes_prio_inherit():
     import contextlib

@@ -185,6 +185,14 @@ class KevFile:
         self.stats = KevStats()
         self._losses: list[Loss] = []
         self._events = None
+        # CPUs whose last buffer in the file is full. tracelogger ends a capture by writing every CPU's partly
+        # filled buffer, so a full last buffer means that CPU's last events may be missing from the file (cut
+        # at a buffer boundary, or its last buffers dropped). A buffer is closed when the next event does not
+        # fit, so full buffers vary by a few slots; a last buffer counts as full when it holds no fewer slots
+        # than the smallest and no more than the largest buffer that another buffer of the same CPU follows
+        # (more than the largest would show those sizes do not give the capacity). With no such buffer the set
+        # stays empty.
+        self.full_last_buffers: set[int] = set()
 
     # ---- header -----------------------------------------------------------
     @staticmethod
@@ -253,6 +261,11 @@ class KevFile:
         for n, (a, b, cpu, want) in enumerate(table):
             tail_cut = n == len(table) - 1 and st.trailing_bytes and b - a == want - 1
             bad.append(b - a != want and not tail_cut)
+        last = {cpu: n for n, (_a, _b, cpu, _w) in enumerate(table)}
+        closed = [w for n, (a, b, cpu, w) in enumerate(table) if last[cpu] != n and b - a == w]
+        if closed:
+            self.full_last_buffers = {cpu for cpu, n in last.items()
+                                      if min(closed) <= table[n][3] <= max(closed) and table[n][1] - table[n][0] == table[n][3]}
         anchor = {}      # cpu -> full timestamp of the latest TIME event on that cpu
         last_any = None  # latest anchor of any cpu, for slots before their own cpu's first TIME
         latest = {}      # cpu -> latest timestamp seen on that cpu
