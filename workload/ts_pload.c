@@ -31,9 +31,12 @@
  * receive thread that runs lo's request, also when that thread inherited
  * lo's 11, so both receive threads are busy when hi sends. With -s 500 both
  * woke on the same tick and lo2 ran first.
+ * -H PRIO runs the hog at PRIO (default 20) and -I PRIO runs hi at PRIO
+ * (default 30). The seeded regressions use them: a hog raised above hi, or hi
+ * lowered below the hog. hi's request ids follow its priority.
  *
  * usage: ts_pload [-n periods] [-P period_us] [-l lo_us] [-m hog_us] [-d dl_us] [-o lo,hog,hi] [-k lo_threads]
- *                 [-L lo_prio[,lo2_prio...]] [-s lo_step_us]
+ *                 [-L lo_prio[,lo2_prio...]] [-s lo_step_us] [-H hog_prio] [-I hi_prio]
  */
 #include "common.h"
 
@@ -42,6 +45,7 @@
 static int nper = 20, nlo = 1, nlo_prio = 1, lo_prio[TS_MAX_LO] = { 10 };
 static unsigned period_us = 25000, lo_us = 4000, hog_us = 10000, hi_us = 500, dl_us = 5000;
 static unsigned off_lo = 0, off_hog = 2000, off_hi = 4000, lo_step_us = 0;
+static int hog_prio = 20, hi_prio = 30;
 static struct timespec t_base;
 static int srv_pid, srv_chid;
 static pthread_barrier_t bar;
@@ -103,7 +107,7 @@ static void *worker(void *arg)
 int main(int argc, char **argv)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:L:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:P:l:m:d:o:k:L:s:H:I:")) != -1) {
         switch (opt) {
         case 'n': nper = atoi(optarg); break;
         case 'P': period_us = (unsigned)atoi(optarg); break;
@@ -131,6 +135,8 @@ int main(int argc, char **argv)
             break;
         }
         case 's': lo_step_us = (unsigned)atoi(optarg); break;
+        case 'H': hog_prio = atoi(optarg); break;
+        case 'I': hi_prio = atoi(optarg); break;
         }
     }
     if (nlo < 1 || nlo > TS_MAX_LO || (nlo > 1 && nper > 100)) {
@@ -142,6 +148,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "-L wants lo priorities from 1 to 19, below the hog's 20\n");
             return 2;
         }
+    if (hog_prio < 1 || hog_prio > 39 || hi_prio < 1 || hi_prio > 39) {
+        fprintf(stderr, "-H and -I want priorities from 1 to 39, below the main thread's 40\n");
+        return 2;
+    }
     ts_role = "pload";
     ts_pin_cpu0();
     ts_set_prio(SCHED_FIFO, 40);
@@ -156,8 +166,8 @@ int main(int argc, char **argv)
         if (j)
             snprintf(sp[nth].name, sizeof sp[nth].name, "lo%d", j + 1);
     }
-    sp[nth++] = (spec_t){ "hog", 20, off_hog, hog_us, 1, 0 };
-    sp[nth++] = (spec_t){ "hi", 30, off_hi, hi_us, 2, 0 };
+    sp[nth++] = (spec_t){ "hog", hog_prio, off_hog, hog_us, 1, 0 };
+    sp[nth++] = (spec_t){ "hi", hi_prio, off_hi, hi_us, 2, 0 };
     pthread_barrier_init(&bar, NULL, (unsigned)nth + 1);
     pthread_t th[TS_MAX_LO + 2];
     for (int i = 0; i < nth; i++) pthread_create(&th[i], NULL, worker, &sp[i]);

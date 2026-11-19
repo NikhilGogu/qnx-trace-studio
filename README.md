@@ -62,7 +62,7 @@ The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload tu
 
 | criterion | where to look |
 |---|---|
-| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 111 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
+| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 113 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
 | Design | The quickstart above runs on the checked-in captures without QNX. `check` gives an exit status and JUnit XML, and [action.yml](action.yml) runs it as a GitHub Action. `open` loads a trace in Perfetto with the right tracks pinned. [tools/build_examples.py](tools/build_examples.py) builds a page with every capture. [docs/JSON.md](docs/JSON.md) documents the JSON output |
 | Potential impact | Timing budgets and "no suspected inversion" as a CI gate for QNX message passing. The mutex owner chain in quickstart step 5, which is the more common case in real code. Verdicts for multi-threaded servers |
 | Innovation | Verdicts that carry their evidence, and "insufficient evidence" with reasons when the trace cannot support one. A critical path that crosses processes and follows mutex owners ([What trace-studio adds](#what-trace-studio-adds)). Perfetto SQL examples in [docs/sql](docs/sql). An agent skill in [skills/trace-studio](skills/trace-studio/SKILL.md) |
@@ -463,8 +463,10 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
-- 11 of the 20 captures are in `tests/data`, and `tests/data/run6` adds the two thread-pool captures. The test suite runs on all 13 and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository.
-- `python3 tests/test_tracestudio.py` runs 111 tests: 83 on synthetic slot streams, with a counterexample for each defect found in code review, and 28 on the checked-in captures, among them one that runs the quickstart commands above.
+- 11 of the 20 captures are in `tests/data`, and `tests/data/run6` adds the two thread-pool captures. The test suite runs on all 13 and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository. What can be reproduced: on the 13 checked-in captures, `tools/validate_all.py` finds 369,402 events identical to `traceprinter` and 1,097,066 argument values compared with 0 mismatches.
+- `python3 tests/test_tracestudio.py` runs 113 tests: 83 on synthetic slot streams, with a counterexample for each defect found in code review, and 30 on the checked-in captures, among them one that runs the quickstart commands above.
+- Seeded regressions on a QNX 8.0 target ([details](docs/VALIDATION.md#seeded-scheduling-regressions-qnx-target)): 10 planted scheduling bugs and 7 healthy controls, 3 captures each. A deadline-only gate failed all 30 bug captures and named no cause. trace-studio failed all 30 and named the expected cause in 30. It failed 1 of 21 control captures, where the gate allows no request with insufficient evidence.
+- Loss injection on the checked-in captures ([details](docs/VALIDATION.md#loss-injection-host-only)): 1,203 damaged copies. Every copy with visible damage reported loss and failed `check`. No wrong or missed inversion and no wrong mutex owner. No wrong link among the 793,417 exchanges still called trustworthy (144 before an end-of-trace fix on this branch).
 
 ## Limitations
 

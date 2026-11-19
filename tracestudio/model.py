@@ -93,6 +93,7 @@ NOT_BLOCKED = (None, ST_UNKNOWN, ST_RUNNING, ST_READY)
 BLOCKED_IPC = {"SEND", "RECEIVE", "REPLY"}
 UNKNOWN = (-1, 0)          # pseudo thread: what ran on a CPU is not known
 PROCNTO_PID = 1
+NESTED_UNCLEAR = "a nested request may be left unlinked (its server process handled a request whose events were lost)"
 INF = float("inf")
 _NTO_CHF_FIXED_PRIORITY = 0x1
 _NTO_CHF_INHERIT_RUNMASK = 0x4000
@@ -296,6 +297,18 @@ class Model:
         evs = kev.events()
         self.start_ts = evs[0].ts if evs else 0
         self.end_ts = evs[-1].ts if evs else 0
+        # cpu -> timestamp of its last event. After it, that CPU's events may not be in the file: a file cut at a
+        # buffer boundary, or one CPU's last buffers missing, leaves no loss record. An exchange that ends after
+        # any CPU's last event may have its real exit (or reply) in the missing tail and a later event linked
+        # in its place, so it is not trusted.
+        # Only when the file shows it may be cut: a loss that lasts to the end of the trace (truncation, a last
+        # buffer with the wrong slot count), or a CPU whose last buffer is full. Then a CPU of the header with no
+        # event at all counts as ending before the trace starts.
+        self.cpu_end = {}
+        if evs and (kev.full_last_buffers or any(l.t1 is None for l in kev.losses)):
+            self.cpu_end = {cpu: None for cpu in range(kev.ncpu)}
+            for e in evs:
+                self.cpu_end[e.cpu] = e.ts
         self._path_window = kev.cycles_per_sec // 100
         self._running = {}            # cpu -> thread key, UNKNOWN, or absent (nothing seen yet)
         self._where = {}              # thread key -> cpu it last ran on
@@ -304,6 +317,8 @@ class Model:
         self._by_client = {}          # client key -> open Txn
         self._by_rcvid = {}           # (server pid, rcvid) -> open Txn
         self._handling = defaultdict(list)   # server thread -> [Txn] received, not yet replied
+        self._unseen_requests = []           # (server pid, ts): a reply, in a trace with lost events, to a
+        #                                      request whose receive the trace does not hold
         self._replying = {}           # server thread -> Txn between MsgReplyv entry and exit
         self._pulse_q = defaultdict(deque)   # (server pid, scoid) -> sent, not yet received
         self._pulse_synced = set()    # pulse queues known to be in step with the channel
@@ -426,6 +441,26 @@ class Model:
             self._gap(*g)
         self._finish()
 
+    def _unlink_unseen_parents(self):
+        """A reply, in a trace with lost events, to a request whose receive the trace does not hold: some thread of
+        that server process received it in the lost events (not always the replying one). Between the first loss
+        and the reply, a request sent by any thread of that process may be nested in the unseen one, so its parent
+        link is dropped (kept as a candidate) and the linked parent is no longer trusted."""
+        if not self._unseen_requests:
+            return
+        first = min(w0 for lst in self.loss_windows.values() for w0, _ in lst)
+        for pid, tr in self._unseen_requests:
+            for tx in self.txns:
+                ts = tx.t_call if tx.t_call is not None else tx.t_smsg
+                if tx.client[0] != pid or tx.parent is None or ts is None or not first < ts < tr:
+                    continue
+                p = self.txns[tx.parent]
+                p.children.remove(tx.idx)
+                tx.parent, tx.parent_candidates = None, [p.idx]
+                self.counters["parents_unclear_after_loss"] += 1
+                if NESTED_UNCLEAR not in p.warnings:
+                    p.warnings.append(NESTED_UNCLEAR)
+
     def _finish(self):
         c = self.counters
         for tx in {id(t): t for t in list(self._by_client.values()) + list(self._by_rcvid.values())}.values():
@@ -439,6 +474,13 @@ class Model:
                     note = "spans lost events on cpu %d" % cpu
                     if note not in tx.warnings:
                         tx.warnings.append(note)
+            for cpu, last in self.cpu_end.items():
+                if tx.t_exit is not None and (last is None or last < tx.t_exit):
+                    note = ("ends after the last event traced on cpu %d" % cpu if last is not None
+                            else "no event traced on cpu %d" % cpu)
+                    if note not in tx.warnings:
+                        tx.warnings.append(note)
+        self._unlink_unseen_parents()
         c["wakeups_without_evidence"] += len(self._wake_msg) + len(self._wake_pulse)
         for w in self._mutex_call.values():          # still blocked when the trace ended
             if w.t_block is not None:
@@ -863,7 +905,11 @@ class Model:
         tx = self._by_rcvid.get((actor[0], a.get("rcvid")))
         if tx is None:
             self.counters["reply_without_txn"] += 1
+            if self.gaps:
+                self._unseen_requests.append((actor[0], ts))
             return
+        if tx.server is None and self.gaps:      # its receive is not in the trace: held unseen until now
+            self._unseen_requests.append((tx.server_pid, ts))
         tx.replier = actor
         tx.t_reply_call = ts
         if name == "MSG_ERROR":
@@ -956,6 +1002,12 @@ class Model:
         elif not ev.partial:
             self._send_pulse(actor, code, a["w1"], a["w0"], ev)
 
+    def _held_in_loss(self, tx, ts):
+        """The server thread held tx (received, not yet replied as far as the trace shows) at some time before ts
+        when events were lost on some CPU."""
+        a = tx.t_rmsg if tx.t_rmsg is not None else tx.t_smsg
+        return any(w0 < ts and a < w1 for lst in self.loss_windows.values() for w0, w1 in lst)
+
     def _smsg(self, actor, rcvid, spid, ts):
         c = self.counters
         if actor is None:
@@ -984,7 +1036,17 @@ class Model:
             call.sent.append(key)
         tx.client_prio = self.prio_of(actor)
         cands = self._handling.get(actor) or []
-        if len(cands) == 1:
+        held = [x for x in cands if self._held_in_loss(x, ts)]
+        if held:
+            # the thread held a request while events were lost: its reply may be among them, so which request
+            # this one serves is not known. Left unlinked, and the other candidates lose their trust: one of them
+            # may miss this nested request.
+            tx.parent_candidates = [x.idx for x in cands]
+            c["parents_unclear_after_loss"] += 1
+            for x in cands:
+                if NESTED_UNCLEAR not in x.warnings:
+                    x.warnings.append(NESTED_UNCLEAR)
+        elif len(cands) == 1:
             tx.parent = cands[0].idx
             cands[0].children.append(tx.idx)
         elif cands:   # kept for latency; left out of causal analyses (see Txn.causal)
@@ -1028,6 +1090,8 @@ class Model:
         tx = self._by_client.get(ckey)
         if tx is None:
             self.counters["reply_msg_without_txn"] += 1
+            if actor is not None and self.gaps:
+                self._unseen_requests.append((actor[0], ts))
             return
         if actor is None or self._replying.get(actor) is not tx:
             # not the reply call in progress for this client's exchange (a stale or misattributed reply):
