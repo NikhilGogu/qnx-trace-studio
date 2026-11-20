@@ -1,14 +1,33 @@
-# trace-studio
+# QNX Trace Studio
+
+[![tests](https://github.com/NikhilGogu/qnx-trace-studio/actions/workflows/test.yml/badge.svg)](https://github.com/NikhilGogu/qnx-trace-studio/actions/workflows/test.yml)
+
+A deadline check flags a late request. Trace Studio reads the QNX kernel trace and shows which server the client waited for and which thread held the CPU. If the trace cannot support a diagnosis, it says why.
+
+On our planted scheduling bugs, both checks flagged all 30 bug captures. The deadline-only check named no cause. Trace Studio named the planted cause in all 30. Its strict gate also failed 1 of 21 healthy captures for insufficient evidence. This is a comparison with a deadline-only gate on bugs we planted, not a comparison with another trace analyser.
+
+| 51 captures on QNX OS 8.0 | Deadline-only gate | Trace Studio `check` |
+|---|---|---|
+| Bug captures where the gate fails (of 30) | 30 | 30 |
+| Planted cause named (of 30) | 0 | 30 |
+| Control captures where the gate fails (of 21) | 0 | 1 |
+
+We planted the 10 bugs and wrote the 7 controls ourselves.
+
+Measured times are left out of every sample output in this repository. Where a block is real tool output with times cut, it says so. Run the commands to see the times.
+
+[Try the included traces without QNX](#try-it-without-a-qnx-target) | [Validation record](docs/VALIDATION.md)
+
+![Perfetto timeline of a priority inversion: hi waits in SEND while hog holds CPU 0 and the server is READY](docs/img/critical_path.png)
+
+`hi` waits in SEND. Its server `psrv-rx` is READY. `hog` holds CPU 0, the only CPU the server may use.
+
+Time values are hidden in these screenshots.
 
 trace-studio explains missed deadlines on QNX OS 8.0 from a kernel trace. It reads the `.kev` file that `tracelogger` writes and tells you which server a client waited for, what that server was doing, who held the CPU it needed, and whether the trace shows a suspected priority inversion, with the evidence for each verdict. It converts the trace to a Perfetto timeline. It runs as a command-line tool on a development host, so the same check can gate a CI build.
 
 It is for developers of QNX message-passing systems who need to know why a request was late. The quickstart below runs on traces in this repository, with no QNX target or licence.
 
-![Perfetto timeline of a priority inversion: hi waits in SEND while hog holds CPU 0 and the server is READY](docs/img/critical_path.png)
-
-A high-priority client (`hi`) waits in SEND while a medium-priority thread (`hog`) holds the only CPU the server may use. The critical-path track under `hi` names the cause.
-
-- Demo video (under 3 minutes): https://youtu.be/YeNumwjDXUk
 - For judges: [where to find the evidence for each criterion](#for-judges)
 - Codelab: [Find a priority inversion in QNX message passing](https://nikhil-qnx-codelabs.pages.dev/find-priority-inversion/) (source in [codelab/](codelab/find-priority-inversion.md))
 
@@ -37,13 +56,7 @@ venv/bin/tracestudio check tests/data/run1/prio_inherit.kev.gz --deadline hi@ts_
 venv/bin/tracestudio analyze tests/data/run4/mutex_chain_nopi.kev.gz --slowest 1 --client ts_mutex/hi
 ```
 
-Step 1 reports that 20 of 20 `hi` requests missed the deadline and lists 20 suspected priority inversions. Each one comes with its evidence, for example:
-
-```
-txn 520: ts_pload/hi (prio 30) waited 10937.8 us in MsgSend; for 8151.9 us of it (SEND-blocked 8151.9 us)
-  ts_psrv/psrv-rx was READY at prio 10 while every CPU it may run on (CPU 0, run mask 0x1) ran a thread
-  above prio 10, at least one of them below the client's 30; most of the time ts_pload/hog (prio 20) on CPU 0
-```
+Step 1 reports that 20 of 20 `hi` requests missed the deadline and lists 20 suspected priority inversions. Each one comes with its evidence. For example, `ts_pload/hi` (prio 30) is SEND-blocked while `ts_psrv/psrv-rx` is READY at prio 10. Every CPU it may run on (CPU 0, run mask 0x1) runs a thread above prio 10, at least one of them below the client's 30, most of the time `ts_pload/hog` (prio 20) on CPU 0. Target timings omitted. Run the example locally for full output.
 
 Step 2 shows 0 of 20 misses and no inversions once the channel inherits the client's priority.
 
@@ -56,7 +69,7 @@ python3 -m http.server -d site 8000        # then open http://127.0.0.1:8000
 
 Without `--with-timing` the page replaces every measured time with "[timing withheld]". That is the version `.github/workflows/pages.yml` publishes, because the QNX licence does not allow publishing performance results without approval.
 
-The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload turns inheritance off on purpose. Step 5 is the more common case. A mutex created with `PTHREAD_PRIO_NONE` is held by a low-priority thread that waits on another server, and the critical path follows the chain from hi's server thread to the mutex owner and into the owner's own request, where a medium-priority hog holds the CPU (output under [Mutex owner chains](#mutex-owner-chains)). The inversion rule follows the same chain, so `tracestudio check tests/data/run4/mutex_chain_nopi.kev.gz --no-inversions --client ts_mutex/hi` fails and names the mutex owner and the hog, while the same gate passes on `mutex_chain_hog`, where the mutex has priority inheritance. Thread-pool servers are covered by the inversion rule too, so far on synthetic traces only (see [Limitations](#limitations)).
+The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload turns inheritance off on purpose. Step 5 is the more common case. A mutex created with `PTHREAD_PRIO_NONE` is held by a low-priority thread that waits on another server, and the critical path follows the chain from hi's server thread to the mutex owner and into the owner's own request, where a medium-priority hog holds the CPU (output under [Mutex owner chains](#mutex-owner-chains)). The inversion rule follows the same chain, so `tracestudio check tests/data/run4/mutex_chain_nopi.kev.gz --no-inversions --client ts_mutex/hi` fails and names the mutex owner and the hog, while the same gate passes on `mutex_chain_hog`, where the mutex has priority inheritance. Thread-pool servers are covered by the inversion rule too. `tests/data/run6` contains QNX captures of the fixed-priority and inheritance-enabled thread-pool scenarios. Synthetic tests cover additional cases (see [Limitations](#limitations)).
 
 ## For judges
 
@@ -170,7 +183,7 @@ hi's `MsgSend -> ts_psrv` selected: the arrow lands on psrv-rx's handling of hi'
 
 ![MsgSend flow](docs/img/hi_msgsend_flow.png)
 
-The same period with all tracks: QNX states (SEND, READY, ...) and the critical-path tracks (`txn 522 -> ts_psrv: 11194.1 us`, `psrv-rx READY (10), CPU: hog (20) +4 more`).
+The same period with all tracks: QNX states (SEND, READY, ...) and the critical-path tracks (`txn 522 -> ts_psrv`, `psrv-rx READY (10), CPU: hog (20) +4 more`).
 
 ![Critical path](docs/img/critical_path.png)
 
@@ -216,24 +229,22 @@ What ui.perfetto.dev (v59.1) showed after that session: lo's and hi's QNX state 
 tracestudio analyze prio_fixed.kev --deadline hi=5000
 ```
 
-prints latency per client and server, deadline misses, suspected inversions and fixed-priority channels (abridged, long lines wrapped):
+prints latency per client and server, deadline misses, suspected inversions and fixed-priority channels. The counts and verdicts below are from the checked-in capture, abridged. The measured times are cut, as the last line says:
 
 ```
 trace prio_fixed.kev: 690 message exchanges, 682 trustworthy (analyses use only those)
   10 of them have an ambiguous parent: kept in latency, left out of critical paths and inversions
-deadline hi=5000 us on ts_psrv: 20 of 20 requests missed, max 11429.5 us
+deadline hi=5000 us on ts_psrv: 20 of 20 requests missed
 suspected priority inversions: 20 (checked 672 exchanges, 5 excluded as untrustworthy, 10 with an ambiguous
   parent, threshold 100 us)
-  txn 520: ts_pload/hi (prio 30) waited 10937.8 us in MsgSend; for 8151.9 us of it (SEND-blocked 8151.9 us)
-  ts_psrv/psrv-rx was READY at prio 10 while every CPU it may run on (CPU 0, run mask 0x1) ran a thread above
-  prio 10, at least one of them below the client's 30; most of the time ts_pload/hog (prio 20) on CPU 0,
-  8151.9 us; the server was busy with ts_pload/lo's request (txn 519).
+  ...
 insufficient evidence (the trace cannot show whether the server was held up): 2
-  txn 94: ts_psrv/psrv-rx -> procnto-smp-instr/proc_pool_thread, 1146.3 us unexplained: request handed off:
-  received by procnto-smp-instr/proc_pool_thread (tid 14), replied by procnto-smp-instr/proc_pool_thread (tid 16)
   ...
 channels created with _NTO_CHF_FIXED_PRIORITY: ts_psrv chid 1
+Target timings omitted. Run the example locally for full output.
 ```
+
+Each inversion entry names the client, the server thread that was READY, the CPU and run mask, the thread that held the CPU (`ts_pload/hog`, prio 20) and the request the server was busy with. The two entries with insufficient evidence are requests that procnto received on one thread and replied to on another.
 
 A suspected inversion needs evidence for every instant it counts: the client SEND- or REPLY-blocked on the server thread; the server READY at a lower priority than the client (priorities as known at that instant); the server's run mask traced and not invalidated since; every CPU in that mask busy with threads above the server, at least one of them below the client. While the client is SEND-blocked another thread of the server process could receive the message, so every thread of the process must be accounted for: a complete thread inventory with lifetimes, no lost events, no thread started or ended during the wait, and every other thread blocked in another kernel call, RECEIVE-blocked on another channel, or READY below the client and held up the same way. The verdict then names all of them. A thread waiting in MsgReceive on the client's channel means no inversion; any other state of another thread gives insufficient evidence. When another thread replies, the REPLY phase is insufficient evidence too: the trace does not say which threads worked on the request. When the trace cannot show why a low-priority server was not running (untraced run mask, idle CPU, lost events, other possible receivers, a handoff, sporadic scheduling, adaptive partitioning), the request is reported as "insufficient evidence" with the reasons. When the server is itself blocked, the rule follows it: a MUTEX wait to the mutex owner while the trace shows it, a REPLY wait to the server thread of the nested request. The test above then applies to the READY thread at the end of that chain, and the verdict names the chain. A link the trace cannot follow is insufficient evidence with that link named. `--json` prints all rows, including all inversions; [docs/JSON.md](docs/JSON.md) lists every key, and a test keeps that list and the output in step. `--deadline THREAD@SERVER=US` counts only the requests to that server process (`hi@ts_psrv=5000`); `THREAD=US` counts all of the thread's requests.
 
@@ -246,30 +257,20 @@ tracestudio analyze prio_fixed.kev --request 524     # the txn argument shown in
 tracestudio analyze trace.kev --slowest 5            # the 5 slowest top-level requests
 ```
 
-partitions the client's MsgSend latency into consecutive segments that add up exactly, recursing into trustworthy requests the server sends to other servers:
+partitions the client's MsgSend latency into consecutive segments that add up exactly, recursing into trustworthy requests the server sends to other servers. For the slowest `hi` request in `prio_fixed` the segments, in order, are:
 
-```
-txn 524: ts_pload/hi -> ts_psrv, MsgSend latency 11429.5 us
-   start us       us      %  what
-      0.0      0.5    0.0  ts_pload/hi running
-      0.5   8143.0   71.2  ts_psrv/psrv-rx READY at prio 10, CPUs held by ts_pload/hog (prio 20) on CPU 0 8142.8 us, ...
-   8143.5    789.7    6.9  ts_psrv/psrv-rx running ts_pload/lo's request (txn 523)
-   ...
-  10896.4      1.4    0.0  ts_psrv/psrv-rx running, not in a request
-  10897.8      0.4    0.0  ts_psrv/psrv-rx receiving this request (in MsgReceivev)
-  10898.1    530.0    4.6  ts_psrv/psrv-rx running this request
-  11428.1      0.4    0.0  ts_psrv/psrv-rx replying
-  11428.5      0.5    0.0  ts_pload/hi READY at prio 30, not explained by the trace: CPU 0 ran ts_psrv/psrv-rx (prio 10) 0.5 us
-   by kind: server preempted 8702.3 us, server busy 2194.9 us, server running 530.7 us, client running 1.1 us, unexplained ready 0.5 us
-```
+- `ts_pload/hi running`
+- `ts_psrv/psrv-rx READY at prio 10, CPUs held by ts_pload/hog (prio 20) on CPU 0, ...`
+- `ts_psrv/psrv-rx running ts_pload/lo's request`
+- `ts_psrv/psrv-rx running, not in a request`
+- `ts_psrv/psrv-rx receiving this request (in MsgReceivev)`
+- `ts_psrv/psrv-rx running this request`
+- `ts_psrv/psrv-rx replying`
+- `ts_pload/hi READY at prio 30, not explained by the trace: CPU 0 ran ts_psrv/psrv-rx (prio 10)`
 
-A forwarded request (`ipc_wide`, txn 975) shows the nested server inline, and a wait the trace cannot explain as such:
+The real output gives the start, length and share of each segment and a total per kind. Target timings omitted. Run the example locally for full output.
 
-```
-    110.2    209.8   37.9  ts_front/front-rx0 waits for ts_back (txn 977)
-    110.8    208.4   37.6    ts_back/back-rx running this request
-    320.0     47.0    8.5  ts_front/front-rx0 READY at prio 10, not explained by the trace: CPU 0 idle (no run mask traced) 47.0 us
-```
+A forwarded request (`ipc_wide`) shows the nested server inline, for example `ts_front/front-rx0 waits for ts_back` with `ts_back/back-rx running this request` below it. A wait the trace cannot explain is labelled as such: `ts_front/front-rx0 READY at prio 10, not explained by the trace: CPU 0 idle (no run mask traced)`.
 
 Segment kinds: client running, client ready, server waiting, server busy (with another request, holding several, or running outside any request), server preempted, server running (inside the MsgReceivev call that returned the request, handling it, replying), nested request, server blocked, unexplained ready, unknown (lost events, or a handoff: another thread replied, or the receiver went back to MsgReceive with the request open). A wait is "preempted" or "ready" only when every CPU the thread may use ran a known thread at or above its priority. `convert` writes the same segments to each client thread's `critical path` track.
 
@@ -279,33 +280,11 @@ QNX mutexes are locked and unlocked in user space while nobody waits; the kernel
 
 With a known owner, the critical path of a request whose server thread waits on the mutex follows the owner up to its unlock: owner running, owner preempted (READY behind threads at or above its priority), owner blocked, or the owner's own trustworthy request nested inside (never the same request twice on one path). `analyze` lists the mutex waits of at least `--min-us` with the owner, the priorities it was seen at before and during the wait and what it did meanwhile, then any MUTEX time after the owner's unlock (the next owner is not traced) and the time until SyncMutexLock returned. Perfetto splits the waiting thread's slice the same way: `MUTEX 0x... (owner holder)`, `(owner not traced after the release)`, `woken, until SyncMutexLock returns`.
 
-The slowest of hi's requests in `mutex_chain_nopi` (no priority inheritance, a hog at 20), abridged:
-
-```
-$ tracestudio analyze mutex_chain_nopi.kev.gz --slowest 1 --client ts_mutex/hi
-txn 520: ts_mutex/hi -> ts_mutex, MsgSend latency 7777.6 us
-   start us       us      %  what
-      6.3   7562.3   97.2  ts_mutex/mrx MUTEX-blocked on mutex 0x4f2f5f9020 owned by ts_mutex/holder, which waits for
-                           ts_mslow (txn 519)
-      6.5    934.5   12.0    ts_mslow/slow-rx running this request
-    941.0   5218.8   67.1    ts_mslow/slow-rx READY at prio 10, CPUs held by ts_mutex/hog (prio 20) on CPU 0 5182.7 us, ...
-   6159.8   1407.9   18.1    ts_mslow/slow-rx running this request
-   ...
-```
+The slowest of hi's requests in `mutex_chain_nopi` (no priority inheritance, a hog at 20) starts with the segment `ts_mutex/mrx MUTEX-blocked on mutex 0x... owned by ts_mutex/holder, which waits for ts_mslow`. Below it come `ts_mslow/slow-rx running this request`, then `ts_mslow/slow-rx READY at prio 10, CPUs held by ts_mutex/hog (prio 20) on CPU 0`, then `ts_mslow/slow-rx running this request` again. Target timings omitted. Run the example locally for full output.
 
 `analyze` on the same capture lists these requests as suspected priority inversions. The evidence follows the chain: ts_mutex/mrx MUTEX-blocked on the mutex (owner ts_mutex/holder), ts_mutex/holder REPLY-blocked on ts_mslow, and ts_mslow/slow-rx READY at prio 10 while ts_mutex/hog (prio 20) held CPU 0.
 
-With QNX's default priority inheritance (`mutex_chain_hog`), the holder is seen at priority 30 while it owns the mutex (at 10 in `mutex_chain_nopi`), and so is ts_mslow's server thread while it handles the holder's request; the hog does not get in and the waits are about 2.4 ms:
-
-```
-$ tracestudio analyze mutex_chain_hog.kev.gz --top 1
-...
-mutex waits of at least 100 us: 20 (owner known for 20)
-  wait 18: ts_mutex/mrx (prio 30) MUTEX-blocked 2418.2 us on mutex 0x1740110020 owned by ts_mutex/holder (prio 10
-  before the wait, up to 30 during it) for 2417.4 us of it, which was REPLY-blocked on ts_mslow (txn 559) 2414.1 us,
-  RUNNING 2.0 us, READY 1.3 us; then 0.8 us MUTEX-blocked with the next owner not traced; then 0.9 us before
-  SyncMutexLock returned
-```
+With QNX's default priority inheritance (`mutex_chain_hog`), the holder is seen at priority 30 while it owns the mutex (at 10 in `mutex_chain_nopi`), and so is ts_mslow's server thread while it handles the holder's request. The hog does not get in. `analyze` lists the mutex waits (20 waits, owner known for 20) with the owner's priority before and during the wait, and what the owner did meanwhile (REPLY-blocked on ts_mslow, RUNNING, READY). Target timings omitted. Run the example locally for full output.
 
 ## Diff
 
@@ -314,19 +293,17 @@ tracestudio diff prio_fixed.kev prio_inherit.kev --deadline hi=5000 --client ts_
 ```
 
 ```
-deadline hi=5000 us on ts_psrv: before 20/20 missed, max 11429.5 us | after 0/20 missed, max 2740.4 us
+deadline hi=5000 us on ts_psrv: before 20/20 missed | after 0/20 missed
 suspected priority inversions: before 20 | after 0 (checked 21 | 21 exchanges; insufficient evidence: 0 | 0; relying
   on supplied run masks: 0 | 0)
 fixed-priority channels: before ts_psrv chid 1 | after none
-MsgSend latency (us) by client@priority -> server: 2 pairs compared (trustworthy requests on both sides), 0 without
+MsgSend latency by client@priority -> server: 2 pairs compared (trustworthy requests on both sides), 0 without
   trustworthy requests on a side, 0 only before, 0 only after
 largest p99 change:
-  client@priority                server                      n       p50       p90       p99       max  excluded/unfinished
-  ts_pload/hi@30                 ts_psrv          before    20   10883.2   11141.9   11429.5   11429.5  0/0
-  ts_pload/hi@30                 ts_psrv          after     20    2686.6    2725.9    2740.4    2740.4  0/0
   ...
 server priority while handling each client's request (share of the server's running time, changes of 1 point or more):
   ts_psrv/psrv-rx for ts_pload/hi: before prio 10 100% | after prio 30 100%
+Target timings omitted. Run the example locally for full output.
 ```
 
 Rows are matched by role (client process, thread name and priority, server process). Only pairs with trustworthy requests on both sides are ranked; pairs whose requests were all excluded or unfinished on one side, and roles found only before or only after, are listed separately. Priority shares are compared from unrounded running time. Server running time while it holds several requests is counted once, under "(several requests open)". `--client` filters every per-client part of `analyze` and `diff` (latency rows, deadlines, inversions, server priority), in text and in `--json` output.
@@ -352,7 +329,7 @@ tracestudio check prio_fixed.kev --deadline hi@ts_psrv=5000 --no-inversions --cl
 
 ```
 - uses: actions/checkout@v4
-- uses: <owner>/qnx-trace-studio@<tag>     # the repository and release that host trace-studio
+- uses: NikhilGogu/qnx-trace-studio@main     # no release tag includes action.yml yet, so this uses the main branch
   with:
     trace: traces/prio_fixed.kev.gz
     args: --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/
@@ -384,26 +361,25 @@ scp -q $SSHO root@$IP:/tmp/ts/out/prio_fixed.kev ~/work/ts-ci/prio_fixed/
 mkqnximage --stop                                        # in the exit trap
 ```
 
-The failing run (fixed-priority channel), output abridged:
+The failing run (fixed-priority channel), output abridged and with measured times cut:
 
 ```
 $ CI_WORK=~/work/ts-ci/prio_fixed tools/ci_qemu_check.sh prio_fixed --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/; echo "exit $?"
 ...
-hi: 20 of 20 requests missed the 5000 us deadline, slowest 11112 us              (ts_pload's own log, on the target)
+hi: 20 of 20 requests missed the 5000 us deadline          (ts_pload's own log, on the target)
 prio_fixed: 836725 bytes, logs: pload-679960.csv psrv_fixed-667671.csv
 PASS trace integrity: no lost events, 676 of 686 message exchanges trustworthy
-FAIL deadline hi@ts_psrv=5000 us: 20 of 20 trustworthy requests over 5000 us, max 11096.0 us; matched ts_pload/hi@30 ->
+FAIL deadline hi@ts_psrv=5000 us: 20 of 20 trustworthy requests over 5000 us; matched ts_pload/hi@30 ->
   ts_psrv (20)
-  txn 482: ts_pload/hi -> ts_psrv, 11096.0 us (budget 5000 us)
   ...
 FAIL no suspected priority inversions: 20 suspected; checked 119 exchanges of clients matching 'ts_pload/' (at least 1
   required), 0 with insufficient evidence (at most 0 allowed), 0 excluded as untrustworthy, 0 with an ambiguous parent
-  txn 476: ts_pload/hi (prio 30) waited 10908.4 us in MsgSend; for 8186.7 us of it (SEND-blocked 8186.7 us)
   ts_psrv/psrv-rx was READY at prio 10 while every CPU it may run on (CPU 0, run mask 0x1) ran a thread above prio 10, ...
   ...
 check: 3 assertions, 2 failed
 wrote ~/work/ts-ci/prio_fixed/prio_fixed.junit.xml
 exit 1
+Target timings omitted. Run the example locally for full output.
 ```
 
 The passing run (priority inheritance):
@@ -411,29 +387,30 @@ The passing run (priority inheritance):
 ```
 $ CI_WORK=~/work/ts-ci/prio_inherit tools/ci_qemu_check.sh prio_inherit --deadline hi@ts_psrv=5000 --no-inversions --client ts_pload/; echo "exit $?"
 ...
-hi: 0 of 20 requests missed the 5000 us deadline, slowest 2794 us
+hi: 0 of 20 requests missed the 5000 us deadline
 prio_inherit: 841741 bytes, logs: pload-679960.csv psrv_inherit-667671.csv
 PASS trace integrity: no lost events, 676 of 685 message exchanges trustworthy
-PASS deadline hi@ts_psrv=5000 us: 0 of 20 trustworthy requests over 5000 us, max 2779.0 us; matched ts_pload/hi@30 ->
+PASS deadline hi@ts_psrv=5000 us: 0 of 20 trustworthy requests over 5000 us; matched ts_pload/hi@30 ->
   ts_psrv (20)
 PASS no suspected priority inversions: 0 suspected; checked 119 exchanges of clients matching 'ts_pload/' (at least 1
   required), 0 with insufficient evidence (at most 0 allowed), 0 excluded as untrustworthy, 0 with an ambiguous parent
 check: 3 assertions, 0 failed
 wrote ~/work/ts-ci/prio_inherit/prio_inherit.junit.xml
 exit 0
+Target timings omitted. Run the example locally for full output.
 ```
 
-The JUnit report of the failing run starts like this:
+The JUnit report of the failing run starts like this (the time attributes are cut):
 
 ```
-<testsuites name="tracestudio check" tests="3" failures="2" errors="0" time="0.154">
-  <testsuite name="tracestudio check prio_fixed" tests="3" failures="2" errors="0" skipped="0" time="0.154" ...>
+<testsuites name="tracestudio check" tests="3" failures="2" errors="0">
+  <testsuite name="tracestudio check prio_fixed" tests="3" failures="2" errors="0" skipped="0" ...>
     ...
-    <testcase classname="tracestudio.check.prio_fixed" name="deadline hi@ts_psrv=5000 us" time="0">
-      <failure message="20 of 20 trustworthy requests over 5000 us, max 11096.0 us; matched ..." type="DeadlineMissed">
+    <testcase classname="tracestudio.check.prio_fixed" name="deadline hi@ts_psrv=5000 us">
+      <failure message="20 of 20 trustworthy requests over 5000 us; matched ..." type="DeadlineMissed">
 ```
 
-Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. `--client ts_pload/` can fail the same way: on a fresh `prio_inherit_rx` capture, a request from ts_pload's main thread to procnto was handed off inside procnto. To gate on hi alone, use `--client ts_pload/hi`. The workload's own measurement (11112 us) is about 15 us longer than the traced MsgSend.
+Without `--client`, the same passing capture failed `--no-inversions`: one request from ts_psrv itself to procnto had insufficient evidence (procnto received it on one thread and replied on another), and the default allows none. `--client ts_pload/` can fail the same way: on a fresh `prio_inherit_rx` capture, a request from ts_pload's main thread to procnto was handed off inside procnto. To gate on hi alone, use `--client ts_pload/hi`.
 
 ## Use from a coding agent
 
@@ -447,7 +424,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 | tracelogger wide mode (`-w`) | verified |
 | fast mode | verified for message linking and message names (msg[0] keeps the `_IO_CONNECT` subtype); no priorities, so no inversion analysis |
 | per-class mix of fast and wide events | unit tests only |
-| aarch64le, QEMU virt (TCG), 2 CPUs | verified on 3 captures (1 of them in `tests/data`; `ipc_wide`, `prio_fixed`, `prio_inherit`, wide mode; Cortex-A57, ClockCycles at 62.5 MHz): events and arguments identical to traceprinter, all logged requests and pulses matched, the same priority results as on x86_64; real aarch64 hardware untested |
+| aarch64le, QEMU virt (TCG), 2 CPUs | verified on 3 captures (1 of them in `tests/data`; `ipc_wide`, `prio_fixed`, `prio_inherit`, wide mode; Cortex-A57): events and arguments identical to traceprinter, all logged requests and pulses matched, the same priority results as on x86_64; real aarch64 hardware untested |
 | more than 2 CPUs, real hardware | untested |
 | mutex owners (SyncMutexLock/SyncMutexUnlock) | verified on 3 captures (60 waits against the workload's logs); mutexes shared between processes give "owner unknown" |
 | big-endian traces | not supported (refused) |
@@ -463,10 +440,11 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 
 - The parser agrees with the SDP's `traceprinter` on every event of the 20 build-box captures (17 x86_64, 3 aarch64le). Argument values were compared for the event kinds trace-studio decodes, and all agreed; the kinds it does not decode are listed there.
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
-- 11 of the 20 captures are in `tests/data`, and `tests/data/run6` adds the two thread-pool captures. The test suite runs on all 13 and converts and loads each one in TraceProcessor. The others stayed on the build box, so their totals cannot be reproduced from the repository. What can be reproduced: on the 13 checked-in captures, `tools/validate_all.py` finds 369,402 events identical to `traceprinter` and 1,097,066 argument values compared with 0 mismatches.
+- Checked-in captures, reproducible from this repository: on the 13 captures in `tests/data`, `tools/validate_all.py` finds 369,402 events identical to `traceprinter` and 1,097,066 argument values compared with 0 mismatches. 11 of the 13 are among the 20 build-box captures, and `tests/data/run6` adds the two thread-pool captures taken later. The test suite runs on all 13 and converts and loads each one in TraceProcessor.
+- Build-box captures, reported separately and not reproducible from the repository: the 17 x86_64 captures matched on 739,841 events and 2,428,184 compared argument values, and the 3 aarch64le captures on 158,352 events and 487,334 values, with 0 mismatches in both.
 - `python3 tests/test_tracestudio.py` runs 113 tests: 83 on synthetic slot streams, with a counterexample for each defect found in code review, and 30 on the checked-in captures, among them one that runs the quickstart commands above.
-- Seeded regressions on a QNX 8.0 target ([details](docs/VALIDATION.md#seeded-scheduling-regressions-qnx-target)): 10 planted scheduling bugs and 7 healthy controls, 3 captures each. A deadline-only gate failed all 30 bug captures and named no cause. trace-studio failed all 30 and named the expected cause in 30. It failed 1 of 21 control captures, where the gate allows no request with insufficient evidence.
-- Loss injection on the checked-in captures ([details](docs/VALIDATION.md#loss-injection-host-only)): 1,203 damaged copies. Every copy with visible damage reported loss and failed `check`. No wrong or missed inversion and no wrong mutex owner. No wrong link among the 793,417 exchanges still called trustworthy (144 before an end-of-trace fix on this branch).
+- Seeded regressions on a QNX 8.0 target ([details](docs/VALIDATION.md#seeded-scheduling-regressions-qnx-target)): 10 planted scheduling bugs and 7 healthy controls, 3 captures each. A deadline-only gate failed all 30 bug captures and named no cause. trace-studio failed all 30 and named the expected cause in 30. It failed 1 of 21 control captures, where the gate allows no request with insufficient evidence. The seeded comparison used one x86_64 QNX 8.0 guest under QEMU. The repository also includes an aarch64le QEMU capture. No physical board is claimed.
+- Loss injection on the checked-in captures ([details](docs/VALIDATION.md#loss-injection-host-only)): 1,203 damaged copies. Every copy with visible damage reported loss and failed `check`. No wrong or missed inversion and no wrong mutex owner. No wrong link among the 793,417 exchanges still called trustworthy (144 before the end-of-trace fix).
 
 ## Limitations
 
@@ -475,13 +453,12 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - Wakeups appear in Perfetto ("woken by") only with object evidence: the woken thread receives the message or pulse sent in the waker's kernel call before it blocks again, or the waker's reply names it. Timer, interrupt, synchronisation-object and cross-CPU wakeups have no waker; the QNX state track still shows READY.
 - Perfetto's own thread-state view maps QNX states to Linux ones (blocked states become "Sleeping"); the `QNX state` track has the kernel's states.
 - The priority column of Perfetto's sched table holds the QNX priority (0 to 255, higher wins).
-- The inversion analysis needs the server's run mask traced (`ThreadCtl` during the trace) or supplied with `--runmask`; for a multi-threaded server a SEND-phase verdict needs every thread of the process accounted for during the wait (process created during the trace or its threads listed at trace start, no lost events, no thread started or ended, each other thread blocked in another kernel call, RECEIVE-blocked on another channel, or READY below the client with every CPU it may use running a thread above it and at least one below the client). A thread with an unknown state, priority, run mask or receive channel, a running thread, a READY thread that could run, or a thread in MsgReceivePulse on the channel gives "insufficient evidence", and the rule has been tested on synthetic traces only; requests replied to by another thread are "insufficient evidence" after the receive; a chain is followed through mutex owners and REPLY-blocked servers for up to 4 links; a link the trace cannot follow (owner unknown, a nested request not yet received, a handoff, a loop, the link limit) gives "insufficient evidence" with that link named, and a thread on the chain blocked in any other call (CONDVAR, SEM, NANOSLEEP, ...) is not counted either way.
+- The inversion analysis needs the server's run mask traced (`ThreadCtl` during the trace) or supplied with `--runmask`; for a multi-threaded server a SEND-phase verdict needs every thread of the process accounted for during the wait (process created during the trace or its threads listed at trace start, no lost events, no thread started or ended, each other thread blocked in another kernel call, RECEIVE-blocked on another channel, or READY below the client with every CPU it may use running a thread above it and at least one below the client). A thread with an unknown state, priority, run mask or receive channel, a running thread, a READY thread that could run, or a thread in MsgReceivePulse on the channel gives "insufficient evidence". `tests/data/run6` holds QNX captures of the fixed-priority and inheritance-enabled thread-pool scenarios, and synthetic tests cover additional cases; requests replied to by another thread are "insufficient evidence" after the receive; a chain is followed through mutex owners and REPLY-blocked servers for up to 4 links; a link the trace cannot follow (owner unknown, a nested request not yet received, a handoff, a loop, the link limit) gives "insufficient evidence" with that link named, and a thread on the chain blocked in any other call (CONDVAR, SEM, NANOSLEEP, ...) is not counted either way.
 - The critical path follows trustworthy nested requests and mutex owners when the trace shows them. It does not follow condvars, semaphores, rwlocks or handoffs to other threads (it says "handed off, not followed" and counts that time as unknown).
 - A server holding several received requests is reported as such, since the trace does not say which one it works on.
 - Mutex owners are known only for contended mutexes (uncontended locks never reach the kernel), only from the waiter's SyncMutexLock until the owner's successful SyncMutexUnlock (after that, when several threads waited, the next owner is not traced), only within one process (the address of a mutex shared between processes differs per process), and not for recursive mutexes. Remapping the memory of a mutex is not traced in a form trace-studio decodes; an owner is never carried from one wait to another, so a reused address can only matter within a single wait.
 - Paths are candidates: a coid gets one when the opening thread's PATHMGR event is followed within 10 ms by its ConnectAttach and the first message on the coid is an `_IO_CONNECT` answered without error. Nothing in the trace ties the PATHMGR lookup to that connection, so an unrelated open in the window would inherit the path. Files opened before the trace started have no path.
 - Pulses are linked only when exactly one send can match a receive on a queue that is in sync (the receiver blocked on the channel that the scoid's pulses arrive on, with that channel learnt again after any loss, and no ambiguous receive since); otherwise the candidates are recorded and no arrow is drawn.
-- In the pinned priority runs the workload's own ClockCycles() is about 15 us before the traced MsgSendv entry; the cause is not known.
 
 ## Licence
 
