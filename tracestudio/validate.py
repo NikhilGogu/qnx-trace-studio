@@ -197,7 +197,9 @@ def validate(model, logdir, wide=None):
     res["decoder_counters"] = {k: v for k, v in model.counters.items() if v}
     # pulses: client MsgSendPulse (value = request id) and the back-end's timer pulses
     sent = [r for r in rows if r["ev"] == "PULSE_SEND"]
-    dec = [p for p in model.pulses if p.kind == "pulse" and p.sender is not None]
+    from .model import pulse_receive_known
+    known = pulse_receive_known(model.pulses)
+    dec = [p for p in model.pulses if p.kind == "pulse" and p.sender is not None and p.idx in known]
     matched = 0
     for r in sent:
         if any(p.sender == (r["pid"], r["tid"]) and p.value == r["id"] and p.receiver is not None

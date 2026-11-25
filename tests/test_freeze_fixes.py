@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 from kevgen import (C_COMM, C_CONTROL, C_KERCALL, C_PRTH, DEAD, EXIT, INT, K_PULSE, K_RECEIVEV, K_REPLYV,  # noqa: E402,F401
                     K_SEM_POST, K_SENDV, M32, NANOSLEEP, READY, RECEIVE, REPLY, REPLYMSG, RPULSE, RUNNING, SEND, Gen)
-from test_synthetic import B, C, H, M, NAMES, S, S2, T, W1, W2, exchange, kev, model  # noqa: E402,F401
+from test_synthetic import B, C, H, M, NAMES, S, S2, T, W1, W2, exchange, kev, model, receive_pulse  # noqa: E402,F401
 from tracestudio.analyses import Timeline, suspected_inversions  # noqa: E402,F401
 from tracestudio.check import _latency_assertion, _thread_selector  # noqa: E402,F401
 from tracestudio.critical import critical_path  # noqa: E402,F401
@@ -358,6 +358,53 @@ def test_request_open_while_the_receiver_waits_in_receive_is_insufficient_eviden
     assert r["checked"] == 1 and r["suspected"] == []
     (row,) = r["insufficient_evidence"]
     assert any("RECEIVE-blocked, this request still open" in k for k in row["reasons"]), row
+
+
+def pulse_scene(v0, v1):
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T, RUNNING, S, 10)
+    g.kcall(0, T + 1, K_RECEIVEV, [1, 1])
+    g.state(0, T + 2, RUNNING, C, 10)
+    g.pulse(0, T + 10, C, S[0], 0x10001, v0)
+    g.pulse(0, T + 30, C, S[0], 0x10001, v1)
+    receive_pulse(g, 0, T + 100, S, 0x10001, block=False)
+    g.kcall(0, T + 130, K_RECEIVEV, [1, 1])
+    receive_pulse(g, 0, T + 150, S, 0x10001)
+    g.state(0, T + 300, RUNNING, C, 10)
+    g.pulse(0, T + 310, C, S[0], 0x10001, 9)
+    receive_pulse(g, 0, T + 400, S, 0x10001)
+    return model(g)[1]
+
+
+def test_guessed_pulse_pairing_is_not_known_when_the_candidates_differ():
+    from tracestudio.model import pulse_receive_known
+    m = pulse_scene(0, 1)
+    assert [p.match for p in m.pulses] == ["ambiguous", "unsynced", "unique"]
+    assert pulse_receive_known(m.pulses) == {2}
+
+
+def test_guessed_pulse_pairing_is_known_when_the_candidates_are_alike():
+    from tracestudio.model import pulse_receive_known
+    m = pulse_scene(5, 5)
+    assert [p.match for p in m.pulses] == ["ambiguous", "unsynced", "unique"]
+    assert pulse_receive_known(m.pulses) == {0, 1, 2}
+
+
+def test_validate_does_not_count_a_pulse_whose_receive_was_a_guess():
+    import tempfile
+    from tracestudio.validate import validate
+    from test_synthetic import write_logs
+    m = pulse_scene(0, 1)                                      # pulses 0 and 1 queued together, one receive: a guess
+    assert [p.match for p in m.pulses][:2] == ["ambiguous", "unsynced"]
+    send = lambda ts, v: (ts, "clients", C[0], C[1], "PULSE_SEND", v, 0x40000001, 0, 0, 0)  # noqa: E731
+    with tempfile.TemporaryDirectory(prefix="ts-pulse-") as d:
+        write_logs(d, [send(T + 10, 0), send(T + 30, 1), send(T + 310, 9)],
+                   [(T + 120, "front", 200, 1, "PULSE_RX", 0, 0, 0, 0, 0)])
+        res = validate(m, d)[0]
+    assert res["pulses"]["client_pulses_logged"] == 3
+    assert res["pulses"]["client_pulses_matched_with_value"] == 1, res["pulses"]    # only value 9, the unique one
 
 
 if __name__ == "__main__":

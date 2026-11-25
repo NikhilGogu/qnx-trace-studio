@@ -460,6 +460,8 @@ class Writer:
     def _pulses(self):
         m = self.m
         fid = 1 << 40
+        from .model import pulse_receive_known
+        known = pulse_receive_known(m.pulses)
         for pl in m.pulses:
             fid += 1
             linked = pl.match == "unique" and pl.t_send is not None and pl.receiver is not None
@@ -476,7 +478,11 @@ class Writer:
                 self.add_instant(track, pl.t_send, "send %s" % pl.kind, dict(args, pulse=pl.idx),
                                  flows=(fid,) if linked else ())
             if pl.t_recv is not None and pl.receiver is not None:
-                self.add_instant((pl.receiver, None), pl.t_recv, "receive %s" % pl.kind, dict(args, pulse=pl.idx),
+                rargs = dict(args, pulse=pl.idx)
+                if pl.match in ("ambiguous", "unsynced") and pl.idx not in known:
+                    # the send this receive is paired with is a guess: show only what the receive itself proves
+                    rargs.update(sender="not known (guessed pairing)", code=None, value=None)
+                self.add_instant((pl.receiver, None), pl.t_recv, "receive %s" % pl.kind, rargs,
                                  term=(fid,) if linked else ())
             self.stats["pulse_arrows"] += linked
         self.stats["pulses"] = len(m.pulses)

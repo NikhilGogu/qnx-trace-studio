@@ -226,6 +226,24 @@ class Pulse:
     candidates: list = field(default_factory=list)
 
 
+def pulse_receive_known(pulses):
+    """Indices of the pulses whose receive is tied to its send by the trace: a unique match; an unsynced match
+    that no earlier ambiguous receive left open to doubt; or an ambiguous match whose candidates all carry the same
+    sender, code and value (so the guess changes nothing shown)."""
+    def alike(p):
+        return len({(pulses[c].sender, pulses[c].code, pulses[c].value) for c in p.candidates}) == 1
+    doubted = {c for p in pulses if p.match == "ambiguous" and not alike(p) for c in p.candidates}
+    known = set()
+    for p in pulses:
+        if p.t_recv is None or p.receiver is None:
+            continue
+        if p.match == "unique" or (p.match == "unsynced" and p.idx not in doubted):
+            known.add(p.idx)
+        elif p.match == "ambiguous" and alike(p):
+            known.add(p.idx)
+    return known
+
+
 @dataclass(eq=False)
 class MutexWait:
     """One SyncMutexLock call that blocked. The owner is known only when the owner's own SyncMutexUnlock of
