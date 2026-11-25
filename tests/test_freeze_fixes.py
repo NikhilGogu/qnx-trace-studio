@@ -248,6 +248,21 @@ def test_unmatched_unlock_exit_does_not_confirm_the_mutex_owner():
     assert w.owner is None and not w.owner_known, (w.owner, w.unknown)
 
 
+def test_cross_cpu_slot_is_judged_by_the_anchor_of_the_buffer_that_holds_it():
+    # a slot that names CPU 1 sits in CPU 0's buffer, and its low 32 bits are placed with CPU 0's anchor. CPU 1
+    # has no TIME record at all, but the placement is not a guess: the slot must not be marked partial
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RUNNING, S, 10)
+    h = (0 << 30) | (1 << 24) | (C_PRTH << 10) | RUNNING        # S_SIMPLE slot of CPU 1 inside CPU 0's buffer
+    g.cur[3].append([h, (T + 50) & M32, S2[0], S2[1]])
+    g.state(0, T + 100, RUNNING, S, 10)
+    k = kev(g)
+    (ev,) = [e for e in k.events() if e.cpu == 1]
+    assert ev.ts == T + 50 and not ev.partial, (ev.ts, ev.partial)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
