@@ -616,7 +616,7 @@ def _inversion(tl, tx):
                 culprits[(o, p, x)] += f - e
             if ccode == ST_SEND:
                 b = tl.handling_at(srv, e)
-                if b is not None and b is not tx and b not in busy:
+                if b is not None and b is not tx and b.trustworthy and b not in busy:
                     busy.append(b)
 
     def through(key, a, b, hops):

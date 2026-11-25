@@ -106,6 +106,40 @@ def test_unnamed_procnto_thread_with_a_nonzero_ready_priority_is_not_idle():
     assert m.is_idle((1, 8))
 
 
+def test_inversion_does_not_name_the_client_of_a_contradicted_request_as_the_cause():
+    # hi is SEND-blocked while s1 is busy with b's request, but that request carries a contradiction warning
+    # (its _msg_info names another sender): the evidence may not claim "the server was busy with b's request"
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RUNNING, S, 10)
+    g.channel(0, T + 7, 0x1)
+    g.runmask(0, T + 20, 0x1)
+    g.wait_receive(0, T + 40, S, 10)
+    ms = 1_000_000
+    g.state(0, T + ms, RUNNING, B, 10)
+    g.send(0, T + ms + 10, B, S[0], 0x10001, prio=10)
+    g.receive(0, T + ms + 50, S, B, 0x10001, prio=10, info_client=(999, 1))
+    g.state(0, T + ms + 200, RUNNING, H, 30)
+    g.send(0, T + ms + 210, H, S[0], 0x20001, prio=30, block=SEND)
+    g.state(0, T + ms + 300, READY, S, 10)
+    g.state(0, T + ms + 310, RUNNING, W1, 20)
+    g.state(0, T + 3 * ms, NANOSLEEP, W1, 20)
+    g.state(0, T + 3 * ms + 10, RUNNING, S, 10)
+    g.reply(0, T + 3 * ms + 100, S, B, 0x10001, 10)
+    g.wait_receive(0, T + 3 * ms + 150, S, 10)
+    g.receive(0, T + 3 * ms + 200, S, H, 0x20001, prio=10)
+    g.reply(0, T + 3 * ms + 300, S, H, 0x20001, 30)
+    g.send_exit(0, T + 3 * ms + 400, H, 30)
+    _, m = model(g)
+    busy, hi = m.txns
+    assert not busy.trustworthy and hi.trustworthy
+    r = suspected_inversions(m)
+    (x,) = r["suspected"]
+    assert x["client"] == "high/h" and set(x["while"]) == {"SEND"}
+    assert x["server_busy_with"] == [] and "busy with" not in x["evidence"], x["evidence"]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
