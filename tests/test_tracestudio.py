@@ -442,7 +442,7 @@ def test_docs_links_resolve_and_test_counts_match():
     statement of the suite's size names the real number of tests."""
     import re
     root = os.path.join(HERE, "..")
-    suites = {"test_synthetic.py": 0, "test_tracestudio.py": 0}
+    suites = {"test_synthetic.py": 0, "test_tracestudio.py": 0, "test_freeze_fixes.py": 0}
     for name in suites:
         with open(os.path.join(HERE, name)) as f:
             suites[name] = len(re.findall(r"^def test_", f.read(), re.M))
