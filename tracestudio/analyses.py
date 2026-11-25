@@ -549,6 +549,9 @@ def _inversion(tl, tx):
         if m.aps_seen:
             unknown("adaptive partitioning in use: budgets not evaluated", d - c)
             return
+        if m.qvm_seen:
+            unknown("QVM guests in the trace: guest scheduling not evaluated", d - c)
+            return
         if tl.policy_at(key, c) == SCHED_SPORADIC:
             unknown("server uses sporadic scheduling" if not hops else "%s uses sporadic scheduling" % m.label(key),
                     d - c)

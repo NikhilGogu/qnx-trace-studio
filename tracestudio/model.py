@@ -65,7 +65,7 @@ from .events import (COMM_ERROR, COMM_REPLY, COMM_RMSG, COMM_RPULSE, COMM_SIGNAL
                      COMM_SPULSE_DIS, COMM_SPULSE_EXE, INT_DELIVER, PR_PROCCREATE, PR_PROCCREATE_NAME,
                      PR_PROCDESTROY, PR_THREAD_NAME, STATE_MAX, THREAD_WIDE, describe, kercall, msg_type_name,
                      state_name, unpack)
-from .kev import C_COMM, C_INT, C_KERCALL, C_PRTH, C_SYSTEM, KevFile
+from .kev import C_COMM, C_INT, C_KERCALL, C_PRTH, C_QVM, C_SYSTEM, KevFile
 
 ST_UNKNOWN = -1
 ST_DEAD, ST_RUNNING, ST_READY, ST_STOPPED, ST_SEND, ST_RECEIVE, ST_REPLY = range(7)
@@ -293,6 +293,7 @@ class Model:
         self.counters = defaultdict(int)
         self.wide = None        # True when thread events carry priorities
         self.aps_seen = False   # adaptive partitioning events in the trace
+        self.qvm_seen = False   # QVM (hypervisor) events in the trace: guest scheduling is not modelled
         self.injected_pids = set()
         evs = kev.events()
         self.start_ts = evs[0].ts if evs else 0
@@ -426,6 +427,8 @@ class Model:
                 self._kercall(ev)
             elif cls == C_COMM:
                 self._comm(ev)
+            elif cls == C_QVM:
+                self.qvm_seen = True
             elif cls == C_INT:
                 if ev.code == INT_DELIVER and ev.words:
                     self.interrupts.append((ev.ts, ev.cpu, ev.words[0]))

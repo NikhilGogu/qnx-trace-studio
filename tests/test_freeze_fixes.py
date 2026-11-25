@@ -59,6 +59,38 @@ def test_exchange_without_client_blocked_states_is_not_a_clean_check():
     assert [x["client"] for x in r["insufficient_evidence"]] == ["high/h"], r
 
 
+def test_qvm_events_make_the_inversion_verdict_insufficient_evidence():
+    # the README promises "insufficient evidence" when QVM guests appear; guest scheduling is not modelled
+    def scene(qvm):
+        g = Gen(ncpu=2)
+        g.buffer(0, T)
+        g.names(0, T, NAMES)
+        g.state(0, T + 10, RUNNING, S, 10)
+        g.channel(0, T + 12, 0x1)
+        g.runmask(0, T + 20, 0x1)
+        g.wait_receive(0, T + 40, S, 10)
+        ms = 1_000_000
+        g.state(0, T + ms, RUNNING, H, 30)
+        g.send(0, T + ms + 10, H, S[0], 0x10001, prio=30)
+        g.receive(0, T + ms + 40, S, H, 0x10001, prio=10)
+        if qvm:
+            g.event(1, T + ms + 50, 10, 1, [0, 0])             # class QVM
+        g.state(0, T + ms + 100_000, READY, S, 10)
+        g.state(0, T + ms + 100_010, RUNNING, M, 20)
+        g.state(0, T + 3 * ms, NANOSLEEP, M, 20)
+        g.state(0, T + 3 * ms + 10, RUNNING, S, 10)
+        g.reply(0, T + 3 * ms + 400_000, S, H, 0x10001, 30)
+        g.send_exit(0, T + 3 * ms + 400_100, H, 30)
+        return model(g)[1]
+    r = suspected_inversions(scene(False))
+    assert len(r["suspected"]) == 1 and r["insufficient_evidence"] == []      # the same scene, no guest
+    m = scene(True)
+    r = suspected_inversions(m)
+    assert r["suspected"] == [], r["suspected"]
+    (row,) = r["insufficient_evidence"]
+    assert any("QVM" in k for k in row["reasons"]), row
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
