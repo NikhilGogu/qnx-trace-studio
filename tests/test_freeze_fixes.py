@@ -225,6 +225,29 @@ def test_convert_refuses_to_overwrite_its_own_input():
             assert rc != 0
 
 
+def test_unmatched_unlock_exit_does_not_confirm_the_mutex_owner():
+    # the unlock entry is followed by another call entry on the same thread, then an unlock exit with nothing
+    # open for it: the exit is not the exit of that unlock, so it cannot confirm the owner
+    from test_synthetic import K_MUTEX_LOCK, K_MUTEX_UNLOCK, ST_MUTEX_CODE
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RUNNING, S2, 10)
+    g.state(0, T + 10, RUNNING, S, 10)
+    g.kcall(0, T + 20, K_MUTEX_LOCK, [0x1000, 0x80000000, 0x1002])
+    g.state(0, T + 30, ST_MUTEX_CODE, S, 30)
+    g.state(0, T + 40, RUNNING, S2, 10)
+    g.kcall(0, T + 500, K_MUTEX_UNLOCK, [0x1000, 0x80000000, 0x80001002])
+    g.kcall(0, T + 502, K_SEM_POST, [0x2000])                  # another call starts: the unlock entry is dropped
+    g.kcall(0, T + 505, K_MUTEX_UNLOCK, [0, 0], EXIT)          # an unlock exit with no matching entry
+    g.state(0, T + 510, READY, S, 30)
+    g.state(0, T + 600, RUNNING, S, 30)
+    g.kcall(0, T + 610, K_MUTEX_LOCK, [0, 0], EXIT)
+    _, m = model(g)
+    (w,) = m.mutex_waits
+    assert w.owner is None and not w.owner_known, (w.owner, w.unknown)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

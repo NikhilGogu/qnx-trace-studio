@@ -838,7 +838,7 @@ class Model:
                 tx.t_reply_exit = ev.ts
         elif name == "SYNC_MUTEX_UNLOCK":
             pend = self._mutex_unlock.pop(actor, None)
-            if pend is not None and not intr and a.get("ret_val", 0) == 0:
+            if pend is not None and call is not None and not intr and a.get("ret_val", 0) == 0:
                 k, own, t_entry, waits = pend
                 held = self._mutex_held.get(k, [])
                 problem = _owner_word_problem(own)
