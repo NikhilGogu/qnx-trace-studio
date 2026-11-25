@@ -1091,11 +1091,13 @@ class Model:
             tx.warnings.append("REC_MESSAGE actor %s is not in server pid %d" % (actor, spid))
             self.counters["rmsg_actor_not_server"] += 1
             return
-        if tx.server is not None and tx.server != actor:
+        if tx.server is not None:
             tx.warnings.append("received twice (%s, %s)" % (tx.server, actor))
+        again = any(x is tx for x in self._handling[actor])       # the same thread: one entry, removed once
         tx.server = actor
         tx.t_rmsg = ts
-        self._handling[actor].append(tx)
+        if not again:
+            self._handling[actor].append(tx)
 
     def _reply_msg(self, actor, ckey, ts, code):
         tx = self._by_client.get(ckey)

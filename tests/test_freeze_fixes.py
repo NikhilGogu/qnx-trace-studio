@@ -140,6 +140,30 @@ def test_inversion_does_not_name_the_client_of_a_contradicted_request_as_the_cau
     assert x["server_busy_with"] == [] and "busy with" not in x["evidence"], x["evidence"]
 
 
+def test_duplicate_receive_record_on_the_same_thread_is_not_indexed_twice():
+    # REC_MESSAGE twice for one exchange on the same server thread: the exchange is contradictory, and once it is
+    # closed it must not stay behind as the parent of the server's next, independent request
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 6, RECEIVE, M, 10)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.send(0, T + 20, C, S[0], 0x10001, prio=10)
+    g.receive(0, T + 100, S, C, 0x10001, prio=10)
+    g.comm(0, T + 110, 2, 0x10001, S[0])                       # a second REC_MESSAGE for the same rcvid
+    g.reply(0, T + 200, S, C, 0x10001, 10)
+    g.send(0, T + 300, S, M[0], 0x20002, prio=10)              # the server's own, independent request
+    g.receive(0, T + 340, M, S, 0x20002, prio=10)
+    g.reply(0, T + 400, M, S, 0x20002, 10)
+    g.send_exit(0, T + 450, S, 10)
+    g.send_exit(0, T + 500, C, 10)
+    _, m = model(g)
+    first, second = m.txns
+    assert any("received twice" in w for w in first.warnings), first.warnings
+    assert second.parent is None and not second.parent_candidates, (second.parent, second.parent_candidates)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
