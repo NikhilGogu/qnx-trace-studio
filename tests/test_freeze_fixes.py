@@ -199,6 +199,32 @@ def test_deadline_that_matches_no_request_with_min_requests_zero_is_a_result_not
     assert not r.ok and r.kind == "NoData"                     # the default still fails closed
 
 
+def test_convert_refuses_to_overwrite_its_own_input():
+    import contextlib
+    import io
+    import tempfile
+    from tracestudio.cli import main
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    exchange(g, 0, T + 20, C, S, 0x10001)
+    with tempfile.TemporaryDirectory(prefix="ts-conv-") as d:
+        path = os.path.join(d, "t.kev")
+        link = os.path.join(d, "link.pftrace")
+        with open(path, "wb") as f:
+            f.write(g.bytes())
+        os.symlink(path, link)
+        with open(path, "rb") as f:
+            before = f.read()
+        for out in (path, link):
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = main(["convert", path, "-o", out])
+            with open(path, "rb") as f:
+                assert f.read() == before, "the input trace was overwritten"
+            assert rc != 0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
