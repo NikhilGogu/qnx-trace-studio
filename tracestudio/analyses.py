@@ -624,6 +624,36 @@ def _inversion(tl, tx):
                 if b is not None and b is not tx and b.trustworthy and b not in busy:
                     busy.append(b)
 
+    def parked(key, c, d):
+        """[c, d): the server waits in MsgReceivev with this request still open (a deferred reply or a handoff
+        the trace does not follow). Whatever the request waits for, no thread below the client's priority can
+        hold it up while every CPU is idle or runs a thread at or above that priority; any other time is
+        unexplained."""
+        cuts = {c, d}
+        for cpu in tl.cpus:
+            cuts.update(tl.switch_times(cpu, c, d))
+        for e, f in zip(sorted(cuts), sorted(cuts)[1:]):
+            pc = tl.prio_at(tx.client, e)
+            bad = None
+            if pc is None:
+                bad = "priority unknown (fast-mode trace?)"
+            else:
+                for x in sorted(tl.cpus):
+                    o = tl.occupant(x, e)
+                    if o is None or o == UNKNOWN:
+                        bad = "occupant of CPU %d unknown" % x
+                    elif m.is_idle(o):
+                        continue
+                    else:
+                        p = tl.prio_at(o, e)
+                        if p is None or p < pc:
+                            bad = "CPU %d ran %s below the client's prio %d" % (x, m.label(o), pc)
+                    if bad:
+                        break
+            if bad:
+                unknown("%s RECEIVE-blocked, this request still open (deferred reply or handoff, not followed)"
+                        % m.label(key), f - e)
+
     def through(key, a, b, hops, amb=None):
         """Credit [a, b) of the client's wait to `key`, the server or a thread on its chain."""
         for c, d, code, prio in tl.segments(key, a, b):
@@ -631,6 +661,8 @@ def _inversion(tl, tx):
                 unknown("server state unknown" if not hops else "state of %s unknown" % m.label(key), d - c)
             elif code == ST_READY:
                 ready(key, prio, c, d, hops, amb)
+            elif code == ST_RECEIVE and not hops and tx.t_rx_exit is not None and c >= tx.t_rx_exit:
+                parked(key, c, d)
             elif code in (ST_MUTEX, ST_SEND, ST_REPLY):
                 e = c
                 while e < d:

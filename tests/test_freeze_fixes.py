@@ -302,6 +302,64 @@ def test_inversion_does_not_follow_a_nested_request_whose_parent_is_ambiguous():
     assert {x["client"] for x in r["insufficient_evidence"]} == {"high/h", "client/c"}
 
 
+def parked_scene(during):
+    # s1 takes hi's request, waits in MsgReceivev 2 ms with it still open, then replies itself.
+    # `during` runs on CPU 0 meanwhile: (thread, prio) or None for nothing traced.
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    ms = 1_000_000
+    g.state(0, T + ms, RUNNING, H, 30)
+    g.send(0, T + ms + 10, H, S[0], 0x10001, prio=30)
+    g.receive(0, T + ms + 40, S, H, 0x10001, prio=10)
+    g.wait_receive(0, T + ms + 100, S, 10)
+    if during is not None:
+        g.state(0, T + ms + 200, RUNNING, during[0], during[1])
+    g.state(0, T + 3 * ms, RUNNING, S, 10)
+    g.reply(0, T + 3 * ms + 400_000, S, H, 0x10001, 30)
+    g.send_exit(0, T + 3 * ms + 400_100, H, 30)
+    return model(g)[1]
+
+
+def test_parked_request_is_insufficient_evidence_when_a_lower_thread_runs():
+    for during in (None, (M, 20)):
+        r = suspected_inversions(parked_scene(during))
+        assert r["checked"] == 1 and r["suspected"] == [], during
+        (row,) = r["insufficient_evidence"]
+        assert any("RECEIVE-blocked, this request still open" in k for k in row["reasons"]), row
+
+
+def test_parked_request_is_clean_while_the_cpu_is_idle_or_runs_higher_priority_work():
+    for during in (((1, 1), 0), (M, 40)):
+        r = suspected_inversions(parked_scene(during))
+        assert r["checked"] == 1 and r["suspected"] == [] and r["insufficient_evidence"] == [], (during, r)
+
+
+def test_request_open_while_the_receiver_waits_in_receive_is_insufficient_evidence():
+    # s1 takes hi's request, goes back to RECEIVE for 2 ms with the request still open, then replies itself. The
+    # critical path calls that interval a possible handoff; the inversion check must not pass it silently.
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    ms = 1_000_000
+    g.state(0, T + ms, RUNNING, H, 30)
+    g.send(0, T + ms + 10, H, S[0], 0x10001, prio=30)
+    g.receive(0, T + ms + 40, S, H, 0x10001, prio=10)
+    g.wait_receive(0, T + ms + 100, S, 10)                      # back in RECEIVE, request still open
+    g.state(0, T + 3 * ms, RUNNING, S, 10)
+    g.reply(0, T + 3 * ms + 400_000, S, H, 0x10001, 30)
+    g.send_exit(0, T + 3 * ms + 400_100, H, 30)
+    _, m = model(g)
+    (tx,) = m.txns
+    assert tx.trustworthy and tx.causal and tx.replier == tx.server
+    r = suspected_inversions(m)
+    assert r["checked"] == 1 and r["suspected"] == []
+    (row,) = r["insufficient_evidence"]
+    assert any("RECEIVE-blocked, this request still open" in k for k in row["reasons"]), row
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
