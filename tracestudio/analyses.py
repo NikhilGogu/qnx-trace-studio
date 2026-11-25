@@ -639,9 +639,11 @@ def _inversion(tl, tx):
                         through(nxt, e, f, hops + [(key, state_name(code), what, nxt)])
                     e = f
 
+    blocked = False
     for a, b, ccode, _cp in tl.segments(tx.client, tx.t_call, tx.t_exit):
         if ccode not in (ST_SEND, ST_REPLY):
             continue
+        blocked = True
         send_phase = ccode == ST_SEND and (tx.t_rx_exit is None or a < tx.t_rx_exit)
         if not send_phase and tx.replier is not None and tx.replier != srv:
             # another thread replied: after the receive the work may be anywhere in the server process
@@ -650,6 +652,9 @@ def _inversion(tl, tx):
             continue
         sole = not send_phase or tl.sole_thread(srv, a, b)
         through(srv, a, b, [])
+    if not blocked and tx.t_exit > tx.t_call:
+        # a complete exchange whose client has no SEND or REPLY state in the trace: nothing was analysed
+        unknown("no SEND or REPLY state of %s traced during the request" % m.label(tx.client), tx.t_exit - tx.t_call)
     return total["inv"], total["unk"], culprits, reasons, {"phase": phase, "held": held, "busy": busy,
                                                            "assumed": sorted(assumed), "members": members}
 
