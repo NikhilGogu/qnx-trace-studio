@@ -60,7 +60,8 @@ def _latency_assertion(model, name, budget_us, match, allow_loss, min_requests):
                                                          budget_us) for lat, t in misses[:5]]
     if len(misses) > 5:
         ev.append("... %d more" % (len(misses) - 5))
-    head = "%d of %d trustworthy requests over %g us, max %.1f us; %s" % (len(misses), seen, budget_us, worst, matched)
+    head = "%d of %d trustworthy requests over %g us, max %s; %s" % (
+        len(misses), seen, budget_us, "%.1f us" % worst if worst is not None else "none", matched)
     if misses:
         return Result(name, False, head + ("; %s" % untrusted if excluded or unfinished else ""), ev, "DeadlineMissed")
     if (excluded or unfinished) and not allow_loss:
