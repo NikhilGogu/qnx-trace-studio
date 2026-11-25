@@ -407,6 +407,28 @@ def test_validate_does_not_count_a_pulse_whose_receive_was_a_guess():
     assert res["pulses"]["client_pulses_matched_with_value"] == 1, res["pulses"]    # only value 9, the unique one
 
 
+def test_reply_exit_is_kept_when_the_client_returns_first_on_another_cpu():
+    # the client is unblocked by the reply and leaves MsgSend on CPU 1 before the replier's MsgReply returns on
+    # CPU 0: the reply slice still needs its end
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.buffer(1, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(1, T + 10, RUNNING, C, 10)
+    g.send(1, T + 20, C, S[0], 0x10001, prio=10)
+    g.receive(0, T + 100, S, C, 0x10001, prio=10)
+    g.kcall(0, T + 200, K_REPLYV, [0x10001, 1, 0, 0, 0, 0])
+    g.comm(0, T + 210, REPLYMSG, C[1], C[0])
+    g.state(1, T + 220, READY, C, 10)
+    g.send_exit(1, T + 250, C, 10)                             # the client is back first
+    g.kcall(0, T + 300, K_REPLYV, [0, 0], EXIT)
+    _, m = model(g)
+    (tx,) = m.txns
+    assert tx.t_exit == T + 260 and tx.t_reply_call == T + 200
+    assert tx.t_reply_exit == T + 300, tx.t_reply_exit
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

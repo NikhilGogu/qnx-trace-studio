@@ -1231,8 +1231,6 @@ class Model:
         self._unindex_server(tx)
         if self._by_client.get(tx.client) is tx:
             del self._by_client[tx.client]
-        if tx.replier is not None and self._replying.get(tx.replier) is tx:
-            del self._replying[tx.replier]
 
     # ---- derived views ----------------------------------------------------
     def intervals(self, key, end_ts=None):
