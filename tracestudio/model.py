@@ -950,6 +950,9 @@ class Model:
         tx = self._by_rcvid.get((actor[0], rcvid))
         if tx is None:
             self.counters["receive_exit_without_txn"] += 1
+            # a request sent before the trace still came through this receive: its channel may have given the
+            # receiver the client's run mask
+            self._receive_may_change_runmask(actor, call.args.get("chid") if call is not None else None, ts)
             return
         if tx.server is None:
             tx.server = actor
@@ -973,6 +976,9 @@ class Model:
                 self.counters["info_sender_match"] += 1
         chid = tx.info.get("chid", tx.rx_chid)
         tx.rm_chan = (actor[0], chid) in self._rm_channels
+        self._receive_may_change_runmask(actor, chid, ts)
+
+    def _receive_may_change_runmask(self, actor, chid, ts):
         flags = self._chan_flags.get((actor[0], chid)) if chid is not None else None
         if flags is None or flags & _NTO_CHF_INHERIT_RUNMASK:
             # the receiver may have taken the client's run mask (_NTO_CHF_INHERIT_RUNMASK, or flags not traced)

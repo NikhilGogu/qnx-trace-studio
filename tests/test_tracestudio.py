@@ -807,3 +807,8 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print("ok", name)
+    import test_freeze_fixes   # noqa: E402  (regressions from the pre-freeze review)
+    for name, fn in list(vars(test_freeze_fixes).items()):
+        if name.startswith("test_"):
+            fn()
+            print("ok", name)
