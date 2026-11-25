@@ -247,7 +247,7 @@ def critical_path(model, tx, tl=None, max_depth=4, _depth=0, _seen=frozenset()):
                 for e, f in zip(cuts, cuts[1:]):
                     opened = tl.open_at(srv, e)
                     h = opened[0] if len(opened) == 1 else None
-                    if rx0 is not None and rx0 <= e < tx.t_rx_exit:
+                    if rx0 is not None and tx.t_rx_exit is not None and rx0 <= e < tx.t_rx_exit:
                         add(e, f, "server running", "%s receiving this request (in MsgReceivev)" % sl, srv, sprio,
                             short="%s receiving" % ss)
                     elif len(opened) > 1:     # which of them the thread works on is not in the trace

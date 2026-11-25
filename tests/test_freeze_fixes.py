@@ -14,6 +14,7 @@ from kevgen import (C_COMM, C_CONTROL, C_KERCALL, C_PRTH, DEAD, EXIT, INT, K_PUL
                     K_SEM_POST, K_SENDV, M32, NANOSLEEP, READY, RECEIVE, REPLY, REPLYMSG, RPULSE, RUNNING, SEND, Gen)
 from test_synthetic import B, C, H, M, NAMES, S, S2, T, W1, W2, exchange, kev, model  # noqa: E402,F401
 from tracestudio.analyses import Timeline, suspected_inversions  # noqa: E402,F401
+from tracestudio.critical import critical_path  # noqa: E402,F401
 
 
 def test_receive_without_traced_send_still_drops_the_run_mask():
@@ -162,6 +163,26 @@ def test_duplicate_receive_record_on_the_same_thread_is_not_indexed_twice():
     first, second = m.txns
     assert any("received twice" in w for w in first.warnings), first.warnings
     assert second.parent is None and not second.parent_candidates, (second.parent, second.parent_candidates)
+
+
+def test_critical_path_of_a_request_whose_receive_exit_is_not_traced_does_not_crash():
+    # MsgReceivev entry and exit are missing (REC_MESSAGE is there), the server runs, and the client's MsgSend is
+    # complete; `critical --request N` selects it by number and must give a path, not a TypeError
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, C, 10)
+    g.send(0, T + 20, C, S[0], 0x10001, prio=10)
+    g.state(0, T + 100, RUNNING, S, 10)
+    g.comm(0, T + 110, 2, 0x10001, S[0])                       # REC_MESSAGE, but no MsgReceivev exit follows
+    g.reply(0, T + 400, S, C, 0x10001, 10)
+    g.send_exit(0, T + 500, C, 10)
+    _, m = model(g)
+    (tx,) = m.txns
+    assert tx.t_rmsg is not None and tx.t_rx_exit is None and tx.t_exit is not None
+    segs = critical_path(m, tx)
+    assert segs and segs[0].t0 == tx.t_call and segs[-1].t1 == tx.t_exit
 
 
 if __name__ == "__main__":
