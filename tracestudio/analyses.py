@@ -530,7 +530,7 @@ def _inversion(tl, tx):
         total["unk"] += n
         reasons[reason] += n
 
-    def ready(key, kprio, c, d, hops):
+    def ready(key, kprio, c, d, hops, amb=None):
         """The READY rule over [c, d) for `key`: the server (no hops) or a thread it waits for through hops."""
         nonlocal pool
         whose = "the server's" if not hops else "%s's" % m.label(key)
@@ -591,6 +591,11 @@ def _inversion(tl, tx):
             blockers = [(x, o, p) for x, o, p in prios if p < pc]
             if not blockers:
                 continue
+            if amb is not None:
+                # held up below the client's priority, but the chain passes a nested request that may serve
+                # another request the server holds: no inversion is claimed for this client
+                unknown("%s REPLY-blocked on %s: its parent is ambiguous" % (m.label(amb[0]), amb[1]), f - e)
+                continue
             if not sole:
                 stood = [(o, _pool_member(tl, tx, o, pc, e)) for o in pool[1]]
                 if any(r[0] == "receivable" for _, r in stood):
@@ -619,13 +624,13 @@ def _inversion(tl, tx):
                 if b is not None and b is not tx and b.trustworthy and b not in busy:
                     busy.append(b)
 
-    def through(key, a, b, hops):
+    def through(key, a, b, hops, amb=None):
         """Credit [a, b) of the client's wait to `key`, the server or a thread on its chain."""
         for c, d, code, prio in tl.segments(key, a, b):
             if code in (None, ST_UNKNOWN):
                 unknown("server state unknown" if not hops else "state of %s unknown" % m.label(key), d - c)
             elif code == ST_READY:
-                ready(key, prio, c, d, hops)
+                ready(key, prio, c, d, hops, amb)
             elif code in (ST_MUTEX, ST_SEND, ST_REPLY):
                 e = c
                 while e < d:
@@ -639,7 +644,12 @@ def _inversion(tl, tx):
                     elif len(hops) >= CHAIN_LINKS:
                         unknown("blocking chain longer than %d links" % CHAIN_LINKS, f - e)
                     else:
-                        through(nxt, e, f, hops + [(key, state_name(code), what, nxt)])
+                        a2 = amb
+                        if a2 is None and code == ST_REPLY:
+                            ht = tl.client_txn_at(key, e)
+                            if ht is not None and not ht.causal:
+                                a2 = (key, what)
+                        through(nxt, e, f, hops + [(key, state_name(code), what, nxt)], a2)
                     e = f
 
     blocked = False

@@ -263,6 +263,45 @@ def test_cross_cpu_slot_is_judged_by_the_anchor_of_the_buffer_that_holds_it():
     assert ev.ts == T + 50 and not ev.partial, (ev.ts, ev.partial)
 
 
+def test_inversion_does_not_follow_a_nested_request_whose_parent_is_ambiguous():
+    # s1 holds two requests (from hi and from c), then sends z to mid and waits for the reply. Nothing says which of
+    # the two requests z serves, so mid being held up by a thread of prio 20 cannot be blamed on either client.
+    g = Gen(ncpu=1)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    g.state(0, T + 5, RECEIVE, S, 10)
+    g.state(0, T + 10, RUNNING, M, 10)
+    g.channel(0, T + 12, 0x1)
+    g.runmask(0, T + 20, 0x1)
+    g.wait_receive(0, T + 40, M, 10)
+    ms = 1_000_000
+    g.state(0, T + ms, RUNNING, H, 30)
+    g.send(0, T + ms + 10, H, S[0], 0x10001, prio=30)
+    g.state(0, T + ms + 50, RUNNING, C, 25)
+    g.send(0, T + ms + 60, C, S[0], 0x20001, prio=25)
+    g.receive(0, T + ms + 100, S, H, 0x10001, prio=10)
+    g.wait_receive(0, T + ms + 130, S, 10)
+    g.receive(0, T + ms + 150, S, C, 0x20001, prio=10)
+    g.send(0, T + ms + 200, S, M[0], 0x30001, prio=10)         # whose request is this for?
+    g.receive(0, T + ms + 240, M, S, 0x30001, prio=10)
+    g.state(0, T + ms + 300, READY, M, 10)
+    g.state(0, T + ms + 310, RUNNING, W1, 20)                  # prio 20 holds the only CPU: below both clients
+    g.state(0, T + 3 * ms, NANOSLEEP, W1, 20)
+    g.state(0, T + 3 * ms + 10, RUNNING, M, 10)
+    g.reply(0, T + 3 * ms + 100, M, S, 0x30001, 10)
+    g.send_exit(0, T + 3 * ms + 150, S, 10)
+    g.reply(0, T + 3 * ms + 200, S, H, 0x10001, 30)
+    g.reply(0, T + 3 * ms + 300, S, C, 0x20001, 25)
+    g.send_exit(0, T + 3 * ms + 400, H, 30)
+    g.send_exit(0, T + 3 * ms + 500, C, 25)
+    _, m = model(g)
+    z = m.txns[2]
+    assert z.parent is None and z.parent_candidates == [0, 1] and not z.causal
+    r = suspected_inversions(m)
+    assert r["suspected"] == [], [x["evidence"] for x in r["suspected"]]
+    assert {x["client"] for x in r["insufficient_evidence"]} == {"high/h", "client/c"}
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
