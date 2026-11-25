@@ -91,6 +91,21 @@ def test_qvm_events_make_the_inversion_verdict_insufficient_evidence():
     assert any("QVM" in k for k in row["reasons"]), row
 
 
+def test_unnamed_procnto_thread_with_a_nonzero_ready_priority_is_not_idle():
+    g = Gen(ncpu=2)
+    g.buffer(0, T)
+    g.names(0, T, NAMES)
+    worker = (1, 7)                                            # a procnto thread the trace never names
+    g.state(0, T + 10, RUNNING, S, 10)
+    g.state(0, T + 20, READY, worker, 20)                      # READY at prio 20; no RUNNING event for it
+    g.state(0, T + 30, READY, (1, 8), 0)
+    g.state(0, T + 40, RUNNING, (1, 8), 0)                     # an unnamed thread seen running at prio 0 is idle
+    _, m = model(g)
+    assert not m.is_idle(worker)
+    assert Timeline(m).prio_at(worker, T + 100) == 20
+    assert m.is_idle((1, 8))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

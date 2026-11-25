@@ -371,7 +371,9 @@ class Model:
         if t and t.name:
             return t.name.startswith("idle")
         if t and any(s[2] is not None for s in t.states):
-            return all(s[2] == 0 for s in t.states if s[2] is not None and s[1] == ST_RUNNING)
+            running = [s[2] for s in t.states if s[2] is not None and s[1] == ST_RUNNING]
+            # never seen running with a priority: the priorities of its other states decide (all() of nothing is True)
+            return all(p == 0 for p in running or [s[2] for s in t.states if s[2] is not None])
         return key[1] <= self.kev.ncpu
 
     def label(self, key):
