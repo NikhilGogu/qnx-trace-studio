@@ -65,7 +65,7 @@ from .events import (COMM_ERROR, COMM_REPLY, COMM_RMSG, COMM_RPULSE, COMM_SIGNAL
                      COMM_SPULSE_DIS, COMM_SPULSE_EXE, INT_DELIVER, PR_PROCCREATE, PR_PROCCREATE_NAME,
                      PR_PROCDESTROY, PR_THREAD_NAME, STATE_MAX, THREAD_WIDE, describe, kercall, msg_type_name,
                      state_name, unpack)
-from .kev import C_COMM, C_INT, C_KERCALL, C_PRTH, C_SYSTEM, KevFile
+from .kev import C_COMM, C_INT, C_KERCALL, C_PRTH, C_QVM, C_SYSTEM, KevFile
 
 ST_UNKNOWN = -1
 ST_DEAD, ST_RUNNING, ST_READY, ST_STOPPED, ST_SEND, ST_RECEIVE, ST_REPLY = range(7)
@@ -226,6 +226,24 @@ class Pulse:
     candidates: list = field(default_factory=list)
 
 
+def pulse_receive_known(pulses):
+    """Indices of the pulses whose receive is tied to its send by the trace: a unique match; an unsynced match
+    that no earlier ambiguous receive left open to doubt; or an ambiguous match whose candidates all carry the same
+    sender, code and value (so the guess changes nothing shown)."""
+    def alike(p):
+        return len({(pulses[c].sender, pulses[c].code, pulses[c].value) for c in p.candidates}) == 1
+    doubted = {c for p in pulses if p.match == "ambiguous" and not alike(p) for c in p.candidates}
+    known = set()
+    for p in pulses:
+        if p.t_recv is None or p.receiver is None:
+            continue
+        if p.match == "unique" or (p.match == "unsynced" and p.idx not in doubted):
+            known.add(p.idx)
+        elif p.match == "ambiguous" and alike(p):
+            known.add(p.idx)
+    return known
+
+
 @dataclass(eq=False)
 class MutexWait:
     """One SyncMutexLock call that blocked. The owner is known only when the owner's own SyncMutexUnlock of
@@ -293,6 +311,7 @@ class Model:
         self.counters = defaultdict(int)
         self.wide = None        # True when thread events carry priorities
         self.aps_seen = False   # adaptive partitioning events in the trace
+        self.qvm_seen = False   # QVM (hypervisor) events in the trace: guest scheduling is not modelled
         self.injected_pids = set()
         evs = kev.events()
         self.start_ts = evs[0].ts if evs else 0
@@ -370,7 +389,9 @@ class Model:
         if t and t.name:
             return t.name.startswith("idle")
         if t and any(s[2] is not None for s in t.states):
-            return all(s[2] == 0 for s in t.states if s[2] is not None and s[1] == ST_RUNNING)
+            running = [s[2] for s in t.states if s[2] is not None and s[1] == ST_RUNNING]
+            # never seen running with a priority: the priorities of its other states decide (all() of nothing is True)
+            return all(p == 0 for p in running or [s[2] for s in t.states if s[2] is not None])
         return key[1] <= self.kev.ncpu
 
     def label(self, key):
@@ -426,6 +447,8 @@ class Model:
                 self._kercall(ev)
             elif cls == C_COMM:
                 self._comm(ev)
+            elif cls == C_QVM:
+                self.qvm_seen = True
             elif cls == C_INT:
                 if ev.code == INT_DELIVER and ev.words:
                     self.interrupts.append((ev.ts, ev.cpu, ev.words[0]))
@@ -833,7 +856,7 @@ class Model:
                 tx.t_reply_exit = ev.ts
         elif name == "SYNC_MUTEX_UNLOCK":
             pend = self._mutex_unlock.pop(actor, None)
-            if pend is not None and not intr and a.get("ret_val", 0) == 0:
+            if pend is not None and call is not None and not intr and a.get("ret_val", 0) == 0:
                 k, own, t_entry, waits = pend
                 held = self._mutex_held.get(k, [])
                 problem = _owner_word_problem(own)
@@ -950,6 +973,9 @@ class Model:
         tx = self._by_rcvid.get((actor[0], rcvid))
         if tx is None:
             self.counters["receive_exit_without_txn"] += 1
+            # a request sent before the trace still came through this receive: its channel may have given the
+            # receiver the client's run mask
+            self._receive_may_change_runmask(actor, call.args.get("chid") if call is not None else None, ts)
             return
         if tx.server is None:
             tx.server = actor
@@ -973,6 +999,9 @@ class Model:
                 self.counters["info_sender_match"] += 1
         chid = tx.info.get("chid", tx.rx_chid)
         tx.rm_chan = (actor[0], chid) in self._rm_channels
+        self._receive_may_change_runmask(actor, chid, ts)
+
+    def _receive_may_change_runmask(self, actor, chid, ts):
         flags = self._chan_flags.get((actor[0], chid)) if chid is not None else None
         if flags is None or flags & _NTO_CHF_INHERIT_RUNMASK:
             # the receiver may have taken the client's run mask (_NTO_CHF_INHERIT_RUNMASK, or flags not traced)
@@ -1080,11 +1109,13 @@ class Model:
             tx.warnings.append("REC_MESSAGE actor %s is not in server pid %d" % (actor, spid))
             self.counters["rmsg_actor_not_server"] += 1
             return
-        if tx.server is not None and tx.server != actor:
+        if tx.server is not None:
             tx.warnings.append("received twice (%s, %s)" % (tx.server, actor))
+        again = any(x is tx for x in self._handling[actor])       # the same thread: one entry, removed once
         tx.server = actor
         tx.t_rmsg = ts
-        self._handling[actor].append(tx)
+        if not again:
+            self._handling[actor].append(tx)
 
     def _reply_msg(self, actor, ckey, ts, code):
         tx = self._by_client.get(ckey)
@@ -1200,8 +1231,6 @@ class Model:
         self._unindex_server(tx)
         if self._by_client.get(tx.client) is tx:
             del self._by_client[tx.client]
-        if tx.replier is not None and self._replying.get(tx.replier) is tx:
-            del self._replying[tx.replier]
 
     # ---- derived views ----------------------------------------------------
     def intervals(self, key, end_ts=None):

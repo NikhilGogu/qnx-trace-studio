@@ -530,7 +530,7 @@ def _inversion(tl, tx):
         total["unk"] += n
         reasons[reason] += n
 
-    def ready(key, kprio, c, d, hops):
+    def ready(key, kprio, c, d, hops, amb=None):
         """The READY rule over [c, d) for `key`: the server (no hops) or a thread it waits for through hops."""
         nonlocal pool
         whose = "the server's" if not hops else "%s's" % m.label(key)
@@ -548,6 +548,9 @@ def _inversion(tl, tx):
                 return
         if m.aps_seen:
             unknown("adaptive partitioning in use: budgets not evaluated", d - c)
+            return
+        if m.qvm_seen:
+            unknown("QVM guests in the trace: guest scheduling not evaluated", d - c)
             return
         if tl.policy_at(key, c) == SCHED_SPORADIC:
             unknown("server uses sporadic scheduling" if not hops else "%s uses sporadic scheduling" % m.label(key),
@@ -588,6 +591,11 @@ def _inversion(tl, tx):
             blockers = [(x, o, p) for x, o, p in prios if p < pc]
             if not blockers:
                 continue
+            if amb is not None:
+                # held up below the client's priority, but the chain passes a nested request that may serve
+                # another request the server holds: no inversion is claimed for this client
+                unknown("%s REPLY-blocked on %s: its parent is ambiguous" % (m.label(amb[0]), amb[1]), f - e)
+                continue
             if not sole:
                 stood = [(o, _pool_member(tl, tx, o, pc, e)) for o in pool[1]]
                 if any(r[0] == "receivable" for _, r in stood):
@@ -613,16 +621,48 @@ def _inversion(tl, tx):
                 culprits[(o, p, x)] += f - e
             if ccode == ST_SEND:
                 b = tl.handling_at(srv, e)
-                if b is not None and b is not tx and b not in busy:
+                if b is not None and b is not tx and b.trustworthy and b not in busy:
                     busy.append(b)
 
-    def through(key, a, b, hops):
+    def parked(key, c, d):
+        """[c, d): the server waits in MsgReceivev with this request still open (a deferred reply or a handoff
+        the trace does not follow). Whatever the request waits for, no thread below the client's priority can
+        hold it up while every CPU is idle or runs a thread at or above that priority; any other time is
+        unexplained."""
+        cuts = {c, d}
+        for cpu in tl.cpus:
+            cuts.update(tl.switch_times(cpu, c, d))
+        for e, f in zip(sorted(cuts), sorted(cuts)[1:]):
+            pc = tl.prio_at(tx.client, e)
+            bad = None
+            if pc is None:
+                bad = "priority unknown (fast-mode trace?)"
+            else:
+                for x in sorted(tl.cpus):
+                    o = tl.occupant(x, e)
+                    if o is None or o == UNKNOWN:
+                        bad = "occupant of CPU %d unknown" % x
+                    elif m.is_idle(o):
+                        continue
+                    else:
+                        p = tl.prio_at(o, e)
+                        if p is None or p < pc:
+                            bad = "CPU %d ran %s below the client's prio %d" % (x, m.label(o), pc)
+                    if bad:
+                        break
+            if bad:
+                unknown("%s RECEIVE-blocked, this request still open (deferred reply or handoff, not followed)"
+                        % m.label(key), f - e)
+
+    def through(key, a, b, hops, amb=None):
         """Credit [a, b) of the client's wait to `key`, the server or a thread on its chain."""
         for c, d, code, prio in tl.segments(key, a, b):
             if code in (None, ST_UNKNOWN):
                 unknown("server state unknown" if not hops else "state of %s unknown" % m.label(key), d - c)
             elif code == ST_READY:
-                ready(key, prio, c, d, hops)
+                ready(key, prio, c, d, hops, amb)
+            elif code == ST_RECEIVE and not hops and tx.t_rx_exit is not None and c >= tx.t_rx_exit:
+                parked(key, c, d)
             elif code in (ST_MUTEX, ST_SEND, ST_REPLY):
                 e = c
                 while e < d:
@@ -636,12 +676,19 @@ def _inversion(tl, tx):
                     elif len(hops) >= CHAIN_LINKS:
                         unknown("blocking chain longer than %d links" % CHAIN_LINKS, f - e)
                     else:
-                        through(nxt, e, f, hops + [(key, state_name(code), what, nxt)])
+                        a2 = amb
+                        if a2 is None and code == ST_REPLY:
+                            ht = tl.client_txn_at(key, e)
+                            if ht is not None and not ht.causal:
+                                a2 = (key, what)
+                        through(nxt, e, f, hops + [(key, state_name(code), what, nxt)], a2)
                     e = f
 
+    blocked = False
     for a, b, ccode, _cp in tl.segments(tx.client, tx.t_call, tx.t_exit):
         if ccode not in (ST_SEND, ST_REPLY):
             continue
+        blocked = True
         send_phase = ccode == ST_SEND and (tx.t_rx_exit is None or a < tx.t_rx_exit)
         if not send_phase and tx.replier is not None and tx.replier != srv:
             # another thread replied: after the receive the work may be anywhere in the server process
@@ -650,6 +697,9 @@ def _inversion(tl, tx):
             continue
         sole = not send_phase or tl.sole_thread(srv, a, b)
         through(srv, a, b, [])
+    if not blocked and tx.t_exit > tx.t_call:
+        # a complete exchange whose client has no SEND or REPLY state in the trace: nothing was analysed
+        unknown("no SEND or REPLY state of %s traced during the request" % m.label(tx.client), tx.t_exit - tx.t_call)
     return total["inv"], total["unk"], culprits, reasons, {"phase": phase, "held": held, "busy": busy,
                                                            "assumed": sorted(assumed), "members": members}
 

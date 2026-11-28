@@ -332,8 +332,8 @@ class KevFile:
                 ts = place(table[bi][2] if bi >= 0 else cpu, d0)
             else:
                 ts = None
-            # before its CPU's first TIME a slot's epoch is borrowed from another CPU: a guess, not trusted
-            guessed = not is_time and cpu not in anchor
+            # before the first TIME of the buffer's CPU a slot's epoch is borrowed from another CPU: a guess
+            guessed = not is_time and (table[bi][2] if bi >= 0 else cpu) not in anchor
             prev_latest = latest.get(cpu)
             if ts is not None:
                 if prev_latest is not None and ts < prev_latest:

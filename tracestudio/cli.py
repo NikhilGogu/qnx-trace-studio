@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -111,6 +112,9 @@ def cmd_convert(a):
         print("error: %s has no events" % a.trace, file=sys.stderr)
         return 1
     out = a.output or a.trace.rsplit(".", 1)[0] + ".perfetto-trace"
+    if os.path.exists(out) and os.path.samefile(out, a.trace):
+        print("error: the output file is the input trace; give another name with -o", file=sys.stderr)
+        return 2
     stats = write(model, out, critical_paths=not a.no_critical_path)
     print("wrote %s: %s" % (out, json.dumps(stats, sort_keys=True)))
     for l in kev.losses:

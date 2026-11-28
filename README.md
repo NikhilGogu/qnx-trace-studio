@@ -4,6 +4,8 @@
 
 A deadline check flags a late request. Trace Studio reads the QNX kernel trace and shows which server the client waited for and which thread held the CPU. If the trace cannot support a diagnosis, it says why.
 
+QNX OS 8.0 | target: QEMU images built with `mkqnximage` (x86_64 under KVM, aarch64le under QEMU virt) | toolchain: QNX SDP 8.0 (`qcc`, `tracelogger`, `traceprinter`); the host tool needs Python 3.10 or newer
+
 On our planted scheduling bugs, both checks flagged all 30 bug captures. The deadline-only check named no cause. Trace Studio named the planted cause in all 30. Its strict gate also failed 1 of 21 healthy captures for insufficient evidence. This is a comparison with a deadline-only gate on bugs we planted, not a comparison with another trace analyser.
 
 | 51 captures on QNX OS 8.0 | Deadline-only gate | Trace Studio `check` |
@@ -75,17 +77,19 @@ The fixed-priority channel in steps 1 to 4 is a controlled demo: the workload tu
 
 | criterion | where to look |
 |---|---|
-| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 113 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
+| Technological implementation | Its own `.kev` parser ([tracestudio/kev.py](tracestudio/kev.py)), checked event by event against the SDP's `traceprinter` ([docs/VALIDATION.md](docs/VALIDATION.md)). The message-passing model in [tracestudio/model.py](tracestudio/model.py). 132 tests in [tests/](tests), run by [CI](.github/workflows/test.yml) on Python 3.10 and 3.12 |
 | Design | The quickstart above runs on the checked-in captures without QNX. `check` gives an exit status and JUnit XML, and [action.yml](action.yml) runs it as a GitHub Action. `open` loads a trace in Perfetto with the right tracks pinned. [tools/build_examples.py](tools/build_examples.py) builds a page with every capture. [docs/JSON.md](docs/JSON.md) documents the JSON output |
 | Potential impact | Timing budgets and "no suspected inversion" as a CI gate for QNX message passing. The mutex owner chain in quickstart step 5, which is the more common case in real code. Verdicts for multi-threaded servers |
 | Innovation | Verdicts that carry their evidence, and "insufficient evidence" with reasons when the trace cannot support one. A critical path that crosses processes and follows mutex owners ([What trace-studio adds](#what-trace-studio-adds)). Perfetto SQL examples in [docs/sql](docs/sql). An agent skill in [skills/trace-studio](skills/trace-studio/SKILL.md) |
 
-Where QNX is used:
+## Where QNX shows
 
-- The traces in `tests/data` were written by `tracelogger` on QNX OS 8.0 (x86_64 and aarch64le, under QEMU).
-- The workload in [workload/](workload) is QNX C code built with `qcc`: `ChannelCreate` with and without `_NTO_CHF_FIXED_PRIORITY`, `MsgSend`, `MsgReceive`, `MsgReply`, `MsgSendPulse`, `TimerTimeout`, `ThreadCtl(_NTO_TCTL_RUNMASK)` and a `PTHREAD_PRIO_NONE` mutex.
-- The kernel call numbers, thread states and message types in [tracestudio/qnx_tables.py](tracestudio/qnx_tables.py) are generated from the SDP 8.0 headers by [tools/gen_qnx_tables.py](tools/gen_qnx_tables.py).
-- [tools/ci_qemu_check.sh](tools/ci_qemu_check.sh) builds the workload with the SDP, boots a QNX target with `mkqnximage`, captures a scenario and runs `tracestudio check` on it.
+- **The `.kev` parser:** `KevFile` in [tracestudio/kev.py](tracestudio/kev.py) reads the file that `tracelogger` writes: the text header, the system page, the 16-byte event slots and the per-CPU buffer numbers that reveal lost events.
+- **The QNX events it decodes:** `describe`, `kercall`, `msg_type_name` and `state_name` in [tracestudio/events.py](tracestudio/events.py) name kernel calls, thread states and messages. The tables in [tracestudio/qnx_tables.py](tracestudio/qnx_tables.py) are generated from the SDP 8.0 headers by [tools/gen_qnx_tables.py](tools/gen_qnx_tables.py).
+- **Target programs built with the QNX toolchain:** the nine `ts_*.c` programs in [workload/](workload) are built with `qcc` ([workload/Makefile](workload/Makefile)). They use `ChannelCreate` with and without `_NTO_CHF_FIXED_PRIORITY` ([workload/ts_psrv.c](workload/ts_psrv.c)), `MsgSendPulse` ([workload/ts_clients.c](workload/ts_clients.c)), `TimerTimeout` ([workload/ts_cancel.c](workload/ts_cancel.c)), `ThreadCtl(_NTO_TCTL_RUNMASK)` ([workload/ts_pool.c](workload/ts_pool.c)) and a `PTHREAD_PRIO_NONE` mutex ([workload/ts_mutex.c](workload/ts_mutex.c)). [workload/run_scenarios.sh](workload/run_scenarios.sh) runs each scenario under `tracelogger`.
+- **Traces recorded on QNX:** the 13 `.kev.gz` files in [tests/data](tests/data) came from `tracelogger` on QNX OS 8.0, 12 on x86_64 and 1 on aarch64le, both under QEMU. The workload's own CSV logs sit next to them.
+- **From source to verdict on a QNX target:** [tools/ci_qemu_check.sh](tools/ci_qemu_check.sh) builds the workload with the SDP, boots a target with `mkqnximage`, captures a scenario and runs `tracestudio check` on the trace. The codelab walks through the same steps by hand.
+- **Output that shows it:** `tracestudio analyze tests/data/run1/prio_fixed.kev.gz --deadline hi=5000` names the QNX threads, priorities and CPU in each verdict, and `tracestudio check` exits 1 on that trace and 0 on `prio_inherit`. [docs/VALIDATION.md](docs/VALIDATION.md) records that on the 13 checked-in captures 369,402 events are identical to those the SDP's `traceprinter` prints, with 0 mismatches.
 
 ## trace-studio and the System Profiler
 
@@ -442,7 +446,7 @@ Without `--client`, the same passing capture failed `--no-inversions`: one reque
 - `tracestudio validate` matched every logged request of the workloads to the right client thread, server thread, rcvid, coid and MsgSend outcome.
 - Checked-in captures, reproducible from this repository: on the 13 captures in `tests/data`, `tools/validate_all.py` finds 369,402 events identical to `traceprinter` and 1,097,066 argument values compared with 0 mismatches. 11 of the 13 are among the 20 build-box captures, and `tests/data/run6` adds the two thread-pool captures taken later. The test suite runs on all 13 and converts and loads each one in TraceProcessor.
 - Build-box captures, reported separately and not reproducible from the repository: the 17 x86_64 captures matched on 739,841 events and 2,428,184 compared argument values, and the 3 aarch64le captures on 158,352 events and 487,334 values, with 0 mismatches in both.
-- `python3 tests/test_tracestudio.py` runs 113 tests: 83 on synthetic slot streams, with a counterexample for each defect found in code review, and 30 on the checked-in captures, among them one that runs the quickstart commands above.
+- `python3 tests/test_tracestudio.py` runs 132 tests: 83 on synthetic slot streams, with a counterexample for each defect found in code review, 30 on the checked-in captures, among them one that runs the quickstart commands above, and 19 on fixes made after review.
 - Seeded regressions on a QNX 8.0 target ([details](docs/VALIDATION.md#seeded-scheduling-regressions-qnx-target)): 10 planted scheduling bugs and 7 healthy controls, 3 captures each. A deadline-only gate failed all 30 bug captures and named no cause. trace-studio failed all 30 and named the expected cause in 30. It failed 1 of 21 control captures, where the gate allows no request with insufficient evidence. The seeded comparison used one x86_64 QNX 8.0 guest under QEMU. The repository also includes an aarch64le QEMU capture. No physical board is claimed.
 - Loss injection on the checked-in captures ([details](docs/VALIDATION.md#loss-injection-host-only)): 1,203 damaged copies. Every copy with visible damage reported loss and failed `check`. No wrong or missed inversion and no wrong mutex owner. No wrong link among the 793,417 exchanges still called trustworthy (144 before the end-of-trace fix).
 
